@@ -82,6 +82,48 @@ fn write_fd(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
     }
 }
 
+fn write_all_fd(fd: RawFd, mut buf: &[u8]) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match write_fd(fd, buf) {
+            Ok(0) => break,
+            Ok(n) => buf = &buf[n..],
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+const TERMINAL_CLEANUP_SEQUENCES: &[u8] = concat!(
+    "\x1b[<u",  // pop one kitty keyboard protocol stack entry
+    "\x1b[=0u", // force kitty keyboard protocol flags to the default
+    "\x1b[?9;1000;1001;1002;1003;1005;1006;1015;1016l", // mouse reporting/encodings
+    "\x1b[?1004l", // focus reporting
+    "\x1b[?2004;2005;2006l", // bracketed paste and paste quoting/literal modes
+    "\x1b[?2026l", // synchronized output
+    "\x1b[?1l", // application cursor keys
+    "\x1b[?5l", // reverse video
+    "\x1b[?6l", // origin mode
+    "\x1b[?7h", // autowrap
+    "\x1b[?12l", // blinking cursor
+    "\x1b[?25h", // visible cursor
+    "\x1b[?47;1047;1048;1049l", // alternate screen and saved cursor variants
+    "\x1b[?66l", // application keypad
+    "\x1b[0 q", // default cursor style
+    "\x1b[0m",  // default graphics rendition
+)
+.as_bytes();
+
+fn terminal_cleanup_sequences() -> &'static [u8] {
+    TERMINAL_CLEANUP_SEQUENCES
+}
+
+fn cleanup_terminal_features() {
+    if stdout_is_terminal() {
+        let _ = write_all_fd(STDOUT_FD, terminal_cleanup_sequences());
+    }
+}
+
 pub(crate) fn terminal_size() -> TermSize {
     let mut ws = libc::winsize {
         ws_row: 24,
@@ -193,9 +235,36 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         if self.active {
+            cleanup_terminal_features();
             unsafe {
                 libc::tcsetattr(STDIN_FD, libc::TCSANOW, &self.saved);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_cleanup_disables_interactive_modes_without_ris() {
+        let seq = terminal_cleanup_sequences();
+        assert!(seq.starts_with(b"\x1b[<u\x1b[=0u"));
+        assert!(seq_contains(
+            seq,
+            b"\x1b[?9;1000;1001;1002;1003;1005;1006;1015;1016l"
+        ));
+        assert!(seq_contains(seq, b"\x1b[?1004l"));
+        assert!(seq_contains(seq, b"\x1b[?2004;2005;2006l"));
+        assert!(seq_contains(seq, b"\x1b[?2026l"));
+        assert!(seq_contains(seq, b"\x1b[?47;1047;1048;1049l"));
+        assert!(seq_contains(seq, b"\x1b[?25h"));
+        assert!(seq.ends_with(b"\x1b[0 q\x1b[0m"));
+        assert!(!seq_contains(seq, b"\x1bc"));
+    }
+
+    fn seq_contains(seq: &[u8], needle: &[u8]) -> bool {
+        seq.windows(needle.len()).any(|window| window == needle)
     }
 }
