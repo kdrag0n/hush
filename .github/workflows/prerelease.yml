@@ -75,18 +75,13 @@ jobs:
             fi
           fi
 
-          shasum -a 256 "dist/hush-${artifact}" > "dist/hush-${artifact}.sha256"
-          shasum -a 256 "dist/hush-server-${artifact}" > "dist/hush-server-${artifact}.sha256"
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: |
             dist/hush-${{ matrix.artifact }}
-            dist/hush-${{ matrix.artifact }}.sha256
             dist/hush-server-${{ matrix.artifact }}
-            dist/hush-server-${{ matrix.artifact }}.sha256
           if-no-files-found: error
 
   publish:
@@ -130,7 +125,7 @@ jobs:
           {
             printf 'Automatic hush prerelease for `%s` at `%s`.\n\n' "${REF_NAME}" "${short_sha}"
             printf 'Built by %s.\n\n' "${run_url}"
-            printf 'Assets are uncompressed binaries plus `.sha256` files:\n\n'
+            printf 'Assets are uncompressed binaries:\n\n'
             printf -- '- `hush-linux-x86_64-musl`\n'
             printf -- '- `hush-server-linux-x86_64-musl`\n'
             printf -- '- `hush-linux-aarch64-musl`\n'
