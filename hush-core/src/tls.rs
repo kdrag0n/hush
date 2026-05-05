@@ -303,6 +303,7 @@ fn long_idle_transport() -> Result<TransportConfig> {
     let mut transport = TransportConfig::default();
     transport.max_idle_timeout(Some(Duration::from_secs(7 * 24 * 60 * 60).try_into()?));
     transport.keep_alive_interval(None);
+    transport.congestion_controller_factory(Arc::new(crate::congestion::KcpConfig::fast()));
     Ok(transport)
 }
 
