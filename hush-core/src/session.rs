@@ -331,7 +331,8 @@ async fn run_pty(
 async fn copy_pty_to_quic(mut pty: AsyncPty, mut send: SendStream) -> Result<()> {
     tokio::io::copy(&mut pty, &mut send).await?;
     send.finish()?;
-    let _ = send.stopped().await;
+    // The exit-status side stream is the application-level completion signal.
+    // Waiting for QUIC read completion here adds visible logout latency.
     Ok(())
 }
 
