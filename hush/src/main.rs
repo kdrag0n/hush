@@ -219,14 +219,24 @@ async fn run_pty(
     write_frame(&mut send, &StreamOpen::SessionPtyData).await?;
     expect_session_ready(&mut control_recv).await?;
     let resize_task = tokio::spawn(watch_resize(control_tx.clone()));
-    let in_task = tokio::spawn(stdio_to_quic(libc::STDIN_FILENO, send));
+    let mut status_task = tokio::spawn(async move { read_exit_status(&mut control_recv).await });
+    let (in_task, mut escape_rx) = spawn_stdin_pump(send);
     let out_task = tokio::spawn(quic_to_stdio(recv, libc::STDOUT_FILENO));
-    let status = read_exit_status(&mut control_recv).await?;
+    let end = loop {
+        tokio::select! {
+            status = &mut status_task => break SessionEnd::Remote(status??),
+            Some(()) = escape_rx.recv() => {
+                conn.close(0u32.into(), b"~.");
+                break SessionEnd::Escape;
+            }
+        }
+    };
+    status_task.abort();
     resize_task.abort();
     in_task.abort();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), out_task).await;
     drop(raw);
-    finish_process(status);
+    finish_session(end);
 }
 
 async fn run_pipes(
@@ -236,7 +246,7 @@ async fn run_pipes(
 ) -> Result<()> {
     let (local_signal_tx, mut local_signal_rx) = tokio::sync::mpsc::channel(8);
     let signal_task = tokio::spawn(watch_signals(control_tx, local_signal_tx));
-    let mut sigterm_watchdog = None;
+    let mut sigterm_watchdog: Option<tokio::task::JoinHandle<()>> = None;
     let (mut send, recv) = conn.open_bi().await?;
     write_frame(&mut send, &StreamOpen::SessionStdIo).await?;
     expect_session_ready(&mut control_recv).await?;
@@ -249,12 +259,17 @@ async fn run_pipes(
         }
     };
 
-    let in_task = tokio::spawn(stdio_to_quic(libc::STDIN_FILENO, send));
+    let (in_task, mut escape_rx) = spawn_stdin_pump(send);
     let out_task = tokio::spawn(quic_to_stdio(recv, libc::STDOUT_FILENO));
     let err_task = tokio::spawn(quic_to_stdio(stderr_recv, libc::STDERR_FILENO));
-    let status = loop {
+    let mut status_task = tokio::spawn(async move { read_exit_status(&mut control_recv).await });
+    let end = loop {
         tokio::select! {
-            status = read_exit_status(&mut control_recv) => break status?,
+            status = &mut status_task => break SessionEnd::Remote(status??),
+            Some(()) = escape_rx.recv() => {
+                conn.close(0u32.into(), b"~.");
+                break SessionEnd::Escape;
+            }
             Some(signal) = local_signal_rx.recv() => {
                 if signal == RemoteSignal::SIGTERM && sigterm_watchdog.is_none() {
                     sigterm_watchdog = Some(tokio::spawn(async {
@@ -265,6 +280,7 @@ async fn run_pipes(
             }
         }
     };
+    status_task.abort();
     if let Some(watchdog) = sigterm_watchdog {
         watchdog.abort();
     }
@@ -272,7 +288,7 @@ async fn run_pipes(
     in_task.abort();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), out_task).await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), err_task).await;
-    finish_process(status);
+    finish_session(end);
 }
 
 #[cfg(unix)]
@@ -311,21 +327,116 @@ async fn watch_signals(
     }
 }
 
-async fn stdio_to_quic(fd: RawFd, mut send: quinn::SendStream) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdinPumpExit {
+    Eof,
+    Escape,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SessionEnd {
+    Remote(ProcessExit),
+    Escape,
+}
+
+fn spawn_stdin_pump(
+    send: quinn::SendStream,
+) -> (tokio::task::JoinHandle<()>, tokio::sync::mpsc::Receiver<()>) {
+    let (escape_tx, escape_rx) = tokio::sync::mpsc::channel(1);
+    let task = tokio::spawn(async move {
+        match stdio_to_quic(libc::STDIN_FILENO, send).await {
+            Ok(StdinPumpExit::Escape) => {
+                let _ = escape_tx.try_send(());
+            }
+            Ok(StdinPumpExit::Eof) => {}
+            Err(err) => tracing::debug!(%err, "stdin pump stopped"),
+        }
+    });
+    (task, escape_rx)
+}
+
+async fn stdio_to_quic(fd: RawFd, mut send: quinn::SendStream) -> Result<StdinPumpExit> {
+    let enable_escape = fd == libc::STDIN_FILENO && std::io::stdin().is_terminal();
     let fd = Arc::new(async_stdio_fd(fd)?);
+    let mut escape = EscapeFilter::new(enable_escape);
     let mut buf = vec![0u8; 8192];
+    let mut out = Vec::with_capacity(buf.len());
     loop {
         let mut guard = fd.readable().await?;
         match guard.try_io(|inner| read_fd(inner.get_ref().as_raw_fd(), &mut buf)) {
             Ok(Ok(0)) => break,
-            Ok(Ok(n)) => send.write_all(&buf[..n]).await?,
+            Ok(Ok(n)) => {
+                out.clear();
+                if escape.push(&buf[..n], &mut out) {
+                    return Ok(StdinPumpExit::Escape);
+                }
+                if !out.is_empty() {
+                    send.write_all(&out).await?;
+                }
+            }
             Ok(Err(err)) => return Err(err.into()),
             Err(_) => continue,
         }
     }
+    out.clear();
+    escape.finish(&mut out);
+    if !out.is_empty() {
+        send.write_all(&out).await?;
+    }
     send.finish()?;
     let _ = send.stopped().await;
-    Ok(())
+    Ok(StdinPumpExit::Eof)
+}
+
+#[derive(Debug)]
+struct EscapeFilter {
+    enabled: bool,
+    at_line_start: bool,
+    pending_tilde: bool,
+}
+
+impl EscapeFilter {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            at_line_start: true,
+            pending_tilde: false,
+        }
+    }
+
+    fn push(&mut self, input: &[u8], output: &mut Vec<u8>) -> bool {
+        if !self.enabled {
+            output.extend_from_slice(input);
+            return false;
+        }
+
+        for &byte in input {
+            if self.pending_tilde {
+                self.pending_tilde = false;
+                if byte == b'.' {
+                    return true;
+                }
+                output.push(b'~');
+                self.at_line_start = false;
+            }
+
+            if self.at_line_start && byte == b'~' {
+                self.pending_tilde = true;
+                continue;
+            }
+
+            output.push(byte);
+            self.at_line_start = byte == b'\n' || byte == b'\r';
+        }
+        false
+    }
+
+    fn finish(&mut self, output: &mut Vec<u8>) {
+        if self.pending_tilde {
+            self.pending_tilde = false;
+            output.push(b'~');
+        }
+    }
 }
 
 async fn quic_to_stdio(mut recv: quinn::RecvStream, fd: RawFd) -> Result<()> {
@@ -460,10 +571,11 @@ fn session_env(mode: &SessionMode) -> Vec<EnvVar> {
     env
 }
 
-fn finish_process(status: ProcessExit) -> ! {
-    match status {
-        ProcessExit::Code(code) => std::process::exit(code),
-        ProcessExit::Signal(signal) => self_terminate_with_signal(signal),
+fn finish_session(end: SessionEnd) -> ! {
+    match end {
+        SessionEnd::Remote(ProcessExit::Code(code)) => std::process::exit(code),
+        SessionEnd::Remote(ProcessExit::Signal(signal)) => self_terminate_with_signal(signal),
+        SessionEnd::Escape => std::process::exit(255),
     }
 }
 
@@ -729,6 +841,57 @@ mod tests {
                 "192.0.2.2:443".parse().unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn escape_filter_detects_tilde_dot_at_line_start() {
+        let (escaped, output) = run_escape_filter(true, &[b"hello\n~."]);
+        assert!(escaped);
+        assert_eq!(output, b"hello\n");
+    }
+
+    #[test]
+    fn escape_filter_carries_tilde_across_reads() {
+        let (escaped, output) = run_escape_filter(true, &[b"hello\r", b"~", b"."]);
+        assert!(escaped);
+        assert_eq!(output, b"hello\r");
+    }
+
+    #[test]
+    fn escape_filter_ignores_tilde_dot_away_from_line_start() {
+        let (escaped, output) = run_escape_filter(true, &[b"echo ~.\n"]);
+        assert!(!escaped);
+        assert_eq!(output, b"echo ~.\n");
+    }
+
+    #[test]
+    fn escape_filter_only_handles_tilde_dot() {
+        let (escaped, output) = run_escape_filter(true, &[b"~~.\n~x\n~"]);
+        assert!(!escaped);
+        assert_eq!(output, b"~~.\n~x\n~");
+    }
+
+    #[test]
+    fn escape_filter_can_be_disabled() {
+        let (escaped, output) = run_escape_filter(false, &[b"~.\n"]);
+        assert!(!escaped);
+        assert_eq!(output, b"~.\n");
+    }
+
+    fn run_escape_filter(enabled: bool, chunks: &[&[u8]]) -> (bool, Vec<u8>) {
+        let mut filter = EscapeFilter::new(enabled);
+        let mut output = Vec::new();
+        let mut escaped = false;
+        for chunk in chunks {
+            if filter.push(chunk, &mut output) {
+                escaped = true;
+                break;
+            }
+        }
+        if !escaped {
+            filter.finish(&mut output);
+        }
+        (escaped, output)
     }
 }
 
