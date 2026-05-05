@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: prerelease-${{ github.ref }}
@@ -17,6 +17,8 @@ jobs:
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -37,6 +39,8 @@ jobs:
     steps:
       - name: Check out sources
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust target
         run: |
@@ -86,13 +90,17 @@ jobs:
 
   publish:
     name: publish prerelease
+    if: github.ref == 'refs/heads/main' && ((github.event_name == 'push' && github.event.pusher.name == 'kdrag0n') || (github.event_name == 'workflow_dispatch' && github.actor == 'kdrag0n'))
     runs-on: ubuntu-24.04
     needs: build
+    permissions:
+      contents: write
     steps:
       - name: Check out sources
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -119,7 +127,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -f "${tag}" "${SHA}"
-          git push --force origin "refs/tags/${tag}"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git" "refs/tags/${tag}"
 
           notes="$(mktemp)"
           {
