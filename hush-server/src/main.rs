@@ -45,6 +45,7 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     init_logging(args.verbose);
+    hush_core::resource::raise_nofile_soft_limit_to_hard()?;
     let config_path = args
         .config
         .clone()

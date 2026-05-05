@@ -65,6 +65,7 @@ struct ForwardArg {
 async fn main() -> Result<()> {
     let args = Args::parse();
     init_logging(args.verbose);
+    hush_core::resource::raise_nofile_soft_limit_to_hard()?;
     let target = Target::parse(&args.target, args.port)?;
     let ssh_cfg = config::read_ssh_config(&target.host_alias)?;
     let user = target
