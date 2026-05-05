@@ -6,7 +6,7 @@ use hush_core::{
     protocol::{ControlRequest, ControlResponse, OpenSession, read_frame, write_frame},
 };
 use quinn::Endpoint;
-use rustls::pki_types::CertificateDer;
+use rustls_pki_types::CertificateDer;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::Semaphore;
 

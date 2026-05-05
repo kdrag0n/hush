@@ -7,12 +7,9 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-console.workspace = true
 hush-core = { path = "../hush-core" }
 libc.workspace = true
 quinn.workspace = true
-rustls.workspace = true
-shell-words.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
