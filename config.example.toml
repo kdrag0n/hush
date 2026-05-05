@@ -1,0 +1,52 @@
+# Example hush-server configuration.
+#
+# Copy this file to the server config path and edit it:
+#
+#   sudo mkdir -p /etc/hush/server
+#   sudo cp config.example.toml /etc/hush/server/config.toml
+#
+# When hush-server runs as root, the default data directory is /etc/hush and the
+# default config path is /etc/hush/server/config.toml. Command-line flags
+# override values in this file.
+
+# UDP listen address for incoming hush connections.
+# Default: "[::]:22022"
+listen = "[::]:22022"
+
+# Base data directory. Server files live under data_dir/server.
+# Default when running as root: "/etc/hush"
+# Default when running as a normal user: platform data directory
+data_dir = "/etc/hush"
+
+# DER-encoded TLS host certificate and private key.
+# If omitted, hush-server creates and reuses these under data_dir/server.
+# host_cert_path = "/etc/hush/server/host_cert.der"
+# host_key_path = "/etc/hush/server/host_key.der"
+
+# authorized_keys file used for client public-key authorization.
+# If omitted, hush-server uses the target user's ~/.ssh/authorized_keys.
+# authorized_keys_path = "/home/alice/.ssh/authorized_keys"
+
+# Restrict logins to these users. Leave empty or omit to allow any local user
+# whose authorized_keys file accepts the client's key.
+# allow_users = ["alice", "deploy"]
+
+# Allow local and remote TCP forwarding.
+# Default: true
+allow_tcp_forwarding = true
+
+# Maximum concurrent QUIC connections accepted by the server.
+# Default: 128
+max_connections = 128
+
+# Maximum shell sessions accepted per QUIC connection.
+# Default: 1
+max_sessions_per_connection = 1
+
+# Maximum remote -R listeners accepted before a session starts.
+# Default: 16
+max_forwards_per_connection = 16
+
+# Maximum concurrent local-forward streams per connection.
+# Default: 64
+max_forward_streams_per_connection = 64

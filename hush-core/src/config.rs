@@ -119,3 +119,14 @@ fn host_pattern_matches(pattern: &str, host: &str) -> bool {
     }
     pattern == host
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ServerConfigFile;
+
+    #[test]
+    fn config_example_parses() {
+        toml::from_str::<ServerConfigFile>(include_str!("../../config.example.toml"))
+            .expect("config.example.toml should parse");
+    }
+}
