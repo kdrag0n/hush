@@ -843,6 +843,7 @@ name = "hush-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
  "base64",
  "hex",
  "libc",
@@ -858,6 +859,7 @@ dependencies = [
  "shell-words",
  "ssh-agent-client-rs",
  "ssh-key",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",

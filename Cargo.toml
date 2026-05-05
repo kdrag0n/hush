@@ -9,6 +9,7 @@ repository = "https://example.invalid/hush"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+aws-lc-rs = "1.15.1"
 base64 = "0.22.1"
 clap = { version = "4.5.51", features = ["derive"] }
 hex = "0.4.3"

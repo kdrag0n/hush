@@ -5,7 +5,7 @@ use hush_core::{
     config::{self, ServerRuntimeConfig},
     protocol::{StreamOpen, StreamResponse, read_frame, write_frame},
 };
-use quinn::Endpoint;
+use quinn::{Endpoint, default_runtime};
 use rustls_pki_types::CertificateDer;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::Semaphore;
@@ -63,7 +63,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
 
     let server_config =
         hush_core::tls::make_server_config(&data_dir, host_cert.as_deref(), host_key.as_deref())?;
-    let endpoint = Endpoint::server(server_config, listen)?;
+    let endpoint_config = hush_core::endpoint::server_endpoint_config(&data_dir)?;
+    let socket = std::net::UdpSocket::bind(listen)?;
+    let runtime = default_runtime().context("no async runtime found")?;
+    let endpoint = Endpoint::new(endpoint_config, Some(server_config), socket, runtime)?;
     let local_addr = endpoint.local_addr()?;
     tracing::info!(
         addr = %local_addr,
