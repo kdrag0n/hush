@@ -7,7 +7,7 @@ use std::path::PathBuf;
     name = "hush",
     version,
     about = "SSH-like remote command client over QUIC",
-    long_about = "hush connects to a hush-server over QUIC, authenticates with an Ed25519 SSH key, and runs a remote shell or command.\n\nTarget syntax is [user@]host[:port]. IPv6 literals may be written as [::1]:4433.\n\nForward syntax for -L and -R is [listen_host:]listen_port:target_host:target_port."
+    long_about = "hush connects to a hush-server over QUIC, authenticates with an Ed25519 SSH key, and runs a remote shell or command.\n\nTarget syntax is [user@]host[:port]. IPv6 literals may be written as [::1]:22022.\n\nForward syntax for -L and -R is [listen_host:]listen_port:target_host:target_port."
 )]
 pub(crate) struct Args {
     /// Enable client logging. Without this, client logging is disabled.

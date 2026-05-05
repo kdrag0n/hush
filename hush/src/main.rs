@@ -31,7 +31,10 @@ async fn main() -> Result<()> {
         .or(ssh_cfg.user)
         .unwrap_or_else(auth::current_username);
     let host = ssh_cfg.hostname.unwrap_or(target.host);
-    let port = target.port.or(ssh_cfg.port).unwrap_or(4433);
+    let port = target
+        .port
+        .or(ssh_cfg.port)
+        .unwrap_or(hush_core::defaults::DEFAULT_PORT);
     let data_dir = args
         .data_dir
         .unwrap_or_else(hush_core::paths::default_data_dir);

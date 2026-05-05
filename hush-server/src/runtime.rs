@@ -24,7 +24,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         .data_dir
         .or(file_cfg.data_dir)
         .unwrap_or(initial_data_dir);
-    let listen = if args.listen.to_string() != "[::]:4433" {
+    let default_listen =
+        SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], hush_core::defaults::DEFAULT_PORT));
+    let listen = if args.listen != default_listen {
         args.listen
     } else {
         file_cfg.listen.unwrap_or(args.listen)
