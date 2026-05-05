@@ -62,30 +62,31 @@ jobs:
           set -euo pipefail
           artifact="${{ matrix.artifact }}"
           target="${{ matrix.target }}"
-          out="dist/${artifact}"
-          mkdir -p "${out}"
+          mkdir -p dist
 
-          cp "target/${target}/release/hush" "${out}/hush"
-          cp "target/${target}/release/hush-server" "${out}/hush-server"
+          cp "target/${target}/release/hush" "dist/hush-${artifact}"
+          cp "target/${target}/release/hush-server" "dist/hush-server-${artifact}"
 
           if [[ "${target}" == *-musl ]]; then
-            file "${out}/hush" "${out}/hush-server"
-            if file "${out}/hush" "${out}/hush-server" | grep -q "dynamically linked"; then
+            file "dist/hush-${artifact}" "dist/hush-server-${artifact}"
+            if file "dist/hush-${artifact}" "dist/hush-server-${artifact}" | grep -q "dynamically linked"; then
               echo "musl release binaries must be static" >&2
               exit 1
             fi
           fi
 
-          tar -C "dist" -czf "dist/${artifact}.tar.gz" "${artifact}"
-          shasum -a 256 "dist/${artifact}.tar.gz" > "dist/${artifact}.tar.gz.sha256"
+          shasum -a 256 "dist/hush-${artifact}" > "dist/hush-${artifact}.sha256"
+          shasum -a 256 "dist/hush-server-${artifact}" > "dist/hush-server-${artifact}.sha256"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: |
-            dist/${{ matrix.artifact }}.tar.gz
-            dist/${{ matrix.artifact }}.tar.gz.sha256
+            dist/hush-${{ matrix.artifact }}
+            dist/hush-${{ matrix.artifact }}.sha256
+            dist/hush-server-${{ matrix.artifact }}
+            dist/hush-server-${{ matrix.artifact }}.sha256
           if-no-files-found: error
 
   publish:
@@ -129,10 +130,13 @@ jobs:
           {
             printf 'Automatic hush prerelease for `%s` at `%s`.\n\n' "${REF_NAME}" "${short_sha}"
             printf 'Built by %s.\n\n' "${run_url}"
-            printf 'Assets contain both `hush` and `hush-server`:\n\n'
-            printf -- '- `hush-linux-x86_64-musl.tar.gz`\n'
-            printf -- '- `hush-linux-aarch64-musl.tar.gz`\n'
-            printf -- '- `hush-macos-aarch64.tar.gz`\n'
+            printf 'Assets are uncompressed binaries plus `.sha256` files:\n\n'
+            printf -- '- `hush-linux-x86_64-musl`\n'
+            printf -- '- `hush-server-linux-x86_64-musl`\n'
+            printf -- '- `hush-linux-aarch64-musl`\n'
+            printf -- '- `hush-server-linux-aarch64-musl`\n'
+            printf -- '- `hush-macos-aarch64`\n'
+            printf -- '- `hush-server-macos-aarch64`\n'
           } > "${notes}"
 
           if gh release view "${tag}" >/dev/null 2>&1; then
