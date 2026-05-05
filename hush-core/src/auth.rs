@@ -9,6 +9,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
 };
+use subtle::ConstantTimeEq;
 use x509_parser::prelude::FromDer;
 
 #[derive(Debug, Clone)]
@@ -206,7 +207,10 @@ pub fn is_authorized(user: &str, key: &PublicKey, override_path: Option<&Path>) 
         let parsed = PublicKey::from_openssh(line);
         if let Ok(candidate) = parsed {
             if candidate.algorithm() == Algorithm::Ed25519
-                && candidate.to_bytes().ok().as_deref() == Some(wanted.as_slice())
+                && candidate
+                    .to_bytes()
+                    .ok()
+                    .is_some_and(|candidate| same_public_key_bytes(&candidate, &wanted))
             {
                 return Ok(true);
             }
@@ -216,7 +220,11 @@ pub fn is_authorized(user: &str, key: &PublicKey, override_path: Option<&Path>) 
         if let Some(key_start) = line.find("ssh-ed25519 ") {
             let candidate_line = &line[key_start..];
             if let Ok(candidate) = PublicKey::from_openssh(candidate_line) {
-                if candidate.to_bytes().ok().as_deref() == Some(wanted.as_slice()) {
+                if candidate
+                    .to_bytes()
+                    .ok()
+                    .is_some_and(|candidate| same_public_key_bytes(&candidate, &wanted))
+                {
                     bail!(
                         "{} contains options for a matching key; authorized_keys options are not supported yet",
                         path.display()
@@ -267,7 +275,11 @@ fn preferred_public_key() -> Option<PublicKey> {
 }
 
 fn same_public_key(a: &PublicKey, b: &PublicKey) -> Result<bool> {
-    Ok(a.to_bytes()? == b.to_bytes()?)
+    Ok(same_public_key_bytes(&a.to_bytes()?, &b.to_bytes()?))
+}
+
+fn same_public_key_bytes(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 fn public_key_path_for_private_key(path: &Path) -> PathBuf {

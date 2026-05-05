@@ -859,6 +859,7 @@ dependencies = [
  "shell-words",
  "ssh-agent-client-rs",
  "ssh-key",
+ "subtle",
  "tempfile",
  "tokio",
  "toml",
