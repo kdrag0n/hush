@@ -29,6 +29,8 @@ struct ConnectionEnv {
     ssh_connection: String,
 }
 
+const AUTH_FAILURE_MESSAGE: &str = "unauthorized";
+
 impl ConnectionEnv {
     fn from_connection(conn: &Connection, server_addr: SocketAddr) -> Self {
         let remote = conn.remote_address();
@@ -62,19 +64,24 @@ pub async fn run_server_session(
     if !config.allow_users.is_empty()
         && !config.allow_users.iter().any(|user| user == &request.user)
     {
-        let msg = format!("user {} is not allowed by server config", request.user);
-        tracing::warn!(user = %request.user, key = %peer_fp, reason = %msg, "auth rejected");
-        send_response_error(&mut session_send, &msg).await;
-        bail!("{msg}");
+        tracing::warn!(
+            user = %request.user,
+            key = %peer_fp,
+            reason = "user is not allowed by server config",
+            "auth rejected"
+        );
+        send_auth_failure(&mut session_send).await;
+        bail!(AUTH_FAILURE_MESSAGE);
     }
     if !auth::can_login_as(&request.user) {
-        let msg = format!(
-            "server is not root; only {} may log in",
-            auth::current_username()
+        tracing::warn!(
+            user = %request.user,
+            key = %peer_fp,
+            current_user = %auth::current_username(),
+            "auth rejected because server is not root and requested user differs"
         );
-        tracing::warn!(user = %request.user, key = %peer_fp, reason = %msg, "auth rejected");
-        send_response_error(&mut session_send, &msg).await;
-        bail!("{msg}");
+        send_auth_failure(&mut session_send).await;
+        bail!(AUTH_FAILURE_MESSAGE);
     }
     let authorized = auth::is_authorized(
         &request.user,
@@ -84,18 +91,18 @@ pub async fn run_server_session(
     match authorized {
         Ok(true) => tracing::info!(user = %request.user, key = %peer_fp, "auth accepted"),
         Ok(false) => {
-            let msg = format!(
-                "public key {peer_fp} is not authorized for {}",
-                request.user
+            tracing::warn!(
+                user = %request.user,
+                key = %peer_fp,
+                "auth rejected because public key is not authorized"
             );
-            tracing::warn!(user = %request.user, key = %peer_fp, reason = %msg, "auth rejected");
-            send_response_error(&mut session_send, &msg).await;
-            bail!("{msg}");
+            send_auth_failure(&mut session_send).await;
+            bail!(AUTH_FAILURE_MESSAGE);
         }
         Err(err) => {
             tracing::warn!(user = %request.user, key = %peer_fp, reason = %err, "auth rejected");
-            send_response_error(&mut session_send, &err.to_string()).await;
-            return Err(err);
+            send_auth_failure(&mut session_send).await;
+            bail!(AUTH_FAILURE_MESSAGE);
         }
     };
 
@@ -211,6 +218,10 @@ async fn send_response_error(send: &mut SendStream, msg: &str) {
     let _ = write_frame(send, &StreamResponse::Error(msg.to_owned())).await;
     let _ = send.finish();
     let _ = send.stopped().await;
+}
+
+async fn send_auth_failure(send: &mut SendStream) {
+    send_response_error(send, AUTH_FAILURE_MESSAGE).await;
 }
 
 async fn send_session_end(conn: &Connection, header: StreamOpen) -> Result<()> {

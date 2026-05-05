@@ -457,7 +457,7 @@ fn remote_forwarding_carries_tcp() {
 }
 
 #[test]
-fn authorized_keys_options_are_rejected() {
+fn authorized_keys_options_are_rejected_without_detail() {
     let mut env = TestEnv::new();
     let key = fs::read_to_string(env.home.join(".ssh/id_ed25519.pub")).unwrap();
     fs::write(&env.authorized_keys, format!("command=\"nope\" {key}")).unwrap();
@@ -473,10 +473,9 @@ fn authorized_keys_options_are_rejected() {
         .output()
         .unwrap();
     assert!(!out.status.success(), "{out:?}");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("authorized_keys options"),
-        "{out:?}"
-    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unauthorized"), "{out:?}");
+    assert!(!stderr.contains("authorized_keys options"), "{out:?}");
 }
 
 #[test]
