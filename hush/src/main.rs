@@ -11,7 +11,7 @@ use hush_core::{
     auth, config,
     forwarding::LocalForward,
     protocol::{
-        ControlRequest, ControlResponse, OpenSession, RemoteForwardRequest, SessionMode, TcpTarget,
+        OpenSession, RemoteForwardRequest, SessionMode, StreamOpen, StreamResponse, TcpTarget,
         read_frame, write_frame,
     },
 };
@@ -78,11 +78,11 @@ async fn main() -> Result<()> {
         }
     });
 
-    let (mut control_send, mut control_recv) = conn.open_bi().await?;
     for spec in args.remote_forward.iter().cloned() {
+        let (mut send, mut recv) = conn.open_bi().await?;
         write_frame(
-            &mut control_send,
-            &ControlRequest::OpenRemoteForward(RemoteForwardRequest {
+            &mut send,
+            &StreamOpen::OpenRemoteForward(RemoteForwardRequest {
                 listen_host: spec.listen_host,
                 listen_port: spec.listen_port,
                 target: TcpTarget {
@@ -92,7 +92,8 @@ async fn main() -> Result<()> {
             }),
         )
         .await?;
-        expect_ok(&mut control_recv).await?;
+        send.finish()?;
+        expect_ok(&mut recv).await?;
     }
 
     let mode = session::choose_mode(args.tty, args.no_tty);
@@ -104,23 +105,16 @@ async fn main() -> Result<()> {
         mode,
         env,
     };
-    write_frame(
-        &mut control_send,
-        &ControlRequest::OpenSession(session.clone()),
-    )
-    .await?;
-    let (control_tx, control_rx) = tokio::sync::mpsc::channel(32);
-    tokio::spawn(session::control_writer(control_send, control_rx));
     match session.mode {
-        SessionMode::Pty { .. } => session::run_pty(conn, control_recv, control_tx).await,
-        SessionMode::Pipes => session::run_pipes(conn, control_recv, control_tx).await,
+        SessionMode::Pty { .. } => session::run_pty(conn, session).await,
+        SessionMode::Pipes => session::run_pipes(conn, session).await,
     }
 }
 
 async fn expect_ok(recv: &mut quinn::RecvStream) -> Result<()> {
-    match read_frame::<ControlResponse>(recv).await? {
-        ControlResponse::Ok => Ok(()),
-        ControlResponse::Error(err) => bail!("{err}"),
+    match read_frame::<StreamResponse>(recv).await? {
+        StreamResponse::Ok => Ok(()),
+        StreamResponse::Error(err) => bail!("{err}"),
         other => bail!("unexpected control response: {other:?}"),
     }
 }

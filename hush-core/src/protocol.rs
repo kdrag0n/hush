@@ -58,15 +58,6 @@ pub struct RemoteForwardRequest {
     pub target: TcpTarget,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ControlRequest {
-    OpenSession(OpenSession),
-    Resize(TermSize),
-    Signal(RemoteSignal),
-    OpenRemoteForward(RemoteForwardRequest),
-    Close,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteSignal {
     SIGABRT,
@@ -95,10 +86,9 @@ impl RemoteSignal {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ControlResponse {
+pub enum StreamResponse {
     Ok,
     SessionReady,
-    ExitStatus(ProcessExit),
     Error(String),
 }
 
@@ -110,9 +100,13 @@ pub enum ProcessExit {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StreamOpen {
-    SessionPtyData,
-    SessionStdIo,
+    Session { request: OpenSession },
     SessionStderr,
+    SessionExitStatus(ProcessExit),
+    SessionError(String),
+    Resize(TermSize),
+    Signal(RemoteSignal),
+    OpenRemoteForward(RemoteForwardRequest),
     LocalTcpForward { target: TcpTarget },
     RemoteTcpForward { target: TcpTarget },
 }

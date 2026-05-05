@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use hush_core::{
     auth,
     config::{self, ServerRuntimeConfig},
-    protocol::{ControlRequest, ControlResponse, OpenSession, read_frame, write_frame},
+    protocol::{StreamOpen, StreamResponse, read_frame, write_frame},
 };
 use quinn::Endpoint;
 use rustls_pki_types::CertificateDer;
@@ -126,25 +126,27 @@ async fn handle_connection(
     server_addr: SocketAddr,
 ) -> Result<()> {
     let peer_key = peer_public_key(&conn)?;
-    let (mut control_send, mut control_recv) = conn.accept_bi().await?;
     let mut remote_forwards = 0usize;
-    let session = loop {
-        match read_frame::<ControlRequest>(&mut control_recv).await? {
-            ControlRequest::OpenRemoteForward(req) => {
+    loop {
+        let (mut send, mut recv) = conn.accept_bi().await?;
+        match read_frame::<StreamOpen>(&mut recv).await? {
+            StreamOpen::OpenRemoteForward(req) => {
                 if !config.allow_tcp_forwarding {
                     write_frame(
-                        &mut control_send,
-                        &ControlResponse::Error("TCP forwarding is disabled".to_owned()),
+                        &mut send,
+                        &StreamResponse::Error("TCP forwarding is disabled".to_owned()),
                     )
                     .await?;
+                    send.finish()?;
                     continue;
                 }
                 if remote_forwards >= config.max_forwards_per_connection {
                     write_frame(
-                        &mut control_send,
-                        &ControlResponse::Error("remote forward limit reached".to_owned()),
+                        &mut send,
+                        &StreamResponse::Error("remote forward limit reached".to_owned()),
                     )
                     .await?;
+                    send.finish()?;
                     continue;
                 }
                 remote_forwards += 1;
@@ -161,62 +163,41 @@ async fn handle_connection(
                         tracing::warn!(%err, "remote forward stopped");
                     }
                 });
-                write_frame(&mut control_send, &ControlResponse::Ok).await?;
+                write_frame(&mut send, &StreamResponse::Ok).await?;
+                send.finish()?;
             }
-            ControlRequest::OpenSession(session) => {
+            StreamOpen::Session { request: session } => {
                 if config.max_sessions_per_connection == 0 {
                     write_frame(
-                        &mut control_send,
-                        &ControlResponse::Error("session limit reached".to_owned()),
+                        &mut send,
+                        &StreamResponse::Error("session limit reached".to_owned()),
                     )
                     .await?;
+                    send.finish()?;
                     continue;
                 }
-                break session;
+                return match hush_core::session::run_server_session(
+                    conn,
+                    send,
+                    recv,
+                    session,
+                    peer_key,
+                    config,
+                    server_addr,
+                )
+                .await
+                {
+                    Ok(_) => Ok(()),
+                    Err(err) => {
+                        tracing::warn!(%err, "session failed");
+                        Ok(())
+                    }
+                };
             }
-            ControlRequest::Close => return Ok(()),
-            ControlRequest::Resize(_) | ControlRequest::Signal(_) => {}
-        }
-    };
-    run_session(
-        conn,
-        control_send,
-        control_recv,
-        session,
-        peer_key,
-        config,
-        server_addr,
-    )
-    .await
-}
-
-async fn run_session(
-    conn: quinn::Connection,
-    control_send: quinn::SendStream,
-    control_recv: quinn::RecvStream,
-    session: OpenSession,
-    peer_key: ssh_key::PublicKey,
-    config: ServerRuntimeConfig,
-    server_addr: SocketAddr,
-) -> Result<()> {
-    match hush_core::session::run_server_session(
-        conn,
-        control_send,
-        control_recv,
-        session,
-        peer_key,
-        config,
-        server_addr,
-    )
-    .await
-    {
-        Ok(_) => Ok(()),
-        Err(err) => {
-            tracing::warn!(%err, "session failed");
-            // The stream may already be closed; best effort is enough here.
-            let _ = err;
-            Ok(())
-        }
+            other => {
+                tracing::warn!(?other, "unexpected pre-session stream");
+            }
+        };
     }
 }
 

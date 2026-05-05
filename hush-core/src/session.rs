@@ -7,8 +7,8 @@ use crate::{
         send_process_group_signal, set_nonblocking, shell_for_user, tty_name,
     },
     protocol::{
-        ControlRequest, ControlResponse, EnvVar, OpenSession, ProcessExit, RemoteSignal,
-        SessionMode, StreamOpen, TermSize, read_frame, write_frame,
+        EnvVar, OpenSession, ProcessExit, RemoteSignal, SessionMode, StreamOpen, StreamResponse,
+        TermSize, read_frame, write_frame,
     },
 };
 use anyhow::{Context, Result, bail};
@@ -49,8 +49,8 @@ impl ConnectionEnv {
 
 pub async fn run_server_session(
     conn: Connection,
-    mut control_send: SendStream,
-    mut control_recv: RecvStream,
+    mut session_send: SendStream,
+    session_recv: RecvStream,
     request: OpenSession,
     peer_key: ssh_key::PublicKey,
     config: ServerRuntimeConfig,
@@ -64,7 +64,7 @@ pub async fn run_server_session(
     {
         let msg = format!("user {} is not allowed by server config", request.user);
         tracing::warn!(user = %request.user, key = %peer_fp, reason = %msg, "auth rejected");
-        send_control_error(&mut control_send, &msg).await;
+        send_response_error(&mut session_send, &msg).await;
         bail!("{msg}");
     }
     if !auth::can_login_as(&request.user) {
@@ -73,7 +73,7 @@ pub async fn run_server_session(
             auth::current_username()
         );
         tracing::warn!(user = %request.user, key = %peer_fp, reason = %msg, "auth rejected");
-        send_control_error(&mut control_send, &msg).await;
+        send_response_error(&mut session_send, &msg).await;
         bail!("{msg}");
     }
     let authorized = auth::is_authorized(
@@ -89,23 +89,22 @@ pub async fn run_server_session(
                 request.user
             );
             tracing::warn!(user = %request.user, key = %peer_fp, reason = %msg, "auth rejected");
-            send_control_error(&mut control_send, &msg).await;
+            send_response_error(&mut session_send, &msg).await;
             bail!("{msg}");
         }
         Err(err) => {
             tracing::warn!(user = %request.user, key = %peer_fp, reason = %err, "auth rejected");
-            send_control_error(&mut control_send, &err.to_string()).await;
+            send_response_error(&mut session_send, &err.to_string()).await;
             return Err(err);
         }
     };
 
-    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(4);
     let (resize_tx, resize_rx) = tokio::sync::mpsc::channel(16);
     let (signal_tx, signal_rx) = tokio::sync::mpsc::channel(16);
-    let accept_conn = conn.clone();
+    let accept_bi_conn = conn.clone();
     let forward_slots = Arc::new(Semaphore::new(config.max_forward_streams_per_connection));
     let accept_task = tokio::spawn(async move {
-        while let Ok((send, mut recv)) = accept_conn.accept_bi().await {
+        while let Ok((send, mut recv)) = accept_bi_conn.accept_bi().await {
             let header = match read_frame::<StreamOpen>(&mut recv).await {
                 Ok(header) => header,
                 Err(err) => {
@@ -134,103 +133,92 @@ pub async fn run_server_session(
                     tracing::warn!("rejected local forward stream because forwarding is disabled");
                 }
                 other => {
-                    if stream_tx.send((other, send, recv)).await.is_err() {
-                        break;
-                    }
+                    drop(send);
+                    drop(recv);
+                    tracing::warn!(?other, "unexpected bidirectional stream during session");
                 }
             }
         }
     });
 
-    let control_task = tokio::spawn(async move {
-        while let Ok(request) = read_frame::<ControlRequest>(&mut control_recv).await {
-            match request {
-                ControlRequest::Resize(size) => {
+    let accept_uni_conn = conn.clone();
+    let side_task = tokio::spawn(async move {
+        while let Ok(mut recv) = accept_uni_conn.accept_uni().await {
+            match read_frame::<StreamOpen>(&mut recv).await {
+                Ok(StreamOpen::Resize(size)) => {
                     let _ = resize_tx.send(size).await;
                 }
-                ControlRequest::Signal(signal) => {
+                Ok(StreamOpen::Signal(signal)) => {
                     let _ = signal_tx.send(signal).await;
                 }
-                ControlRequest::Close => break,
-                ControlRequest::OpenSession(_) | ControlRequest::OpenRemoteForward(_) => {}
+                Ok(other) => tracing::warn!(?other, "unexpected unidirectional stream"),
+                Err(err) => tracing::warn!(%err, "failed to read side stream header"),
             }
         }
     });
 
-    let mut resize_rx = Some(resize_rx);
-    let mut signal_rx = Some(signal_rx);
-    while let Some((header, send, recv)) = stream_rx.recv().await {
-        match (&request.mode, header) {
-            (SessionMode::Pty { term, size }, StreamOpen::SessionPtyData) => {
-                write_frame(&mut control_send, &ControlResponse::SessionReady).await?;
-                let status = match run_pty(
-                    &request.user,
-                    &request.command,
-                    term,
-                    size.clone(),
-                    request.use_shell,
-                    send,
-                    recv,
-                    resize_rx.take().context("resize channel already used")?,
-                    signal_rx.take().context("signal channel already used")?,
-                    &request.env,
-                    &connection_env,
-                )
-                .await
-                {
-                    Ok(status) => status,
-                    Err(err) => {
-                        send_control_error(&mut control_send, &err.to_string()).await;
-                        return Err(err);
-                    }
-                };
-                write_frame(&mut control_send, &ControlResponse::ExitStatus(status)).await?;
-                control_send.finish()?;
-                let _ = control_send.stopped().await;
-                accept_task.abort();
-                control_task.abort();
-                return Ok(status);
-            }
-            (SessionMode::Pipes, StreamOpen::SessionStdIo) => {
-                write_frame(&mut control_send, &ControlResponse::SessionReady).await?;
-                let mut err_send = conn.open_uni().await?;
-                write_frame(&mut err_send, &StreamOpen::SessionStderr).await?;
-                let status = match run_pipes(
-                    &request.user,
-                    &request.command,
-                    request.use_shell,
-                    send,
-                    recv,
-                    err_send,
-                    signal_rx.take().context("signal channel already used")?,
-                    &request.env,
-                    &connection_env,
-                )
-                .await
-                {
-                    Ok(status) => status,
-                    Err(err) => {
-                        send_control_error(&mut control_send, &err.to_string()).await;
-                        return Err(err);
-                    }
-                };
-                write_frame(&mut control_send, &ControlResponse::ExitStatus(status)).await?;
-                control_send.finish()?;
-                let _ = control_send.stopped().await;
-                accept_task.abort();
-                control_task.abort();
-                return Ok(status);
-            }
-            _ => bail!("unexpected stream for requested session mode"),
+    let status = match &request.mode {
+        SessionMode::Pty { term, size } => {
+            write_frame(&mut session_send, &StreamResponse::SessionReady).await?;
+            run_pty(
+                &request.user,
+                &request.command,
+                term,
+                size.clone(),
+                request.use_shell,
+                session_send,
+                session_recv,
+                resize_rx,
+                signal_rx,
+                &request.env,
+                &connection_env,
+            )
+            .await
+        }
+        SessionMode::Pipes => {
+            write_frame(&mut session_send, &StreamResponse::SessionReady).await?;
+            let mut err_send = conn.open_uni().await?;
+            write_frame(&mut err_send, &StreamOpen::SessionStderr).await?;
+            run_pipes(
+                &request.user,
+                &request.command,
+                request.use_shell,
+                session_send,
+                session_recv,
+                err_send,
+                signal_rx,
+                &request.env,
+                &connection_env,
+            )
+            .await
+        }
+    };
+    accept_task.abort();
+    side_task.abort();
+    match status {
+        Ok(status) => {
+            send_session_end(&conn, StreamOpen::SessionExitStatus(status)).await?;
+            Ok(status)
+        }
+        Err(err) => {
+            let _ = send_session_end(&conn, StreamOpen::SessionError(err.to_string())).await;
+            Err(err)
         }
     }
-    bail!("connection closed before session stream opened")
 }
 
-async fn send_control_error(send: &mut SendStream, msg: &str) {
-    let _ = write_frame(send, &ControlResponse::Error(msg.to_owned())).await;
+async fn send_response_error(send: &mut SendStream, msg: &str) {
+    let _ = write_frame(send, &StreamResponse::Error(msg.to_owned())).await;
     let _ = send.finish();
     let _ = send.stopped().await;
+}
+
+async fn send_session_end(conn: &Connection, header: StreamOpen) -> Result<()> {
+    let mut send = conn.open_uni().await?;
+    write_frame(&mut send, &header).await?;
+    send.finish()?;
+    let _ = send.stopped().await;
+    Ok(())
 }
 
 async fn run_pipes(

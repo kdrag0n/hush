@@ -1,34 +1,33 @@
 use crate::os;
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use hush_core::protocol::{
-    ControlRequest, ControlResponse, EnvVar, ProcessExit, RemoteSignal, SessionMode, StreamOpen,
+    EnvVar, OpenSession, ProcessExit, RemoteSignal, SessionMode, StreamOpen, StreamResponse,
     read_frame, write_frame,
 };
 
 const STDIO_BUFFER_LEN: usize = 8192;
 
-pub(crate) async fn control_writer(
-    mut control_send: quinn::SendStream,
-    mut rx: tokio::sync::mpsc::Receiver<ControlRequest>,
+async fn stream_open_writer(
+    conn: quinn::Connection,
+    mut rx: tokio::sync::mpsc::Receiver<StreamOpen>,
 ) -> Result<()> {
-    while let Some(request) = rx.recv().await {
-        write_frame(&mut control_send, &request).await?;
+    while let Some(header) = rx.recv().await {
+        let mut send = conn.open_uni().await?;
+        write_frame(&mut send, &header).await?;
+        send.finish()?;
     }
-    let _ = control_send.finish();
     Ok(())
 }
 
-pub(crate) async fn run_pty(
-    conn: quinn::Connection,
-    mut control_recv: quinn::RecvStream,
-    control_tx: tokio::sync::mpsc::Sender<ControlRequest>,
-) -> Result<()> {
+pub(crate) async fn run_pty(conn: quinn::Connection, session: OpenSession) -> Result<()> {
     let raw = os::RawModeGuard::enable_if_terminal()?;
     let (mut send, recv) = conn.open_bi().await?;
-    write_frame(&mut send, &StreamOpen::SessionPtyData).await?;
-    expect_session_ready(&mut control_recv).await?;
-    let resize_task = tokio::spawn(os::watch_resize(control_tx.clone()));
-    let mut status_task = tokio::spawn(async move { read_exit_status(&mut control_recv).await });
+    write_frame(&mut send, &StreamOpen::Session { request: session }).await?;
+    let recv = expect_session_ready(recv).await?;
+    let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(32);
+    let stream_writer_task = tokio::spawn(stream_open_writer(conn.clone(), stream_rx));
+    let resize_task = tokio::spawn(os::watch_resize(stream_tx.clone()));
+    let mut status_task = tokio::spawn(read_exit_status(conn.clone()));
     let (in_task, mut escape_rx) = spawn_stdin_pump(send);
     let out_task = tokio::spawn(quic_to_stdio(recv, os::STDOUT_FD));
     let end = loop {
@@ -41,6 +40,7 @@ pub(crate) async fn run_pty(
         }
     };
     status_task.abort();
+    stream_writer_task.abort();
     resize_task.abort();
     in_task.abort();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), out_task).await;
@@ -48,30 +48,42 @@ pub(crate) async fn run_pty(
     finish_session(end);
 }
 
-pub(crate) async fn run_pipes(
-    conn: quinn::Connection,
-    mut control_recv: quinn::RecvStream,
-    control_tx: tokio::sync::mpsc::Sender<ControlRequest>,
-) -> Result<()> {
+pub(crate) async fn run_pipes(conn: quinn::Connection, session: OpenSession) -> Result<()> {
     let (local_signal_tx, mut local_signal_rx) = tokio::sync::mpsc::channel(8);
-    let signal_task = tokio::spawn(os::watch_signals(control_tx, local_signal_tx));
+    let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(32);
+    let stream_writer_task = tokio::spawn(stream_open_writer(conn.clone(), stream_rx));
+    let signal_task = tokio::spawn(os::watch_signals(stream_tx, local_signal_tx));
     let mut sigterm_watchdog: Option<tokio::task::JoinHandle<()>> = None;
     let (mut send, recv) = conn.open_bi().await?;
-    write_frame(&mut send, &StreamOpen::SessionStdIo).await?;
-    expect_session_ready(&mut control_recv).await?;
+    write_frame(&mut send, &StreamOpen::Session { request: session }).await?;
+    let recv = expect_session_ready(recv).await?;
 
+    let mut deferred_status = None;
     let stderr_recv = loop {
         let mut recv = conn.accept_uni().await?;
         let header: StreamOpen = read_frame(&mut recv).await?;
-        if matches!(header, StreamOpen::SessionStderr) {
-            break recv;
+        match header {
+            StreamOpen::SessionStderr => break recv,
+            StreamOpen::SessionExitStatus(status) => {
+                deferred_status = Some(Ok(status));
+            }
+            StreamOpen::SessionError(err) => {
+                deferred_status = Some(Err(anyhow!(err)));
+            }
+            other => tracing::debug!(?other, "ignoring unexpected session side stream"),
         }
     };
 
     let (in_task, mut escape_rx) = spawn_stdin_pump(send);
     let out_task = tokio::spawn(quic_to_stdio(recv, os::STDOUT_FD));
     let err_task = tokio::spawn(quic_to_stdio(stderr_recv, os::STDERR_FD));
-    let mut status_task = tokio::spawn(async move { read_exit_status(&mut control_recv).await });
+    let status_conn = conn.clone();
+    let mut status_task = tokio::spawn(async move {
+        match deferred_status {
+            Some(result) => result,
+            None => read_exit_status(status_conn).await,
+        }
+    });
     let end = loop {
         tokio::select! {
             status = &mut status_task => break SessionEnd::Remote(status??),
@@ -94,6 +106,7 @@ pub(crate) async fn run_pipes(
         watchdog.abort();
     }
     signal_task.abort();
+    stream_writer_task.abort();
     in_task.abort();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), out_task).await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), err_task).await;
@@ -251,20 +264,21 @@ async fn quic_to_stdio(mut recv: quinn::RecvStream, fd: i32) -> Result<()> {
     }
 }
 
-async fn expect_session_ready(recv: &mut quinn::RecvStream) -> Result<()> {
-    match read_frame::<ControlResponse>(recv).await? {
-        ControlResponse::SessionReady => Ok(()),
-        ControlResponse::Error(err) => bail!("{err}"),
+async fn expect_session_ready(mut recv: quinn::RecvStream) -> Result<quinn::RecvStream> {
+    match read_frame::<StreamResponse>(&mut recv).await? {
+        StreamResponse::SessionReady => Ok(recv),
+        StreamResponse::Error(err) => bail!("{err}"),
         other => bail!("unexpected control response: {other:?}"),
     }
 }
 
-async fn read_exit_status(recv: &mut quinn::RecvStream) -> Result<ProcessExit> {
+async fn read_exit_status(conn: quinn::Connection) -> Result<ProcessExit> {
     loop {
-        match read_frame::<ControlResponse>(recv).await? {
-            ControlResponse::ExitStatus(code) => return Ok(code),
-            ControlResponse::Error(err) => bail!("{err}"),
-            _ => {}
+        let mut recv = conn.accept_uni().await?;
+        match read_frame::<StreamOpen>(&mut recv).await? {
+            StreamOpen::SessionExitStatus(status) => return Ok(status),
+            StreamOpen::SessionError(err) => bail!("{err}"),
+            other => tracing::debug!(?other, "ignoring unexpected session side stream"),
         }
     }
 }

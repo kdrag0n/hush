@@ -7,8 +7,16 @@ use tokio::{
 };
 
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) async fn connect_any(endpoint: &Endpoint, host: &str, port: u16) -> Result<Connection> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect_any_inner(endpoint, host, port)).await {
+        Ok(result) => result,
+        Err(_) => bail!("connect to {host}:{port}: timed out after 60s"),
+    }
+}
+
+async fn connect_any_inner(endpoint: &Endpoint, host: &str, port: u16) -> Result<Connection> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
         .with_context(|| format!("resolve {host}:{port}"))?

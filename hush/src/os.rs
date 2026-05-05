@@ -122,20 +122,20 @@ pub(crate) fn self_terminate_with_signal(signal: RemoteSignal) -> ! {
 }
 
 pub(crate) async fn watch_resize(
-    tx: tokio::sync::mpsc::Sender<hush_core::protocol::ControlRequest>,
+    tx: tokio::sync::mpsc::Sender<hush_core::protocol::StreamOpen>,
 ) -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigwinch = signal(SignalKind::window_change())?;
     while sigwinch.recv().await.is_some() {
         let _ = tx
-            .send(hush_core::protocol::ControlRequest::Resize(terminal_size()))
+            .send(hush_core::protocol::StreamOpen::Resize(terminal_size()))
             .await;
     }
     Ok(())
 }
 
 pub(crate) async fn watch_signals(
-    tx: tokio::sync::mpsc::Sender<hush_core::protocol::ControlRequest>,
+    tx: tokio::sync::mpsc::Sender<hush_core::protocol::StreamOpen>,
     local_tx: tokio::sync::mpsc::Sender<RemoteSignal>,
 ) -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -155,7 +155,7 @@ pub(crate) async fn watch_signals(
             _ = sigusr2.recv() => RemoteSignal::SIGUSR2,
         };
         let _ = tx
-            .send(hush_core::protocol::ControlRequest::Signal(signal))
+            .send(hush_core::protocol::StreamOpen::Signal(signal))
             .await;
         let _ = local_tx.send(signal).await;
     }

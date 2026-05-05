@@ -419,6 +419,44 @@ fn local_forwarding_carries_tcp() {
 }
 
 #[test]
+fn remote_forwarding_carries_tcp() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let web = TcpListener::bind("127.0.0.1:0").unwrap();
+    let web_port = web.local_addr().unwrap().port();
+    let web_thread = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = web.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\nremote-forward-ok")
+                .unwrap();
+        }
+    });
+    let remote_port = free_tcp_port();
+    let mut client = env
+        .hush()
+        .arg("-T")
+        .arg("-R")
+        .arg(format!("{remote_port}:127.0.0.1:{web_port}"))
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sleep")
+        .arg("3")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_tcp(remote_port);
+    let body = http_get(remote_port);
+    let _ = client.wait();
+    let _ = web_thread.join();
+    assert_eq!(body, "remote-forward-ok");
+}
+
+#[test]
 fn authorized_keys_options_are_rejected() {
     let mut env = TestEnv::new();
     let key = fs::read_to_string(env.home.join(".ssh/id_ed25519.pub")).unwrap();
