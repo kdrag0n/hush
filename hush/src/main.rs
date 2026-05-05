@@ -234,11 +234,17 @@ async fn watch_signals(tx: tokio::sync::mpsc::Sender<ControlRequest>) -> Result<
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sighup = signal(SignalKind::hangup())?;
+    let mut sigquit = signal(SignalKind::quit())?;
+    let mut sigusr1 = signal(SignalKind::user_defined1())?;
+    let mut sigusr2 = signal(SignalKind::user_defined2())?;
     loop {
         let signal = tokio::select! {
-            _ = sigint.recv() => RemoteSignal::Interrupt,
-            _ = sigterm.recv() => RemoteSignal::Terminate,
-            _ = sighup.recv() => RemoteSignal::Hangup,
+            _ = sigint.recv() => RemoteSignal::SIGINT,
+            _ = sigterm.recv() => RemoteSignal::SIGTERM,
+            _ = sighup.recv() => RemoteSignal::SIGHUP,
+            _ = sigquit.recv() => RemoteSignal::SIGQUIT,
+            _ = sigusr1.recv() => RemoteSignal::SIGUSR1,
+            _ = sigusr2.recv() => RemoteSignal::SIGUSR2,
         };
         let _ = tx.send(ControlRequest::Signal(signal)).await;
     }
