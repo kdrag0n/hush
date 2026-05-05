@@ -16,7 +16,7 @@ listen = "[::]:22022"
 # Base data directory. Server files live under data_dir/server.
 # Default when running as root: "/etc/hush"
 # Default when running as a normal user: platform data directory
-data_dir = "/etc/hush"
+# data_dir = "/etc/hush"
 
 # DER-encoded TLS host certificate and private key.
 # If omitted, hush-server creates and reuses these under data_dir/server.

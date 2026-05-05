@@ -19,6 +19,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         .config
         .clone()
         .unwrap_or_else(|| hush_core::paths::server_config_path(&initial_data_dir));
+    if !config_path.exists() {
+        config::write_server_config_example_if_missing(&config_path)?;
+    }
     let file_cfg = config::read_server_config(&config_path)?.unwrap_or_else(empty_file_config);
     let data_dir = args
         .data_dir

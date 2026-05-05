@@ -1,11 +1,17 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::{fs, net::SocketAddr, path::Path};
+use std::{
+    fs,
+    io::{ErrorKind, Write},
+    net::SocketAddr,
+    path::Path,
+};
 
 pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
 pub const DEFAULT_MAX_SESSIONS_PER_CONNECTION: usize = 1;
 pub const DEFAULT_MAX_FORWARDS_PER_CONNECTION: usize = 16;
 pub const DEFAULT_MAX_FORWARD_STREAMS_PER_CONNECTION: usize = 64;
+pub const SERVER_CONFIG_EXAMPLE: &str = include_str!("../../config.example.toml");
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfigFile {
@@ -54,6 +60,23 @@ pub fn read_server_config(path: &Path) -> Result<Option<ServerConfigFile>> {
     let data = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let cfg = toml::from_str(&data).with_context(|| format!("parse {}", path.display()))?;
     Ok(Some(cfg))
+}
+
+pub fn write_server_config_example_if_missing(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => file
+            .write_all(SERVER_CONFIG_EXAMPLE.as_bytes())
+            .with_context(|| format!("write {}", path.display())),
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("write {}", path.display())),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -122,11 +145,36 @@ fn host_pattern_matches(pattern: &str, host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::ServerConfigFile;
+    use super::{SERVER_CONFIG_EXAMPLE, ServerConfigFile, write_server_config_example_if_missing};
+    use std::fs;
 
     #[test]
     fn config_example_parses() {
-        toml::from_str::<ServerConfigFile>(include_str!("../../config.example.toml"))
+        toml::from_str::<ServerConfigFile>(SERVER_CONFIG_EXAMPLE)
             .expect("config.example.toml should parse");
+    }
+
+    #[test]
+    fn writes_config_example_if_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server/config.toml");
+
+        write_server_config_example_if_missing(&path).unwrap();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), SERVER_CONFIG_EXAMPLE);
+    }
+
+    #[test]
+    fn does_not_overwrite_existing_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(&path, "listen = \"127.0.0.1:22022\"\n").unwrap();
+
+        write_server_config_example_if_missing(&path).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "listen = \"127.0.0.1:22022\"\n"
+        );
     }
 }
