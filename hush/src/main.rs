@@ -4,8 +4,8 @@ use hush_core::{
     auth, config,
     forwarding::LocalForward,
     protocol::{
-        ControlRequest, ControlResponse, OpenSession, RemoteForwardRequest, RemoteSignal,
-        SessionMode, StreamOpen, TcpTarget, TermSize, read_frame, write_frame,
+        ControlRequest, ControlResponse, EnvVar, OpenSession, ProcessExit, RemoteForwardRequest,
+        RemoteSignal, SessionMode, StreamOpen, TcpTarget, TermSize, read_frame, write_frame,
     },
 };
 use quinn::{Connection, Endpoint};
@@ -137,11 +137,13 @@ async fn main() -> Result<()> {
     }
 
     let mode = choose_mode(args.tty, args.no_tty);
+    let env = session_env(&mode);
     let session = OpenSession {
         user,
         command: args.command,
         use_shell: !args.no_shell,
         mode,
+        env,
     };
     write_frame(
         &mut control_send,
@@ -172,17 +174,19 @@ async fn run_pty(
     mut control_recv: quinn::RecvStream,
     control_tx: tokio::sync::mpsc::Sender<ControlRequest>,
 ) -> Result<()> {
-    let _raw = RawModeGuard::enable_if_terminal()?;
+    let raw = RawModeGuard::enable_if_terminal()?;
     let (mut send, recv) = conn.open_bi().await?;
     write_frame(&mut send, &StreamOpen::SessionPtyData).await?;
     expect_session_ready(&mut control_recv).await?;
-    tokio::spawn(watch_resize(control_tx.clone()));
+    let resize_task = tokio::spawn(watch_resize(control_tx.clone()));
     let in_task = tokio::spawn(stdio_to_quic(libc::STDIN_FILENO, send));
     let out_task = tokio::spawn(quic_to_stdio(recv, libc::STDOUT_FILENO));
     let status = read_exit_status(&mut control_recv).await?;
+    resize_task.abort();
     in_task.abort();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), out_task).await;
-    std::process::exit(status);
+    drop(raw);
+    finish_process(status);
 }
 
 async fn run_pipes(
@@ -205,12 +209,13 @@ async fn run_pipes(
     let in_task = tokio::spawn(stdio_to_quic(libc::STDIN_FILENO, send));
     let out_task = tokio::spawn(quic_to_stdio(recv, libc::STDOUT_FILENO));
     let err_task = tokio::spawn(quic_to_stdio(stderr_recv, libc::STDERR_FILENO));
-    tokio::spawn(watch_signals(control_tx));
+    let signal_task = tokio::spawn(watch_signals(control_tx));
     let status = read_exit_status(&mut control_recv).await?;
+    signal_task.abort();
     in_task.abort();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), out_task).await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), err_task).await;
-    std::process::exit(status);
+    finish_process(status);
 }
 
 #[cfg(unix)]
@@ -362,13 +367,48 @@ async fn expect_session_ready(recv: &mut quinn::RecvStream) -> Result<()> {
     }
 }
 
-async fn read_exit_status(recv: &mut quinn::RecvStream) -> Result<i32> {
+async fn read_exit_status(recv: &mut quinn::RecvStream) -> Result<ProcessExit> {
     loop {
         match read_frame::<ControlResponse>(recv).await? {
             ControlResponse::ExitStatus(code) => return Ok(code),
             ControlResponse::Error(err) => bail!("{err}"),
             _ => {}
         }
+    }
+}
+
+fn session_env(mode: &SessionMode) -> Vec<EnvVar> {
+    let mut env = Vec::new();
+    if let SessionMode::Pty { term, .. } = mode {
+        env.push(EnvVar {
+            key: "TERM".to_owned(),
+            value: term.clone(),
+        });
+    }
+    for (key, value) in std::env::vars() {
+        if key == "LANG" || key.starts_with("LC_") {
+            env.push(EnvVar { key, value });
+        }
+    }
+    env
+}
+
+fn finish_process(status: ProcessExit) -> ! {
+    match status {
+        ProcessExit::Code(code) => std::process::exit(code),
+        ProcessExit::Signal(signal) => self_terminate_with_signal(signal),
+    }
+}
+
+fn self_terminate_with_signal(signal: i32) -> ! {
+    unsafe {
+        let mut set = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, signal);
+        libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::signal(signal, libc::SIG_DFL);
+        libc::kill(libc::getpid(), signal);
+        libc::_exit(128 + signal);
     }
 }
 

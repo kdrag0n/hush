@@ -7,7 +7,8 @@ use hush_core::{
 };
 use quinn::Endpoint;
 use rustls::pki_types::CertificateDer;
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Parser)]
 #[command(name = "hush-server", version)]
@@ -30,6 +31,14 @@ struct Args {
     allow_user: Vec<String>,
     #[arg(long)]
     disable_tcp_forwarding: bool,
+    #[arg(long)]
+    max_connections: Option<usize>,
+    #[arg(long)]
+    max_sessions_per_connection: Option<usize>,
+    #[arg(long)]
+    max_forwards_per_connection: Option<usize>,
+    #[arg(long)]
+    max_forward_streams_per_connection: Option<usize>,
 }
 
 #[tokio::main]
@@ -48,6 +57,10 @@ async fn main() -> Result<()> {
         authorized_keys_path: None,
         allow_users: None,
         allow_tcp_forwarding: None,
+        max_connections: None,
+        max_sessions_per_connection: None,
+        max_forwards_per_connection: None,
+        max_forward_streams_per_connection: None,
     });
     let data_dir = args
         .data_dir
@@ -72,16 +85,53 @@ async fn main() -> Result<()> {
         } else {
             file_cfg.allow_tcp_forwarding.unwrap_or(true)
         },
+        max_connections: args
+            .max_connections
+            .or(file_cfg.max_connections)
+            .unwrap_or(config::DEFAULT_MAX_CONNECTIONS),
+        max_sessions_per_connection: args
+            .max_sessions_per_connection
+            .or(file_cfg.max_sessions_per_connection)
+            .unwrap_or(config::DEFAULT_MAX_SESSIONS_PER_CONNECTION),
+        max_forwards_per_connection: args
+            .max_forwards_per_connection
+            .or(file_cfg.max_forwards_per_connection)
+            .unwrap_or(config::DEFAULT_MAX_FORWARDS_PER_CONNECTION),
+        max_forward_streams_per_connection: args
+            .max_forward_streams_per_connection
+            .or(file_cfg.max_forward_streams_per_connection)
+            .unwrap_or(config::DEFAULT_MAX_FORWARD_STREAMS_PER_CONNECTION),
     };
 
     let server_config =
         hush_core::tls::make_server_config(&data_dir, host_cert.as_deref(), host_key.as_deref())?;
     let endpoint = Endpoint::server(server_config, listen)?;
-    tracing::info!(addr = %endpoint.local_addr()?, "hush server listening");
+    tracing::info!(
+        addr = %endpoint.local_addr()?,
+        max_connections = runtime_config.max_connections,
+        max_sessions_per_connection = runtime_config.max_sessions_per_connection,
+        max_forwards_per_connection = runtime_config.max_forwards_per_connection,
+        max_forward_streams_per_connection = runtime_config.max_forward_streams_per_connection,
+        "hush server listening"
+    );
 
+    let connection_slots = Arc::new(Semaphore::new(runtime_config.max_connections));
     while let Some(connecting) = endpoint.accept().await {
+        let permit = match connection_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!("rejecting connection because max_connections is reached");
+                tokio::spawn(async move {
+                    if let Ok(conn) = connecting.await {
+                        conn.close(0u32.into(), b"server connection limit reached");
+                    }
+                });
+                continue;
+            }
+        };
         let runtime_config = runtime_config.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             match connecting.await {
                 Ok(conn) => {
                     if let Err(err) = handle_connection(conn, runtime_config).await {
@@ -98,6 +148,7 @@ async fn main() -> Result<()> {
 async fn handle_connection(conn: quinn::Connection, config: ServerRuntimeConfig) -> Result<()> {
     let peer_key = peer_public_key(&conn)?;
     let (mut control_send, mut control_recv) = conn.accept_bi().await?;
+    let mut remote_forwards = 0usize;
     let session = loop {
         match read_frame::<ControlRequest>(&mut control_recv).await? {
             ControlRequest::OpenRemoteForward(req) => {
@@ -109,6 +160,15 @@ async fn handle_connection(conn: quinn::Connection, config: ServerRuntimeConfig)
                     .await?;
                     continue;
                 }
+                if remote_forwards >= config.max_forwards_per_connection {
+                    write_frame(
+                        &mut control_send,
+                        &ControlResponse::Error("remote forward limit reached".to_owned()),
+                    )
+                    .await?;
+                    continue;
+                }
+                remote_forwards += 1;
                 let conn2 = conn.clone();
                 tokio::spawn(async move {
                     if let Err(err) = hush_core::forwarding::run_remote_forward_listener(
@@ -124,7 +184,17 @@ async fn handle_connection(conn: quinn::Connection, config: ServerRuntimeConfig)
                 });
                 write_frame(&mut control_send, &ControlResponse::Ok).await?;
             }
-            ControlRequest::OpenSession(session) => break session,
+            ControlRequest::OpenSession(session) => {
+                if config.max_sessions_per_connection == 0 {
+                    write_frame(
+                        &mut control_send,
+                        &ControlResponse::Error("session limit reached".to_owned()),
+                    )
+                    .await?;
+                    continue;
+                }
+                break session;
+            }
             ControlRequest::Close => return Ok(()),
             ControlRequest::Resize(_) | ControlRequest::Signal(_) => {}
         }

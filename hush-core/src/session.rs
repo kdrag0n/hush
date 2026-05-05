@@ -3,8 +3,8 @@ use crate::{
     config::ServerRuntimeConfig,
     net::{copy_quic_to_writer, copy_reader_to_quic},
     protocol::{
-        ControlRequest, ControlResponse, OpenSession, RemoteSignal, SessionMode, StreamOpen,
-        TermSize, read_frame, write_frame,
+        ControlRequest, ControlResponse, EnvVar, OpenSession, ProcessExit, RemoteSignal,
+        SessionMode, StreamOpen, TermSize, read_frame, write_frame,
     },
 };
 use anyhow::{Context, Result, bail};
@@ -12,10 +12,12 @@ use quinn::{Connection, RecvStream, SendStream};
 use std::{
     ffi::CString,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
+    os::unix::process::ExitStatusExt,
     path::PathBuf,
     process::Stdio,
     sync::Arc,
 };
+use tokio::sync::Semaphore;
 use tokio::{io::unix::AsyncFd, process::Command};
 
 pub async fn run_server_session(
@@ -25,11 +27,14 @@ pub async fn run_server_session(
     request: OpenSession,
     peer_key: ssh_key::PublicKey,
     config: ServerRuntimeConfig,
-) -> Result<i32> {
+) -> Result<ProcessExit> {
+    let peer_fp = auth::public_key_fingerprint(&peer_key).unwrap_or_else(|_| "unknown".into());
+    tracing::info!(user = %request.user, key = %peer_fp, "auth attempt");
     if !config.allow_users.is_empty()
         && !config.allow_users.iter().any(|user| user == &request.user)
     {
         let msg = format!("user {} is not allowed by server config", request.user);
+        tracing::warn!(user = %request.user, key = %peer_fp, reason = %msg, "auth rejected");
         send_control_error(&mut control_send, &msg).await;
         bail!("{msg}");
     }
@@ -38,24 +43,38 @@ pub async fn run_server_session(
             "server is not root; only {} may log in",
             auth::current_username()
         );
+        tracing::warn!(user = %request.user, key = %peer_fp, reason = %msg, "auth rejected");
         send_control_error(&mut control_send, &msg).await;
         bail!("{msg}");
     }
-    if !auth::is_authorized(
+    let authorized = auth::is_authorized(
         &request.user,
         &peer_key,
         config.authorized_keys_path.as_deref(),
-    )? {
-        let fp = auth::public_key_fingerprint(&peer_key).unwrap_or_else(|_| "unknown".into());
-        let msg = format!("public key {fp} is not authorized for {}", request.user);
-        send_control_error(&mut control_send, &msg).await;
-        bail!("{msg}");
-    }
+    );
+    match authorized {
+        Ok(true) => tracing::info!(user = %request.user, key = %peer_fp, "auth accepted"),
+        Ok(false) => {
+            let msg = format!(
+                "public key {peer_fp} is not authorized for {}",
+                request.user
+            );
+            tracing::warn!(user = %request.user, key = %peer_fp, reason = %msg, "auth rejected");
+            send_control_error(&mut control_send, &msg).await;
+            bail!("{msg}");
+        }
+        Err(err) => {
+            tracing::warn!(user = %request.user, key = %peer_fp, reason = %err, "auth rejected");
+            send_control_error(&mut control_send, &err.to_string()).await;
+            return Err(err);
+        }
+    };
 
     let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(4);
     let (resize_tx, resize_rx) = tokio::sync::mpsc::channel(16);
     let (signal_tx, signal_rx) = tokio::sync::mpsc::channel(16);
     let accept_conn = conn.clone();
+    let forward_slots = Arc::new(Semaphore::new(config.max_forward_streams_per_connection));
     let accept_task = tokio::spawn(async move {
         while let Ok((send, mut recv)) = accept_conn.accept_bi().await {
             let header = match read_frame::<StreamOpen>(&mut recv).await {
@@ -67,7 +86,14 @@ pub async fn run_server_session(
             };
             match header {
                 StreamOpen::LocalTcpForward { target } if config.allow_tcp_forwarding => {
+                    let Ok(permit) = forward_slots.clone().try_acquire_owned() else {
+                        tracing::warn!(
+                            "rejected local forward stream because forward stream limit is reached"
+                        );
+                        continue;
+                    };
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(err) =
                             crate::forwarding::serve_local_forward_stream(target, send, recv).await
                         {
@@ -118,6 +144,7 @@ pub async fn run_server_session(
                     recv,
                     resize_rx.take().context("resize channel already used")?,
                     signal_rx.take().context("signal channel already used")?,
+                    &request.env,
                 )
                 .await
                 {
@@ -146,6 +173,7 @@ pub async fn run_server_session(
                     recv,
                     err_send,
                     signal_rx.take().context("signal channel already used")?,
+                    &request.env,
                 )
                 .await
                 {
@@ -182,8 +210,9 @@ async fn run_pipes(
     recv: RecvStream,
     err_send: SendStream,
     mut signal_rx: tokio::sync::mpsc::Receiver<RemoteSignal>,
-) -> Result<i32> {
-    let mut cmd = command_for_user(user, command, false, use_shell)?;
+    env: &[EnvVar],
+) -> Result<ProcessExit> {
+    let mut cmd = command_for_user(user, command, false, use_shell, env)?;
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -205,7 +234,7 @@ async fn run_pipes(
     in_task.await.ok();
     out_task.await.ok();
     err_task.await.ok();
-    Ok(status.code().unwrap_or(255))
+    Ok(process_exit_from_status(status))
 }
 
 async fn run_pty(
@@ -218,12 +247,15 @@ async fn run_pty(
     recv: RecvStream,
     mut resize_rx: tokio::sync::mpsc::Receiver<TermSize>,
     mut signal_rx: tokio::sync::mpsc::Receiver<RemoteSignal>,
-) -> Result<i32> {
+    env: &[EnvVar],
+) -> Result<ProcessExit> {
     let argv = pty_argv(user, command, use_shell)?;
     let pty = open_pty(&size)?;
     set_nonblocking(pty.master.as_raw_fd())?;
     let fd = Arc::new(AsyncFd::new(pty.master)?);
     let mut cmd = command_from_argv(&argv)?;
+    apply_session_env(&mut cmd, env);
+    cmd.env("TERM", term);
     let stdin_fd = dup_fd(pty.slave.as_raw_fd())?;
     let stdout_fd = dup_fd(pty.slave.as_raw_fd())?;
     let stderr_fd = pty.slave.into_raw_fd();
@@ -258,7 +290,7 @@ async fn run_pty(
         Ok(Err(err)) => tracing::warn!(%err, "pty output task failed"),
         Err(_) => tracing::warn!("pty output copy timed out"),
     }
-    Ok(status.code().unwrap_or(255))
+    Ok(process_exit_from_status(status))
 }
 
 async fn copy_pty_to_quic(fd: Arc<AsyncFd<OwnedFd>>, mut send: SendStream) -> Result<()> {
@@ -324,6 +356,16 @@ fn write_fd(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
         Ok(rc as usize)
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+fn process_exit_from_status(status: std::process::ExitStatus) -> ProcessExit {
+    if let Some(code) = status.code() {
+        ProcessExit::Code(code)
+    } else if let Some(signal) = status.signal() {
+        ProcessExit::Signal(signal)
+    } else {
+        ProcessExit::Code(255)
     }
 }
 
@@ -397,6 +439,7 @@ fn command_for_user(
     command: &[String],
     login_shell: bool,
     use_shell: bool,
+    env: &[EnvVar],
 ) -> Result<Command> {
     let root_switch = unsafe { libc::geteuid() == 0 } && user != auth::current_username();
     if root_switch {
@@ -409,6 +452,7 @@ fn command_for_user(
                 cmd.arg("-c").arg(exec_argv_command(command));
             }
         }
+        apply_session_env(&mut cmd, env);
         configure_child_pre_exec(&mut cmd, false, None);
         return Ok(cmd);
     }
@@ -416,6 +460,7 @@ fn command_for_user(
     if !use_shell && !command.is_empty() {
         let mut cmd = Command::new(&command[0]);
         cmd.args(&command[1..]);
+        apply_session_env(&mut cmd, env);
         configure_child_pre_exec(&mut cmd, false, None);
         return Ok(cmd);
     }
@@ -437,8 +482,21 @@ fn command_for_user(
     } else {
         cmd.arg("-lc").arg(shell_words::join(command));
     }
+    apply_session_env(&mut cmd, env);
     configure_child_pre_exec(&mut cmd, false, None);
     Ok(cmd)
+}
+
+fn apply_session_env(cmd: &mut Command, env: &[EnvVar]) {
+    for var in env {
+        if allowed_env_key(&var.key) && !var.key.contains('\0') && !var.value.contains('\0') {
+            cmd.env(&var.key, &var.value);
+        }
+    }
+}
+
+fn allowed_env_key(key: &str) -> bool {
+    key == "TERM" || key == "LANG" || key.starts_with("LC_")
 }
 
 fn configure_child_pre_exec(cmd: &mut Command, controlling_tty: bool, term: Option<String>) {

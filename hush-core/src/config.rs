@@ -2,6 +2,11 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::{fs, net::SocketAddr, path::Path};
 
+pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
+pub const DEFAULT_MAX_SESSIONS_PER_CONNECTION: usize = 1;
+pub const DEFAULT_MAX_FORWARDS_PER_CONNECTION: usize = 16;
+pub const DEFAULT_MAX_FORWARD_STREAMS_PER_CONNECTION: usize = 64;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfigFile {
     pub listen: Option<SocketAddr>,
@@ -11,6 +16,10 @@ pub struct ServerConfigFile {
     pub authorized_keys_path: Option<std::path::PathBuf>,
     pub allow_users: Option<Vec<String>>,
     pub allow_tcp_forwarding: Option<bool>,
+    pub max_connections: Option<usize>,
+    pub max_sessions_per_connection: Option<usize>,
+    pub max_forwards_per_connection: Option<usize>,
+    pub max_forward_streams_per_connection: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -18,6 +27,10 @@ pub struct ServerRuntimeConfig {
     pub authorized_keys_path: Option<std::path::PathBuf>,
     pub allow_users: Vec<String>,
     pub allow_tcp_forwarding: bool,
+    pub max_connections: usize,
+    pub max_sessions_per_connection: usize,
+    pub max_forwards_per_connection: usize,
+    pub max_forward_streams_per_connection: usize,
 }
 
 impl Default for ServerRuntimeConfig {
@@ -26,6 +39,10 @@ impl Default for ServerRuntimeConfig {
             authorized_keys_path: None,
             allow_users: Vec::new(),
             allow_tcp_forwarding: true,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_sessions_per_connection: DEFAULT_MAX_SESSIONS_PER_CONNECTION,
+            max_forwards_per_connection: DEFAULT_MAX_FORWARDS_PER_CONNECTION,
+            max_forward_streams_per_connection: DEFAULT_MAX_FORWARD_STREAMS_PER_CONNECTION,
         }
     }
 }

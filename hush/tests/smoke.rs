@@ -1,6 +1,7 @@
 use std::{
     fs,
     net::{TcpListener, UdpSocket},
+    os::unix::process::ExitStatusExt,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::OnceLock,
@@ -170,6 +171,43 @@ fn no_shell_preserves_argv() {
 }
 
 #[test]
+fn selected_environment_is_propagated() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let out = env
+        .hush()
+        .env("LANG", "C.UTF-8")
+        .env("TERM", "vt100")
+        .arg("-t")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-lc")
+        .arg("printf '%s|%s' \"$TERM\" \"$LANG\"")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "vt100|C.UTF-8");
+}
+
+#[test]
+fn remote_signal_exit_is_reemitted_by_client() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let out = env
+        .hush()
+        .arg("-T")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("kill -TERM $$")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.signal(), Some(libc::SIGTERM), "{out:?}");
+}
+
+#[test]
 fn non_pty_signal_forwarding_propagates_interrupt() {
     let mut env = TestEnv::new();
     env.start_server();
@@ -249,7 +287,10 @@ fn authorized_keys_options_are_rejected() {
         .output()
         .unwrap();
     assert!(!out.status.success(), "{out:?}");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("connection lost"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("authorized_keys options"),
+        "{out:?}"
+    );
 }
 
 #[test]

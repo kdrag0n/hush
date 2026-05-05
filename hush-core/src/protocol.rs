@@ -36,6 +36,13 @@ pub struct OpenSession {
     pub command: Vec<String>,
     pub use_shell: bool,
     pub mode: SessionMode,
+    pub env: Vec<EnvVar>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvVar {
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,8 +88,14 @@ impl RemoteSignal {
 pub enum ControlResponse {
     Ok,
     SessionReady,
-    ExitStatus(i32),
+    ExitStatus(ProcessExit),
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum ProcessExit {
+    Code(i32),
+    Signal(i32),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
