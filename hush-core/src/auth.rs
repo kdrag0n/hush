@@ -229,11 +229,33 @@ pub fn is_authorized(user: &str, key: &PublicKey, override_path: Option<&Path>) 
 }
 
 pub fn current_username() -> String {
-    whoami::username()
+    current_username_from_passwd()
+        .or_else(|| env::var("USER").ok())
+        .or_else(|| env::var("LOGNAME").ok())
+        .unwrap_or_else(|| unsafe { libc::geteuid() }.to_string())
 }
 
 pub fn can_login_as(user: &str) -> bool {
     (unsafe { libc::geteuid() == 0 }) || user == current_username()
+}
+
+fn current_username_from_passwd() -> Option<String> {
+    unsafe {
+        let uid = libc::geteuid();
+        let mut pwd = std::mem::zeroed::<libc::passwd>();
+        let mut result = std::ptr::null_mut();
+        let size = libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX);
+        let mut buf = vec![0 as libc::c_char; if size > 0 { size as usize } else { 16 * 1024 }];
+        let rc = libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result);
+        if rc != 0 || result.is_null() || pwd.pw_name.is_null() {
+            return None;
+        }
+        Some(
+            std::ffi::CStr::from_ptr(pwd.pw_name)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
 }
 
 pub fn home_for_user(user: &str) -> Result<Option<PathBuf>> {

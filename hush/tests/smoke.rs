@@ -84,7 +84,7 @@ impl TestEnv {
     }
 
     fn target_for_host(&self, host: &str) -> String {
-        format!("{}@{host}", whoami::username())
+        format!("{}@{host}", hush_core::auth::current_username())
     }
 }
 
@@ -429,7 +429,7 @@ fn tofu_mismatch_fails_without_insecure() {
         .arg("-p")
         .arg(env.port.to_string())
         .arg("-T")
-        .arg(format!("{}@127.0.0.1", whoami::username()))
+        .arg(format!("{}@127.0.0.1", hush_core::auth::current_username()))
         .arg("--")
         .arg("/bin/sh")
         .arg("-c")
