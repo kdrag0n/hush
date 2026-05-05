@@ -273,12 +273,22 @@ install_server_binary_from_release() {
 
 	server=$(download_server "$work")
 	as_root mkdir -p "$INSTALL_DIR"
-	as_root install -m 0755 "$server" "$INSTALL_PATH"
+	staged="$INSTALL_DIR/.hush-server.$$"
+	trap 'rm -rf "$work"; as_root rm -f "$staged"' EXIT INT TERM
+	as_root cp "$server" "$staged"
+	as_root chmod 0755 "$staged"
+	as_root mv -f "$staged" "$INSTALL_PATH"
 	success "Installed hush-server to $INSTALL_PATH"
 }
 
 brew_install_server() {
-	brew install kdrag0n/tap/hush
+	if brew list --formula hush >/dev/null 2>&1; then
+		log "Upgrading hush with Homebrew"
+		brew upgrade hush || brew upgrade kdrag0n/tap/hush
+	else
+		log "Installing hush with Homebrew"
+		brew install kdrag0n/tap/hush
+	fi
 
 	if brew --prefix hush >/dev/null 2>&1; then
 		INSTALL_PATH=$(brew --prefix hush)/bin/hush-server
@@ -332,7 +342,7 @@ load_launchd_service() {
 	as_root launchctl bootstrap system "$PLIST_PATH"
 	as_root launchctl enable "system/$SERVICE_LABEL" >/dev/null 2>&1 || true
 	as_root launchctl kickstart -k "system/$SERVICE_LABEL"
-	success "Loaded launch daemon $SERVICE_LABEL"
+	success "Loaded and restarted launch daemon $SERVICE_LABEL"
 }
 
 write_systemd_service() {
@@ -357,8 +367,9 @@ EOF
 install_systemd_service() {
 	write_systemd_service
 	as_root systemctl daemon-reload
-	as_root systemctl enable --now hush.service
-	success "Enabled and started hush.service"
+	as_root systemctl enable hush.service
+	as_root systemctl restart hush.service
+	success "Enabled and restarted hush.service"
 }
 
 write_openwrt_init() {
@@ -389,7 +400,7 @@ install_openwrt_service() {
 	write_openwrt_init
 	as_root "$OPENWRT_INIT_PATH" enable
 	as_root "$OPENWRT_INIT_PATH" restart
-	success "Enabled and started OpenWrt init service hush"
+	success "Enabled and restarted OpenWrt init service hush"
 }
 
 is_openwrt() {
@@ -402,7 +413,6 @@ is_openwrt() {
 
 install_macos() {
 	if have brew; then
-		log "Installing hush with Homebrew"
 		brew_install_server
 	else
 		log "Homebrew not found; installing hush-server from GitHub releases"
