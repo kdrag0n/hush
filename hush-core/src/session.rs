@@ -11,12 +11,16 @@ use anyhow::{Context, Result, bail};
 use quinn::{Connection, RecvStream, SendStream};
 use std::{
     ffi::CString,
+    io,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
     os::unix::process::ExitStatusExt,
     path::PathBuf,
+    pin::Pin,
     process::Stdio,
     sync::Arc,
+    task::{Context as TaskContext, Poll},
 };
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Semaphore;
 use tokio::{io::unix::AsyncFd, process::Command};
 
@@ -252,7 +256,7 @@ async fn run_pty(
     let argv = pty_argv(user, command, use_shell)?;
     let pty = open_pty(&size)?;
     set_nonblocking(pty.master.as_raw_fd())?;
-    let fd = Arc::new(AsyncFd::new(pty.master)?);
+    let pty_master = AsyncPty::new(pty.master)?;
     let mut cmd = command_from_argv(&argv)?;
     apply_session_env(&mut cmd, env);
     cmd.env("TERM", term);
@@ -265,16 +269,16 @@ async fn run_pty(
     configure_child_pre_exec(&mut cmd, true, Some(term.to_owned()));
     let mut child = cmd.spawn().context("spawn remote pty command")?;
     let child_pid = child.id().context("child pid missing")? as i32;
-    let resize_fd = fd.clone();
+    let resize_pty = pty_master.clone();
     let resize_task = tokio::spawn(async move {
         while let Some(size) = resize_rx.recv().await {
-            if let Err(err) = set_winsize(resize_fd.get_ref().as_raw_fd(), &size) {
+            if let Err(err) = resize_pty.resize(&size) {
                 tracing::warn!(%err, "failed to resize pty");
             }
         }
     });
-    let in_task = tokio::spawn(copy_quic_to_pty(recv, fd.clone()));
-    let out_task = tokio::spawn(copy_pty_to_quic(fd, send));
+    let in_task = tokio::spawn(copy_quic_to_pty(recv, pty_master.clone()));
+    let out_task = tokio::spawn(copy_pty_to_quic(pty_master, send));
     let status = loop {
         tokio::select! {
             status = child.wait() => break status.context("wait for remote pty command")?,
@@ -293,41 +297,16 @@ async fn run_pty(
     Ok(process_exit_from_status(status))
 }
 
-async fn copy_pty_to_quic(fd: Arc<AsyncFd<OwnedFd>>, mut send: SendStream) -> Result<()> {
-    let mut buf = vec![0u8; 8192];
-    loop {
-        let mut guard = fd.readable().await?;
-        match guard.try_io(|inner| read_fd(inner.get_ref().as_raw_fd(), &mut buf)) {
-            Ok(Ok(0)) => break,
-            Ok(Ok(n)) => send.write_all(&buf[..n]).await?,
-            Ok(Err(err)) if err.raw_os_error() == Some(libc::EIO) => break,
-            Ok(Err(err)) => return Err(err.into()),
-            Err(_) => continue,
-        }
-    }
+async fn copy_pty_to_quic(mut pty: AsyncPty, mut send: SendStream) -> Result<()> {
+    tokio::io::copy(&mut pty, &mut send).await?;
     send.finish()?;
     let _ = send.stopped().await;
     Ok(())
 }
 
-async fn copy_quic_to_pty(mut recv: RecvStream, fd: Arc<AsyncFd<OwnedFd>>) -> Result<()> {
-    let mut buf = vec![0u8; 8192];
-    loop {
-        let n = recv.read(&mut buf).await?.unwrap_or(0);
-        if n == 0 {
-            return Ok(());
-        }
-        let mut written = 0;
-        while written < n {
-            let mut guard = fd.writable().await?;
-            match guard.try_io(|inner| write_fd(inner.get_ref().as_raw_fd(), &buf[written..n])) {
-                Ok(Ok(0)) => return Ok(()),
-                Ok(Ok(m)) => written += m,
-                Ok(Err(err)) => return Err(err.into()),
-                Err(_) => continue,
-            }
-        }
-    }
+async fn copy_quic_to_pty(mut recv: RecvStream, mut pty: AsyncPty) -> Result<()> {
+    tokio::io::copy(&mut recv, &mut pty).await?;
+    Ok(())
 }
 
 fn set_nonblocking(fd: RawFd) -> Result<()> {
@@ -352,15 +331,6 @@ fn set_cloexec(fd: RawFd) -> Result<()> {
     Ok(())
 }
 
-fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
-    let rc = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-    if rc >= 0 {
-        Ok(rc as usize)
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
 fn write_fd(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
     let rc = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
     if rc >= 0 {
@@ -377,6 +347,90 @@ fn process_exit_from_status(status: std::process::ExitStatus) -> ProcessExit {
         ProcessExit::Signal(signal)
     } else {
         ProcessExit::Code(255)
+    }
+}
+
+#[derive(Clone)]
+struct AsyncPty {
+    fd: Arc<AsyncFd<OwnedFd>>,
+}
+
+impl AsyncPty {
+    fn new(fd: OwnedFd) -> io::Result<Self> {
+        Ok(Self {
+            fd: Arc::new(AsyncFd::new(fd)?),
+        })
+    }
+
+    fn resize(&self, size: &TermSize) -> Result<()> {
+        set_winsize(self.fd.get_ref().as_raw_fd(), size)
+    }
+}
+
+impl AsyncRead for AsyncPty {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            let mut guard = std::task::ready!(self.fd.poll_read_ready(cx))?;
+            let result = guard.try_io(|inner| {
+                let unfilled = buf.initialize_unfilled();
+                let n = unsafe {
+                    libc::read(
+                        inner.get_ref().as_raw_fd(),
+                        unfilled.as_mut_ptr().cast(),
+                        unfilled.len(),
+                    )
+                };
+                if n >= 0 {
+                    Ok(n as usize)
+                } else {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EIO) {
+                        Ok(0)
+                    } else {
+                        Err(err)
+                    }
+                }
+            });
+
+            match result {
+                Ok(Ok(0)) => return Poll::Ready(Ok(())),
+                Ok(Ok(n)) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(Err(err)) => return Poll::Ready(Err(err)),
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for AsyncPty {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            let mut guard = std::task::ready!(self.fd.poll_write_ready(cx))?;
+            let result = guard.try_io(|inner| write_fd(inner.get_ref().as_raw_fd(), data));
+            match result {
+                Ok(result) => return Poll::Ready(result),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
