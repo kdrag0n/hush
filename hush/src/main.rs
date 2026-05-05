@@ -400,7 +400,8 @@ fn finish_process(status: ProcessExit) -> ! {
     }
 }
 
-fn self_terminate_with_signal(signal: i32) -> ! {
+fn self_terminate_with_signal(signal: RemoteSignal) -> ! {
+    let signal = signal.as_raw();
     unsafe {
         let mut set = std::mem::zeroed::<libc::sigset_t>();
         libc::sigemptyset(&mut set);

@@ -362,7 +362,7 @@ fn write_fd(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
 fn process_exit_from_status(status: std::process::ExitStatus) -> ProcessExit {
     if let Some(code) = status.code() {
         ProcessExit::Code(code)
-    } else if let Some(signal) = status.signal() {
+    } else if let Some(signal) = status.signal().and_then(RemoteSignal::from_raw) {
         ProcessExit::Signal(signal)
     } else {
         ProcessExit::Code(255)

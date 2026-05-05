@@ -82,6 +82,15 @@ impl RemoteSignal {
             Self::Hangup => libc::SIGHUP,
         }
     }
+
+    pub fn from_raw(signal: i32) -> Option<Self> {
+        match signal {
+            libc::SIGINT => Some(Self::Interrupt),
+            libc::SIGTERM => Some(Self::Terminate),
+            libc::SIGHUP => Some(Self::Hangup),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,7 +104,7 @@ pub enum ControlResponse {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ProcessExit {
     Code(i32),
-    Signal(i32),
+    Signal(RemoteSignal),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
