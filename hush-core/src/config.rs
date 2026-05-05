@@ -85,6 +85,16 @@ pub struct SshHostConfig {
     pub hostname: Option<String>,
     pub port: Option<u16>,
     pub identity_file: Option<std::path::PathBuf>,
+    pub local_forwards: Vec<SshForward>,
+    pub remote_forwards: Vec<SshForward>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshForward {
+    pub listen_host: String,
+    pub listen_port: u16,
+    pub target_host: String,
+    pub target_port: u16,
 }
 
 pub fn read_ssh_config(alias: &str) -> Result<SshHostConfig> {
@@ -93,6 +103,10 @@ pub fn read_ssh_config(alias: &str) -> Result<SshHostConfig> {
         return Ok(SshHostConfig::default());
     };
 
+    parse_ssh_config(alias, &data)
+}
+
+fn parse_ssh_config(alias: &str, data: &str) -> Result<SshHostConfig> {
     let mut active = false;
     let mut cfg = SshHostConfig::default();
     for raw in data.lines() {
@@ -119,10 +133,124 @@ pub fn read_ssh_config(alias: &str) -> Result<SshHostConfig> {
             "identityfile" if cfg.identity_file.is_none() => {
                 cfg.identity_file = Some(expand_home(value))
             }
+            "localforward" => cfg.local_forwards.push(
+                parse_ssh_forward(value)
+                    .with_context(|| format!("parse LocalForward {value:?}"))?,
+            ),
+            "remoteforward" => cfg.remote_forwards.push(
+                parse_ssh_forward(value)
+                    .with_context(|| format!("parse RemoteForward {value:?}"))?,
+            ),
             _ => {}
         }
     }
     Ok(cfg)
+}
+
+fn parse_ssh_forward(value: &str) -> Result<SshForward> {
+    let args = shell_words::split(value).context("split forward directive")?;
+    match args.as_slice() {
+        [combined] => parse_colon_forward(combined),
+        [listen, target] => {
+            let (listen_host, listen_port) = parse_listen_endpoint(listen)?;
+            let (target_host, target_port) = parse_target_endpoint(target)?;
+            Ok(SshForward {
+                listen_host,
+                listen_port,
+                target_host,
+                target_port,
+            })
+        }
+        [listen, target_host, target_port] => {
+            let (listen_host, listen_port) = parse_listen_endpoint(listen)?;
+            Ok(SshForward {
+                listen_host,
+                listen_port,
+                target_host: unbracket_host(target_host),
+                target_port: target_port.parse().context("bad target port")?,
+            })
+        }
+        _ => anyhow::bail!(
+            "expected [listen_host:]listen_port target_host:target_port or [listen_host:]listen_port target_host target_port"
+        ),
+    }
+}
+
+fn parse_colon_forward(value: &str) -> Result<SshForward> {
+    let parts = split_colon_bracketed(value);
+    let (listen_host, listen_port, target_host, target_port) = match parts.as_slice() {
+        [lp, th, tp] => (
+            "127.0.0.1".to_owned(),
+            lp.as_str(),
+            th.as_str(),
+            tp.as_str(),
+        ),
+        [lh, lp, th, tp] => (unbracket_host(lh), lp.as_str(), th.as_str(), tp.as_str()),
+        _ => anyhow::bail!("expected [listen_host:]listen_port:target_host:target_port"),
+    };
+    Ok(SshForward {
+        listen_host,
+        listen_port: listen_port.parse().context("bad listen port")?,
+        target_host: unbracket_host(target_host),
+        target_port: target_port.parse().context("bad target port")?,
+    })
+}
+
+fn parse_listen_endpoint(value: &str) -> Result<(String, u16)> {
+    let parts = split_colon_bracketed(value);
+    match parts.as_slice() {
+        [port] => Ok((
+            "127.0.0.1".to_owned(),
+            port.parse().context("bad listen port")?,
+        )),
+        [host, port] => Ok((
+            unbracket_host(host),
+            port.parse().context("bad listen port")?,
+        )),
+        _ => anyhow::bail!("expected [listen_host:]listen_port"),
+    }
+}
+
+fn parse_target_endpoint(value: &str) -> Result<(String, u16)> {
+    let parts = split_colon_bracketed(value);
+    match parts.as_slice() {
+        [host, port] => Ok((
+            unbracket_host(host),
+            port.parse().context("bad target port")?,
+        )),
+        _ => anyhow::bail!("expected target_host:target_port"),
+    }
+}
+
+fn split_colon_bracketed(input: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut bracket_depth = 0usize;
+    for ch in input.chars() {
+        match ch {
+            '[' => {
+                bracket_depth += 1;
+                current.push(ch);
+            }
+            ']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ':' if bracket_depth == 0 => {
+                parts.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    parts.push(current);
+    parts
+}
+
+fn unbracket_host(host: &str) -> String {
+    host.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_owned()
 }
 
 fn expand_home(value: &str) -> std::path::PathBuf {
@@ -145,7 +273,10 @@ fn host_pattern_matches(pattern: &str, host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SERVER_CONFIG_EXAMPLE, ServerConfigFile, write_server_config_example_if_missing};
+    use super::{
+        SERVER_CONFIG_EXAMPLE, ServerConfigFile, SshForward, parse_ssh_forward,
+        write_server_config_example_if_missing,
+    };
     use std::fs;
 
     #[test]
@@ -175,6 +306,108 @@ mod tests {
         assert_eq!(
             fs::read_to_string(path).unwrap(),
             "listen = \"127.0.0.1:22022\"\n"
+        );
+    }
+
+    #[test]
+    fn ssh_forward_parses_openssh_two_argument_form() {
+        let forward = parse_ssh_forward("8080 app.internal:443").unwrap();
+        assert_eq!(
+            forward,
+            SshForward {
+                listen_host: "127.0.0.1".to_owned(),
+                listen_port: 8080,
+                target_host: "app.internal".to_owned(),
+                target_port: 443,
+            }
+        );
+    }
+
+    #[test]
+    fn ssh_forward_parses_openssh_three_argument_form() {
+        let forward = parse_ssh_forward("localhost:8080 db.internal 5432").unwrap();
+        assert_eq!(
+            forward,
+            SshForward {
+                listen_host: "localhost".to_owned(),
+                listen_port: 8080,
+                target_host: "db.internal".to_owned(),
+                target_port: 5432,
+            }
+        );
+    }
+
+    #[test]
+    fn ssh_forward_parses_colon_only_form() {
+        let forward = parse_ssh_forward("127.0.0.1:8080:app.internal:443").unwrap();
+        assert_eq!(
+            forward,
+            SshForward {
+                listen_host: "127.0.0.1".to_owned(),
+                listen_port: 8080,
+                target_host: "app.internal".to_owned(),
+                target_port: 443,
+            }
+        );
+    }
+
+    #[test]
+    fn ssh_forward_parses_bracketed_ipv6_hosts() {
+        let forward = parse_ssh_forward("[::1]:8080 [2001:db8::1]:443").unwrap();
+        assert_eq!(
+            forward,
+            SshForward {
+                listen_host: "::1".to_owned(),
+                listen_port: 8080,
+                target_host: "2001:db8::1".to_owned(),
+                target_port: 443,
+            }
+        );
+    }
+
+    #[test]
+    fn ssh_config_collects_local_and_remote_forwards() {
+        let cfg = super::parse_ssh_config(
+            "edge",
+            r#"
+Host other
+    LocalForward 9000 ignored:9000
+
+Host edge
+    HostName edge.example
+    LocalForward 8080 app.internal:443
+    RemoteForward localhost:9090 db.internal 5432
+    LocalForward [::1]:10000 [2001:db8::1]:443
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.hostname.as_deref(), Some("edge.example"));
+        assert_eq!(
+            cfg.local_forwards,
+            vec![
+                SshForward {
+                    listen_host: "127.0.0.1".to_owned(),
+                    listen_port: 8080,
+                    target_host: "app.internal".to_owned(),
+                    target_port: 443,
+                },
+                SshForward {
+                    listen_host: "::1".to_owned(),
+                    listen_port: 10000,
+                    target_host: "2001:db8::1".to_owned(),
+                    target_port: 443,
+                },
+            ]
+        );
+        assert_eq!(
+            cfg.remote_forwards,
+            vec![SshForward {
+                listen_host: "localhost".to_owned(),
+                listen_port: 9090,
+                target_host: "db.internal".to_owned(),
+                target_port: 5432,
+            }]
         );
     }
 }

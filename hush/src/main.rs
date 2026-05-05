@@ -8,7 +8,8 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use cli::{Args, Target};
 use hush_core::{
-    auth, config,
+    auth,
+    config::{self, SshForward},
     forwarding::LocalForward,
     protocol::{
         OpenSession, RemoteForwardRequest, SessionMode, StreamOpen, StreamResponse, TcpTarget,
@@ -26,19 +27,27 @@ async fn main() -> Result<()> {
 
     let target = Target::parse(&args.target, args.port)?;
     let ssh_cfg = config::read_ssh_config(&target.host_alias)?;
+    let config::SshHostConfig {
+        user: config_user,
+        hostname: config_hostname,
+        port: config_port,
+        identity_file: config_identity_file,
+        local_forwards,
+        remote_forwards,
+    } = ssh_cfg;
     let user = target
         .user
-        .or(ssh_cfg.user)
+        .or(config_user)
         .unwrap_or_else(auth::current_username);
-    let host = ssh_cfg.hostname.unwrap_or(target.host);
+    let host = config_hostname.unwrap_or(target.host);
     let port = target
         .port
-        .or(ssh_cfg.port)
+        .or(config_port)
         .unwrap_or(hush_core::defaults::DEFAULT_PORT);
     let data_dir = args
         .data_dir
         .unwrap_or_else(hush_core::paths::default_data_dir);
-    let identity_file = args.identity_file.or(ssh_cfg.identity_file);
+    let identity_file = args.identity_file.or(config_identity_file);
 
     let identity = auth::load_identity_with_file(identity_file.as_deref())?;
     let mut endpoint = Endpoint::client("[::]:0".parse::<SocketAddr>()?)?;
@@ -51,21 +60,11 @@ async fn main() -> Result<()> {
 
     let conn = net::connect_any(&endpoint, &host, port).await?;
 
+    for spec in local_forwards {
+        spawn_local_forward(conn.clone(), spec);
+    }
     for spec in args.local_forward.iter().cloned() {
-        let conn = conn.clone();
-        tokio::spawn(async move {
-            let local = LocalForward {
-                listen_host: spec.listen_host,
-                listen_port: spec.listen_port,
-                target: TcpTarget {
-                    host: spec.target_host,
-                    port: spec.target_port,
-                },
-            };
-            if let Err(err) = hush_core::forwarding::run_local_forward(conn, local).await {
-                tracing::warn!(%err, "local forwarding stopped");
-            }
-        });
+        spawn_local_forward(conn.clone(), cli_forward_to_ssh_forward(spec));
     }
 
     let conn_for_remote = conn.clone();
@@ -81,22 +80,11 @@ async fn main() -> Result<()> {
         }
     });
 
+    for spec in remote_forwards {
+        request_remote_forward(&conn, spec).await?;
+    }
     for spec in args.remote_forward.iter().cloned() {
-        let (mut send, mut recv) = conn.open_bi().await?;
-        write_frame(
-            &mut send,
-            &StreamOpen::OpenRemoteForward(RemoteForwardRequest {
-                listen_host: spec.listen_host,
-                listen_port: spec.listen_port,
-                target: TcpTarget {
-                    host: spec.target_host,
-                    port: spec.target_port,
-                },
-            }),
-        )
-        .await?;
-        send.finish()?;
-        expect_ok(&mut recv).await?;
+        request_remote_forward(&conn, cli_forward_to_ssh_forward(spec)).await?;
     }
 
     let mode = session::choose_mode(args.tty, args.no_tty);
@@ -112,6 +100,49 @@ async fn main() -> Result<()> {
         SessionMode::Pty { .. } => session::run_pty(conn, session).await,
         SessionMode::Pipes => session::run_pipes(conn, session).await,
     }
+}
+
+fn cli_forward_to_ssh_forward(value: cli::ForwardArg) -> SshForward {
+    SshForward {
+        listen_host: value.listen_host,
+        listen_port: value.listen_port,
+        target_host: value.target_host,
+        target_port: value.target_port,
+    }
+}
+
+fn spawn_local_forward(conn: quinn::Connection, spec: SshForward) {
+    tokio::spawn(async move {
+        let local = LocalForward {
+            listen_host: spec.listen_host,
+            listen_port: spec.listen_port,
+            target: TcpTarget {
+                host: spec.target_host,
+                port: spec.target_port,
+            },
+        };
+        if let Err(err) = hush_core::forwarding::run_local_forward(conn, local).await {
+            tracing::warn!(%err, "local forwarding stopped");
+        }
+    });
+}
+
+async fn request_remote_forward(conn: &quinn::Connection, spec: SshForward) -> Result<()> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    write_frame(
+        &mut send,
+        &StreamOpen::OpenRemoteForward(RemoteForwardRequest {
+            listen_host: spec.listen_host,
+            listen_port: spec.listen_port,
+            target: TcpTarget {
+                host: spec.target_host,
+                port: spec.target_port,
+            },
+        }),
+    )
+    .await?;
+    send.finish()?;
+    expect_ok(&mut recv).await
 }
 
 async fn expect_ok(recv: &mut quinn::RecvStream) -> Result<()> {
