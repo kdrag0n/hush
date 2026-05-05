@@ -146,6 +146,21 @@ asset_os_words() {
 	esac
 }
 
+release_asset_label() {
+	case "$(uname -s):$(uname -m)" in
+		Darwin:arm64|Darwin:aarch64) printf '%s\n' "macos-aarch64" ;;
+		Darwin:x86_64|Darwin:amd64) printf '%s\n' "macos-x86_64" ;;
+		Linux:x86_64|Linux:amd64) printf '%s\n' "linux-x86_64-musl" ;;
+		Linux:arm64|Linux:aarch64) printf '%s\n' "linux-aarch64-musl" ;;
+		*) return 1 ;;
+	esac
+}
+
+prerelease_asset_url() {
+	label=$(release_asset_label) || return 1
+	printf 'https://github.com/%s/releases/download/prerelease-main/hush-server-%s\n' "$HUSH_REPO" "$label"
+}
+
 select_release_asset_url() {
 	tmp_json=$1
 	os_words=$(asset_os_words)
@@ -238,16 +253,17 @@ download_server() {
 			api_url="https://api.github.com/repos/$HUSH_REPO/releases/latest"
 			log "Fetching release metadata from $api_url"
 			if ! fetch_stdout_optional "$api_url" >"$api_json"; then
-				api_url="https://api.github.com/repos/$HUSH_REPO/releases?per_page=20"
-				log "No stable latest release found; checking prereleases"
-				fetch_stdout "$api_url" >"$api_json"
+				log "No stable latest release found; using prerelease-main"
+				asset_url=$(prerelease_asset_url || true)
+			else
+				asset_url=$(select_release_asset_url "$api_json")
 			fi
 		else
 			api_url="https://api.github.com/repos/$HUSH_REPO/releases/tags/$HUSH_VERSION"
 			log "Fetching release metadata from $api_url"
 			fetch_stdout "$api_url" >"$api_json"
+			asset_url=$(select_release_asset_url "$api_json")
 		fi
-		asset_url=$(select_release_asset_url "$api_json")
 	fi
 
 	[ -n "${asset_url:-}" ] || die "could not find a hush release asset for $(uname -s)/$(uname -m); set HUSH_ASSET_URL to override"
