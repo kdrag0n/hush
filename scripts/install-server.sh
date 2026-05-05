@@ -77,6 +77,18 @@ fetch_stdout() {
 	fi
 }
 
+fetch_stdout_optional() {
+	url=$1
+
+	if have curl; then
+		curl -fsL "$url"
+	elif have wget; then
+		wget -qO - "$url"
+	else
+		die "curl or wget is required"
+	fi
+}
+
 lower() {
 	printf '%s' "$1" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz'
 }
@@ -132,14 +144,6 @@ asset_os_words() {
 		Linux) printf '%s\n' "linux openwrt" ;;
 		*) uname -s | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz' ;;
 	esac
-}
-
-release_api_url() {
-	if [ "$HUSH_VERSION" = latest ]; then
-		printf 'https://api.github.com/repos/%s/releases/latest\n' "$HUSH_REPO"
-	else
-		printf 'https://api.github.com/repos/%s/releases/tags/%s\n' "$HUSH_REPO" "$HUSH_VERSION"
-	fi
 }
 
 select_release_asset_url() {
@@ -230,9 +234,19 @@ download_server() {
 		asset_url=$HUSH_ASSET_URL
 	else
 		api_json=$work/release.json
-		api_url=$(release_api_url)
-		log "Fetching release metadata from $api_url"
-		fetch_stdout "$api_url" >"$api_json"
+		if [ "$HUSH_VERSION" = latest ]; then
+			api_url="https://api.github.com/repos/$HUSH_REPO/releases/latest"
+			log "Fetching release metadata from $api_url"
+			if ! fetch_stdout_optional "$api_url" >"$api_json"; then
+				api_url="https://api.github.com/repos/$HUSH_REPO/releases?per_page=20"
+				log "No stable latest release found; checking prereleases"
+				fetch_stdout "$api_url" >"$api_json"
+			fi
+		else
+			api_url="https://api.github.com/repos/$HUSH_REPO/releases/tags/$HUSH_VERSION"
+			log "Fetching release metadata from $api_url"
+			fetch_stdout "$api_url" >"$api_json"
+		fi
 		asset_url=$(select_release_asset_url "$api_json")
 	fi
 
