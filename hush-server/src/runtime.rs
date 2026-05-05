@@ -8,7 +8,10 @@ use hush_core::{
 use quinn::{Endpoint, default_runtime};
 use rustls_pki_types::CertificateDer;
 use std::{net::SocketAddr, sync::Arc};
-use tokio::sync::Semaphore;
+use tokio::{
+    sync::Semaphore,
+    time::{self, Duration},
+};
 
 pub(crate) async fn run(args: Args) -> Result<()> {
     let initial_data_dir = args
@@ -83,33 +86,106 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     );
 
     let connection_slots = Arc::new(Semaphore::new(runtime_config.max_connections));
-    while let Some(connecting) = endpoint.accept().await {
-        let permit = match connection_slots.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                tracing::warn!("rejecting connection because max_connections is reached");
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                let Some(connecting) = incoming else {
+                    break;
+                };
+                let permit = match connection_slots.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        tracing::warn!("rejecting connection because max_connections is reached");
+                        tokio::spawn(async move {
+                            if let Ok(conn) = connecting.await {
+                                conn.close(0u32.into(), b"server connection limit reached");
+                            }
+                        });
+                        continue;
+                    }
+                };
+                let runtime_config = runtime_config.clone();
                 tokio::spawn(async move {
-                    if let Ok(conn) = connecting.await {
-                        conn.close(0u32.into(), b"server connection limit reached");
+                    let _permit = permit;
+                    match connecting.await {
+                        Ok(conn) => {
+                            if let Err(err) = handle_connection(conn, runtime_config, local_addr).await {
+                                tracing::warn!(%err, "connection failed");
+                            }
+                        }
+                        Err(err) => tracing::warn!(%err, "accept failed"),
                     }
                 });
-                continue;
             }
-        };
-        let runtime_config = runtime_config.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            match connecting.await {
-                Ok(conn) => {
-                    if let Err(err) = handle_connection(conn, runtime_config, local_addr).await {
-                        tracing::warn!(%err, "connection failed");
-                    }
-                }
-                Err(err) => tracing::warn!(%err, "accept failed"),
+            () = &mut shutdown => {
+                close_endpoint(&endpoint).await;
+                break;
             }
-        });
+        }
     }
     Ok(())
+}
+
+async fn close_endpoint(endpoint: &Endpoint) {
+    tracing::info!(
+        connections = endpoint.open_connections(),
+        "shutting down hush server"
+    );
+    endpoint.close(0u32.into(), b"server shutdown");
+    match time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await {
+        Ok(()) => tracing::info!("hush server connections closed"),
+        Err(_) => {
+            tracing::warn!(
+                connections = endpoint.open_connections(),
+                "timed out waiting for connections to close"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    match (
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::terminate()),
+    ) {
+        (Ok(mut sigint), Ok(mut sigterm)) => {
+            tokio::select! {
+                _ = sigint.recv() => tracing::info!("received SIGINT"),
+                _ = sigterm.recv() => tracing::info!("received SIGTERM"),
+            }
+        }
+        (Ok(mut sigint), Err(err)) => {
+            tracing::warn!(%err, "failed to install SIGTERM handler");
+            sigint.recv().await;
+            tracing::info!("received SIGINT");
+        }
+        (Err(err), Ok(mut sigterm)) => {
+            tracing::warn!(%err, "failed to install SIGINT handler");
+            sigterm.recv().await;
+            tracing::info!("received SIGTERM");
+        }
+        (Err(sigint_err), Err(sigterm_err)) => {
+            tracing::warn!(
+                %sigint_err,
+                %sigterm_err,
+                "failed to install signal handlers"
+            );
+            std::future::pending().await
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => tracing::info!("received Ctrl-C"),
+        Err(err) => tracing::warn!(%err, "failed to wait for Ctrl-C"),
+    }
 }
 
 fn empty_file_config() -> config::ServerConfigFile {
