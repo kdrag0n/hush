@@ -2,6 +2,12 @@
 
 Modern fuss-free SSH.
 
+## Install server
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kdrag0n/hush/main/scripts/install-server.sh | sh
+```
+
 ## Features
 
 - Built on QUIC protocol
