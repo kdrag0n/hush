@@ -161,3 +161,10 @@ jobs:
           fi
 
           gh release upload "${tag}" dist/* --clobber
+
+      - name: Update Homebrew tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HUSH_VERSION: 0.1.0
+          HOMEBREW_REVISION: ${{ github.run_number }}
+        run: .github/scripts/update-homebrew-tap.sh
