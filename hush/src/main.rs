@@ -234,6 +234,9 @@ async fn run_pipes(
     mut control_recv: quinn::RecvStream,
     control_tx: tokio::sync::mpsc::Sender<ControlRequest>,
 ) -> Result<()> {
+    let (local_signal_tx, mut local_signal_rx) = tokio::sync::mpsc::channel(8);
+    let signal_task = tokio::spawn(watch_signals(control_tx, local_signal_tx));
+    let mut sigterm_watchdog = None;
     let (mut send, recv) = conn.open_bi().await?;
     write_frame(&mut send, &StreamOpen::SessionStdIo).await?;
     expect_session_ready(&mut control_recv).await?;
@@ -249,9 +252,6 @@ async fn run_pipes(
     let in_task = tokio::spawn(stdio_to_quic(libc::STDIN_FILENO, send));
     let out_task = tokio::spawn(quic_to_stdio(recv, libc::STDOUT_FILENO));
     let err_task = tokio::spawn(quic_to_stdio(stderr_recv, libc::STDERR_FILENO));
-    let (local_signal_tx, mut local_signal_rx) = tokio::sync::mpsc::channel(8);
-    let signal_task = tokio::spawn(watch_signals(control_tx, local_signal_tx));
-    let mut sigterm_watchdog = None;
     let status = loop {
         tokio::select! {
             status = read_exit_status(&mut control_recv) => break status?,

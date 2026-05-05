@@ -279,7 +279,8 @@ impl Signer for AgentTlsSigner {
 }
 
 fn pq_provider() -> CryptoProvider {
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768];
     provider
 }
 
