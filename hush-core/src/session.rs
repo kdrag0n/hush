@@ -341,6 +341,17 @@ fn set_nonblocking(fd: RawFd) -> Result<()> {
     Ok(())
 }
 
+fn set_cloexec(fd: RawFd) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        bail!("fcntl(F_GETFD) failed: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        bail!("fcntl(F_SETFD) failed: {}", std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
     let rc = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
     if rc >= 0 {
@@ -395,10 +406,40 @@ fn open_pty(size: &TermSize) -> Result<OpenPty> {
     if rc < 0 {
         bail!("openpty failed: {}", std::io::Error::last_os_error());
     }
-    Ok(OpenPty {
+    let pty = OpenPty {
         master: unsafe { OwnedFd::from_raw_fd(master) },
         slave: unsafe { OwnedFd::from_raw_fd(slave) },
-    })
+    };
+    set_cloexec(pty.master.as_raw_fd())?;
+    set_cloexec(pty.slave.as_raw_fd())?;
+    configure_pty_slave(pty.slave.as_raw_fd())?;
+    Ok(pty)
+}
+
+fn configure_pty_slave(fd: RawFd) -> Result<()> {
+    let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+    if unsafe { libc::tcgetattr(fd, &mut termios) } < 0 {
+        bail!(
+            "tcgetattr pty slave failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    termios.c_iflag |= libc::BRKINT | libc::ICRNL | libc::IXON;
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        termios.c_iflag |= libc::IUTF8;
+    }
+    termios.c_oflag |= libc::OPOST | libc::ONLCR;
+    termios.c_cflag |= libc::CREAD | libc::CS8;
+    termios.c_lflag |=
+        libc::ECHO | libc::ECHOE | libc::ECHOK | libc::ICANON | libc::IEXTEN | libc::ISIG;
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) } < 0 {
+        bail!(
+            "tcsetattr pty slave failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
 }
 
 fn set_winsize(fd: RawFd, size: &TermSize) -> Result<()> {
