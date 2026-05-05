@@ -3,8 +3,7 @@ use crate::{
     auth::{self, IdentityKey},
 };
 use anyhow::{Result, bail};
-use quinn::TransportConfig;
-use quinn::{ClientConfig, ServerConfig};
+use quinn::{AckFrequencyConfig, ClientConfig, ServerConfig, TransportConfig, VarInt};
 use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::{
     ClientConfig as RustlsClientConfig, DigitallySignedStruct, Error as RustlsError,
@@ -28,6 +27,15 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+const QUIC_FAST_MTU: u16 = 1200;
+const QUIC_FAST_SEND_WINDOW: u64 = 256 * QUIC_FAST_MTU as u64;
+const QUIC_FAST_STREAM_RECV_WINDOW: u32 = 4 * 1024 * 1024;
+const QUIC_FAST_CONN_RECV_WINDOW: u32 = 16 * 1024 * 1024;
+const QUIC_FAST_PACKET_THRESHOLD: u32 = 3;
+const QUIC_FAST_TIME_THRESHOLD: f32 = 1.0;
+const QUIC_FAST_INITIAL_RTT: Duration = Duration::from_millis(100);
+const QUIC_FAST_ACK_DELAY: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone)]
 struct KnownHosts {
@@ -303,6 +311,23 @@ fn long_idle_transport() -> Result<TransportConfig> {
     let mut transport = TransportConfig::default();
     transport.max_idle_timeout(Some(Duration::from_secs(7 * 24 * 60 * 60).try_into()?));
     transport.keep_alive_interval(None);
+    transport.initial_mtu(QUIC_FAST_MTU);
+    transport.min_mtu(QUIC_FAST_MTU);
+    transport.mtu_discovery_config(None);
+    transport.pad_to_mtu(false);
+    transport.enable_segmentation_offload(false);
+    transport.send_window(QUIC_FAST_SEND_WINDOW);
+    transport.stream_receive_window(VarInt::from_u32(QUIC_FAST_STREAM_RECV_WINDOW));
+    transport.receive_window(VarInt::from_u32(QUIC_FAST_CONN_RECV_WINDOW));
+    transport.packet_threshold(QUIC_FAST_PACKET_THRESHOLD);
+    transport.time_threshold(QUIC_FAST_TIME_THRESHOLD);
+    transport.initial_rtt(QUIC_FAST_INITIAL_RTT);
+    let mut ack_frequency = AckFrequencyConfig::default();
+    ack_frequency.ack_eliciting_threshold(VarInt::from_u32(0));
+    ack_frequency.max_ack_delay(Some(QUIC_FAST_ACK_DELAY));
+    ack_frequency.reordering_threshold(VarInt::from_u32(QUIC_FAST_PACKET_THRESHOLD - 1));
+    transport.ack_frequency_config(Some(ack_frequency));
+    transport.persistent_congestion_threshold(10);
     transport.congestion_controller_factory(Arc::new(crate::congestion::KcpConfig::fast()));
     Ok(transport)
 }

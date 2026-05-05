@@ -4,10 +4,10 @@ use quinn_proto::{
 };
 use std::{any::Any, sync::Arc, time::Instant};
 
-const DEFAULT_SEND_WINDOW_PACKETS: u64 = 32;
+const DEFAULT_SEND_WINDOW_PACKETS: u64 = 256;
 const INITIAL_SSTHRESH_PACKETS: u64 = 2;
 const MIN_SSTHRESH_PACKETS: u64 = 2;
-const FAST_RESEND_THRESHOLD: u64 = 2;
+const FAST_RESEND_THRESHOLD: u64 = 1;
 
 #[derive(Debug, Clone)]
 pub struct KcpConfig {
@@ -188,10 +188,10 @@ mod tests {
         let now = Instant::now();
         let mut controller = Arc::new(KcpConfig::fast()).build(now, 1200);
 
-        assert_eq!(controller.initial_window(), 32 * 1200);
-        assert_eq!(controller.window(), 32 * 1200);
+        assert_eq!(controller.initial_window(), 256 * 1200);
+        assert_eq!(controller.window(), 256 * 1200);
         controller.on_congestion_event(now, now, true, 1200);
-        assert_eq!(controller.window(), 32 * 1200);
+        assert_eq!(controller.window(), 256 * 1200);
     }
 
     #[test]
