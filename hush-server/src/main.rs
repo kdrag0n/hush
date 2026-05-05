@@ -11,33 +11,63 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::sync::Semaphore;
 
 #[derive(Debug, Parser)]
-#[command(name = "hush-server", version)]
+#[command(
+    name = "hush-server",
+    version,
+    about = "Server for hush, an SSH-like remote shell over QUIC",
+    long_about = "hush-server listens for QUIC connections, authenticates clients with Ed25519 SSH keys, and runs remote shell sessions.\n\nConfiguration is read from ~/.hush/server_config.toml, or /etc/hush/server_config.toml when running as root, unless --config is supplied. Command-line flags override config file values."
+)]
 struct Args {
+    /// Enable verbose server logging.
     #[arg(short, long)]
     verbose: bool,
-    #[arg(long)]
+
+    /// Data directory for host keys and server state.
+    #[arg(long, value_name = "DIR", help_heading = "Configuration")]
     data_dir: Option<PathBuf>,
-    #[arg(short, long, default_value = "[::]:4433")]
+
+    /// UDP listen address.
+    #[arg(short, long, value_name = "ADDR", default_value = "[::]:4433")]
     listen: SocketAddr,
-    #[arg(short, long)]
+
+    /// Path to server_config.toml.
+    #[arg(short, long, value_name = "PATH", help_heading = "Configuration")]
     config: Option<PathBuf>,
-    #[arg(long)]
+
+    /// DER-encoded TLS host certificate path.
+    #[arg(long, value_name = "PATH", help_heading = "Configuration")]
     host_cert: Option<PathBuf>,
-    #[arg(long)]
+
+    /// DER-encoded TLS host private key path.
+    #[arg(long, value_name = "PATH", help_heading = "Configuration")]
     host_key: Option<PathBuf>,
-    #[arg(long)]
+
+    /// authorized_keys file to use instead of the target user's default.
+    #[arg(long, value_name = "PATH", help_heading = "Configuration")]
     authorized_keys: Option<PathBuf>,
-    #[arg(long)]
+
+    /// Restrict logins to this username. May be repeated.
+    #[arg(long, value_name = "USER", help_heading = "Configuration")]
     allow_user: Vec<String>,
+
+    /// Disable local and remote TCP forwarding.
     #[arg(long)]
     disable_tcp_forwarding: bool,
-    #[arg(long)]
+
+    /// Maximum concurrent QUIC connections.
+    #[arg(long, value_name = "N", help_heading = "Limits")]
     max_connections: Option<usize>,
-    #[arg(long)]
+
+    /// Maximum shell sessions accepted per QUIC connection.
+    #[arg(long, value_name = "N", help_heading = "Limits")]
     max_sessions_per_connection: Option<usize>,
-    #[arg(long)]
+
+    /// Maximum remote -R listeners accepted before the session starts.
+    #[arg(long, value_name = "N", help_heading = "Limits")]
     max_forwards_per_connection: Option<usize>,
-    #[arg(long)]
+
+    /// Maximum concurrent local-forward streams per connection.
+    #[arg(long, value_name = "N", help_heading = "Limits")]
     max_forward_streams_per_connection: Option<usize>,
 }
 

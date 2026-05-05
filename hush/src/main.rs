@@ -26,29 +26,68 @@ use tokio::{
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Parser)]
-#[command(name = "hush", version)]
+#[command(
+    name = "hush",
+    version,
+    about = "SSH-like remote command client over QUIC",
+    long_about = "hush connects to a hush-server over QUIC, authenticates with an Ed25519 SSH key, and runs a remote shell or command.\n\nTarget syntax is [user@]host[:port]. IPv6 literals may be written as [::1]:4433.\n\nForward syntax for -L and -R is [listen_host:]listen_port:target_host:target_port."
+)]
 struct Args {
+    /// Enable client logging. Without this, client logging is disabled.
     #[arg(short = 'v', long)]
     verbose: bool,
-    #[arg(short = 'k', long)]
+
+    /// Skip TOFU host certificate verification for this connection.
+    #[arg(short = 'k', long, help_heading = "Host Trust")]
     insecure: bool,
-    #[arg(short = 'p')]
+
+    /// Connect to this remote port, overriding target and ssh_config ports.
+    #[arg(short = 'p', value_name = "PORT")]
     port: Option<u16>,
+
+    /// Force PTY allocation. Repeat as -tt for ssh compatibility.
     #[arg(short = 't', action = clap::ArgAction::Count)]
     tty: u8,
+
+    /// Disable PTY allocation and use stdin/stdout/stderr pipes.
     #[arg(short = 'T')]
     no_tty: bool,
-    #[arg(long)]
+
+    /// Data directory for known_hosts and client state.
+    #[arg(long, value_name = "DIR", help_heading = "Files")]
     data_dir: Option<PathBuf>,
-    #[arg(short = 'i')]
+
+    /// SSH Ed25519 identity file. Agent use is preferred when it has this key.
+    #[arg(short = 'i', value_name = "PATH", help_heading = "Authentication")]
     identity_file: Option<PathBuf>,
-    #[arg(short = 'S', long)]
+
+    /// Execute the command directly instead of through the user's shell.
+    #[arg(short = 'S', long, help_heading = "Execution")]
     no_shell: bool,
-    #[arg(short = 'L', value_parser = parse_forward)]
+
+    /// Forward a local TCP port to the remote side.
+    #[arg(
+        short = 'L',
+        value_name = "[BIND:]PORT:TARGET_HOST:TARGET_PORT",
+        help_heading = "Forwarding",
+        value_parser = parse_forward
+    )]
     local_forward: Vec<ForwardArg>,
-    #[arg(short = 'R', value_parser = parse_forward)]
+
+    /// Forward a remote TCP port back to the client side.
+    #[arg(
+        short = 'R',
+        value_name = "[BIND:]PORT:TARGET_HOST:TARGET_PORT",
+        help_heading = "Forwarding",
+        value_parser = parse_forward
+    )]
     remote_forward: Vec<ForwardArg>,
+
+    /// Remote target as [user@]host[:port].
+    #[arg(value_name = "[USER@]HOST[:PORT]")]
     target: String,
+
+    /// Remote command and arguments. Defaults to a login shell.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
 }
