@@ -79,7 +79,11 @@ impl TestEnv {
     }
 
     fn target(&self) -> String {
-        format!("{}@127.0.0.1", whoami::username())
+        self.target_for_host("127.0.0.1")
+    }
+
+    fn target_for_host(&self, host: &str) -> String {
+        format!("{}@{host}", whoami::username())
     }
 }
 
@@ -128,6 +132,23 @@ fn forced_pty_works() {
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stdout).contains("pty-ok"));
+}
+
+#[test]
+fn domain_name_target_works() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let out = env
+        .hush()
+        .arg("-T")
+        .arg(env.target_for_host("localhost"))
+        .arg("--")
+        .arg("/bin/echo")
+        .arg("domain-ok")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "domain-ok");
 }
 
 #[test]
