@@ -20,7 +20,7 @@ use rustls::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     fmt, fs,
     net::SocketAddr,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -28,18 +28,11 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use x509_parser::prelude::FromDer;
-
-const KNOWN_HOSTS_VERSION: u32 = 1;
-const KNOWN_HOST_KIND_X509_CERTIFICATE: &str = "x509-certificate";
-const KNOWN_HOST_HASH_SHA256: &str = "sha256";
-const KNOWN_HOST_ENCODING_BASE64_NO_PAD: &str = "base64-no-pad";
 
 #[derive(Debug, Clone)]
 struct KnownHosts {
     path: PathBuf,
-    entries: HashMap<String, KnownHostEntry>,
-    dirty: bool,
+    entries: BTreeMap<String, String>,
 }
 
 impl KnownHosts {
@@ -48,78 +41,37 @@ impl KnownHosts {
         let Ok(data) = fs::read_to_string(&path) else {
             return Ok(Self {
                 path,
-                entries: HashMap::new(),
-                dirty: false,
+                entries: BTreeMap::new(),
             });
         };
         if data.trim().is_empty() {
             return Ok(Self {
                 path,
-                entries: HashMap::new(),
-                dirty: false,
+                entries: BTreeMap::new(),
             });
         }
-        match toml::from_str::<KnownHostsFile>(&data) {
-            Ok(file) => {
-                if file.version != KNOWN_HOSTS_VERSION {
-                    bail!("unsupported known_hosts version {}", file.version);
-                }
-                let entries = file
-                    .hosts
-                    .into_iter()
-                    .map(|entry| (entry.host.clone(), entry))
-                    .collect();
-                Ok(Self {
-                    path,
-                    entries,
-                    dirty: false,
-                })
-            }
-            Err(err) if looks_like_structured_known_hosts(&data) => {
-                bail!("parse {}: {err}", path.display())
-            }
-            Err(_) => Ok(Self {
-                path,
-                entries: parse_legacy_known_hosts(&data),
-                dirty: true,
-            }),
-        }
+        let file = toml::from_str::<KnownHostsFile>(&data)
+            .map_err(|err| anyhow::anyhow!("parse {}: {err}", path.display()))?;
+        Ok(Self {
+            path,
+            entries: file.hosts,
+        })
     }
 
-    fn check_or_insert(
-        &mut self,
-        host: &str,
-        fingerprint: KnownHostFingerprint,
-        insecure: bool,
-    ) -> Result<()> {
+    fn check_or_insert(&mut self, host: &str, fingerprint: &str, insecure: bool) -> Result<()> {
         if insecure {
             return Ok(());
         }
         match self.entries.get(host) {
-            Some(old) if old.matches(&fingerprint) => {
-                if self.dirty {
-                    self.save()?;
-                    self.dirty = false;
-                }
-                Ok(())
-            }
+            Some(old) if old == fingerprint => Ok(()),
             Some(old) => {
-                let known = old.display_fingerprint();
-                let got = fingerprint.display();
                 bail!(
-                    "host certificate mismatch for {host}: known {known}, got {got}; use -k to bypass"
+                    "host certificate mismatch for {host}: known {old}, got {fingerprint}; use -k to bypass"
                 )
             }
             None => {
-                self.entries.insert(
-                    host.to_owned(),
-                    KnownHostEntry {
-                        host: host.to_owned(),
-                        fingerprints: vec![fingerprint],
-                    },
-                );
+                self.entries.insert(host.to_owned(), fingerprint.to_owned());
                 self.save()?;
-                self.dirty = false;
                 Ok(())
             }
         }
@@ -129,11 +81,8 @@ impl KnownHosts {
         if let Some(parent) = self.path.parent() {
             ensure_private_dir(parent)?;
         }
-        let mut hosts: Vec<_> = self.entries.values().cloned().collect();
-        hosts.sort_by(|a, b| a.host.cmp(&b.host));
         let data = toml::to_string_pretty(&KnownHostsFile {
-            version: KNOWN_HOSTS_VERSION,
-            hosts,
+            hosts: self.entries.clone(),
         })?;
         write_private_file_atomic(&self.path, data.as_bytes())?;
         Ok(())
@@ -142,133 +91,8 @@ impl KnownHosts {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct KnownHostsFile {
-    version: u32,
     #[serde(default)]
-    hosts: Vec<KnownHostEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct KnownHostEntry {
-    host: String,
-    #[serde(default)]
-    fingerprints: Vec<KnownHostFingerprint>,
-}
-
-impl KnownHostEntry {
-    fn matches(&self, fingerprint: &KnownHostFingerprint) -> bool {
-        self.fingerprints
-            .iter()
-            .any(|known| known.matches(fingerprint))
-    }
-
-    fn display_fingerprint(&self) -> String {
-        self.fingerprints
-            .first()
-            .map(KnownHostFingerprint::display)
-            .unwrap_or_else(|| "<none>".to_owned())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct KnownHostFingerprint {
-    kind: String,
-    hash: String,
-    encoding: String,
-    value: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    public_key_algorithm: Option<String>,
-}
-
-impl KnownHostFingerprint {
-    fn from_cert_der(cert_der: &[u8]) -> Self {
-        Self {
-            kind: KNOWN_HOST_KIND_X509_CERTIFICATE.to_owned(),
-            hash: KNOWN_HOST_HASH_SHA256.to_owned(),
-            encoding: KNOWN_HOST_ENCODING_BASE64_NO_PAD.to_owned(),
-            value: auth::cert_fingerprint(cert_der)
-                .strip_prefix("SHA256:")
-                .unwrap_or_default()
-                .to_owned(),
-            public_key_algorithm: cert_public_key_algorithm(cert_der),
-        }
-    }
-
-    fn from_legacy_cert_fingerprint(fingerprint: &str) -> Self {
-        let value = fingerprint
-            .strip_prefix("SHA256:")
-            .unwrap_or(fingerprint)
-            .to_owned();
-        Self {
-            kind: KNOWN_HOST_KIND_X509_CERTIFICATE.to_owned(),
-            hash: KNOWN_HOST_HASH_SHA256.to_owned(),
-            encoding: KNOWN_HOST_ENCODING_BASE64_NO_PAD.to_owned(),
-            value,
-            public_key_algorithm: None,
-        }
-    }
-
-    fn matches(&self, other: &Self) -> bool {
-        self.kind == other.kind
-            && self.hash == other.hash
-            && self.encoding == other.encoding
-            && self.value == other.value
-    }
-
-    fn display(&self) -> String {
-        match (
-            self.hash.as_str(),
-            self.encoding.as_str(),
-            self.kind.as_str(),
-        ) {
-            (
-                KNOWN_HOST_HASH_SHA256,
-                KNOWN_HOST_ENCODING_BASE64_NO_PAD,
-                KNOWN_HOST_KIND_X509_CERTIFICATE,
-            ) => {
-                format!("SHA256:{}", self.value)
-            }
-            _ => format!(
-                "{}:{}:{}:{}",
-                self.kind, self.hash, self.encoding, self.value
-            ),
-        }
-    }
-}
-
-fn parse_legacy_known_hosts(data: &str) -> HashMap<String, KnownHostEntry> {
-    let mut entries = HashMap::new();
-    for line in data.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        let Some(host) = parts.next() else { continue };
-        let Some(fingerprint) = parts.next() else {
-            continue;
-        };
-        entries.insert(
-            host.to_owned(),
-            KnownHostEntry {
-                host: host.to_owned(),
-                fingerprints: vec![KnownHostFingerprint::from_legacy_cert_fingerprint(
-                    fingerprint,
-                )],
-            },
-        );
-    }
-    entries
-}
-
-fn looks_like_structured_known_hosts(data: &str) -> bool {
-    data.lines().map(str::trim).any(|line| {
-        line.starts_with("version") || line.starts_with("[hosts") || line.starts_with("[[hosts")
-    })
-}
-
-fn cert_public_key_algorithm(cert_der: &[u8]) -> Option<String> {
-    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(cert_der).ok()?;
-    Some(cert.public_key().algorithm.algorithm.to_id_string())
+    hosts: BTreeMap<String, String>,
 }
 
 pub fn make_client_config(
@@ -529,11 +353,11 @@ impl ServerCertVerifier for TofuServerVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, RustlsError> {
-        let fp = KnownHostFingerprint::from_cert_der(end_entity.as_ref());
+        let fp = auth::cert_fingerprint(end_entity.as_ref());
         self.known_hosts
             .lock()
             .map_err(|_| RustlsError::General("known_hosts lock poisoned".into()))?
-            .check_or_insert(&self.host_key, fp, self.insecure)
+            .check_or_insert(&self.host_key, &fp, self.insecure)
             .map_err(|e| RustlsError::General(e.to_string()))?;
         Ok(ServerCertVerified::assertion())
     }
@@ -639,55 +463,43 @@ mod tests {
     };
 
     #[test]
-    fn legacy_known_hosts_migrates_to_structured_toml() {
-        let path = temp_known_hosts_path("legacy");
-        fs::write(&path, "example.com:4433 SHA256:abc123\n").unwrap();
+    fn known_hosts_saves_host_hash_map() {
+        let path = temp_known_hosts_path("new");
 
         let mut known_hosts = KnownHosts::load(&path).unwrap();
         known_hosts
-            .check_or_insert(
-                "example.com:4433",
-                KnownHostFingerprint::from_legacy_cert_fingerprint("SHA256:abc123"),
-                false,
-            )
+            .check_or_insert("example.com:4433", "SHA256:abc123", false)
             .unwrap();
 
         let data = fs::read_to_string(&path).unwrap();
-        assert!(data.contains("version = 1"));
-        assert!(data.contains("kind = \"x509-certificate\""));
-        assert!(data.contains("hash = \"sha256\""));
-        assert!(data.contains("encoding = \"base64-no-pad\""));
-        assert!(data.contains("value = \"abc123\""));
+        assert!(data.contains("[hosts]"));
+        assert!(data.contains("\"example.com:4433\" = \"SHA256:abc123\""));
     }
 
     #[test]
-    fn structured_known_hosts_does_not_require_ed25519_metadata() {
-        let path = temp_known_hosts_path("structured");
+    fn known_hosts_rejects_legacy_line_format() {
+        let path = temp_known_hosts_path("legacy");
+        fs::write(&path, "example.com:4433 SHA256:abc123\n").unwrap();
+
+        let err = KnownHosts::load(&path).unwrap_err();
+        assert!(err.to_string().contains("parse"));
+    }
+
+    #[test]
+    fn known_hosts_loads_hash_only_format() {
+        let path = temp_known_hosts_path("hash-only");
         fs::write(
             &path,
             r#"
-version = 1
-
-[[hosts]]
-host = "example.com:4433"
-
-[[hosts.fingerprints]]
-kind = "x509-certificate"
-hash = "sha256"
-encoding = "base64-no-pad"
-value = "abc123"
-public_key_algorithm = "1.2.840.10045.2.1"
+[hosts]
+"example.com:4433" = "SHA256:abc123"
 "#,
         )
         .unwrap();
 
         let mut known_hosts = KnownHosts::load(&path).unwrap();
         known_hosts
-            .check_or_insert(
-                "example.com:4433",
-                KnownHostFingerprint::from_legacy_cert_fingerprint("SHA256:abc123"),
-                false,
-            )
+            .check_or_insert("example.com:4433", "SHA256:abc123", false)
             .unwrap();
     }
 
