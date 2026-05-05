@@ -28,8 +28,7 @@ use std::{
     time::Duration,
 };
 
-const QUIC_FAST_MTU: u16 = 1200;
-const QUIC_FAST_SEND_WINDOW: u64 = 256 * QUIC_FAST_MTU as u64;
+const QUIC_FAST_SEND_WINDOW: u64 = 256 * 1200;
 const QUIC_FAST_STREAM_RECV_WINDOW: u32 = 4 * 1024 * 1024;
 const QUIC_FAST_CONN_RECV_WINDOW: u32 = 16 * 1024 * 1024;
 const QUIC_FAST_PACKET_THRESHOLD: u32 = 3;
@@ -311,11 +310,6 @@ fn long_idle_transport() -> Result<TransportConfig> {
     let mut transport = TransportConfig::default();
     transport.max_idle_timeout(Some(Duration::from_secs(7 * 24 * 60 * 60).try_into()?));
     transport.keep_alive_interval(None);
-    transport.initial_mtu(QUIC_FAST_MTU);
-    transport.min_mtu(QUIC_FAST_MTU);
-    transport.mtu_discovery_config(None);
-    transport.pad_to_mtu(false);
-    transport.enable_segmentation_offload(false);
     transport.send_window(QUIC_FAST_SEND_WINDOW);
     transport.stream_receive_window(VarInt::from_u32(QUIC_FAST_STREAM_RECV_WINDOW));
     transport.receive_window(VarInt::from_u32(QUIC_FAST_CONN_RECV_WINDOW));
