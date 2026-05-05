@@ -1,0 +1,14 @@
+[Unit]
+Description=hush server
+Documentation=https://github.com/kdrag0n/hush
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/hush-server
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
