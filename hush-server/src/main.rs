@@ -10,6 +10,6 @@ use cli::Args;
 async fn main() -> Result<()> {
     let args = Args::parse();
     logging::init(args.verbose);
-    hush_core::resource::raise_nofile_soft_limit_to_hard()?;
+    hush_core::os::raise_nofile_soft_limit_to_hard()?;
     runtime::run(args).await
 }

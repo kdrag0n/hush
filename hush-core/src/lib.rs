@@ -8,7 +8,6 @@ pub mod net;
 pub mod os;
 pub mod paths;
 pub mod protocol;
-pub mod resource;
 pub mod session;
 pub mod tls;
 
