@@ -1,0 +1,4 @@
+/target/
+/.hush-test/
+*.log
+*.pem
