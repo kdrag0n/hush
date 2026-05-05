@@ -22,7 +22,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         .data_dir
         .or(file_cfg.data_dir)
         .unwrap_or(initial_data_dir);
-    let listen = if args.listen.to_string() != "[::]:4433" {
+    let listen = if args.listen.to_string() != "0.0.0.0:4433" {
         args.listen
     } else {
         file_cfg.listen.unwrap_or(args.listen)
@@ -57,8 +57,13 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             .unwrap_or(config::DEFAULT_MAX_FORWARD_STREAMS_PER_CONNECTION),
     };
 
-    let mut listener = Listener::bind(listen, data_dir).await?;
-    let local_addr = listener.local_addr();
+    let connection_slots = Arc::new(Semaphore::new(runtime_config.max_connections));
+    let listener = Listener::bind(listen, data_dir).await?;
+    log_listening(listener.local_addr(), &runtime_config);
+    accept_loop(listener, runtime_config, connection_slots).await
+}
+
+fn log_listening(local_addr: SocketAddr, runtime_config: &ServerRuntimeConfig) {
     tracing::info!(
         addr = %local_addr,
         max_connections = runtime_config.max_connections,
@@ -67,8 +72,14 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         max_forward_streams_per_connection = runtime_config.max_forward_streams_per_connection,
         "hush server listening"
     );
+}
 
-    let connection_slots = Arc::new(Semaphore::new(runtime_config.max_connections));
+async fn accept_loop(
+    mut listener: Listener,
+    runtime_config: ServerRuntimeConfig,
+    connection_slots: Arc<Semaphore>,
+) -> Result<()> {
+    let local_addr = listener.local_addr();
     loop {
         let permit = match connection_slots.clone().try_acquire_owned() {
             Ok(permit) => permit,

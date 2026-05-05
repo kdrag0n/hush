@@ -18,7 +18,7 @@ pub(crate) struct Args {
     pub(crate) data_dir: Option<PathBuf>,
 
     /// UDP listen address.
-    #[arg(short, long, value_name = "ADDR", default_value = "[::]:4433")]
+    #[arg(short, long, value_name = "ADDR", default_value = "0.0.0.0:4433")]
     pub(crate) listen: SocketAddr,
 
     /// Path to server/config.toml.

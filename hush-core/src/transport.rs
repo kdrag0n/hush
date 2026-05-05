@@ -1,6 +1,6 @@
 use crate::auth::{self, LoadedIdentity};
 use anyhow::{Context, Result, bail};
-use kcp_tokio::{KcpConfig, KcpListener, KcpStream};
+use kcp_tokio::{KcpConfig, KcpListener, KcpStream, UdpTransport};
 use serde::{Deserialize, Serialize};
 use snow::TransportState;
 use std::{
@@ -28,6 +28,7 @@ const KCP_SEND_WINDOW: u32 = 256;
 const KCP_RECV_WINDOW: u32 = 256;
 const KCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const KCP_KEEPALIVE: Duration = Duration::from_secs(10);
+const SECURE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const NOISE_MESSAGE_MAX_LEN: usize = 65_535;
 const SECURE_RECORD_MAX_LEN: usize = 2 * 1024 * 1024;
 const STREAM_EVENT_QUEUE_LEN: usize = 1024;
@@ -112,13 +113,22 @@ impl Connection {
         identity: LoadedIdentity,
         insecure: bool,
     ) -> Result<Self> {
-        let mut raw = KcpStream::connect(addr, kcp_config())
+        let mut raw = connect_kcp(addr)
             .await
             .with_context(|| format!("connect KCP to {addr}"))?;
         let local_addr = raw.local_addr().context("get local KCP address")?;
-        let mut transport = client_handshake(&mut raw, host_key, data_dir, &identity, insecure)
-            .await
-            .with_context(|| format!("secure handshake with {host_key}"))?;
+        let mut transport = tokio::time::timeout(
+            SECURE_HANDSHAKE_TIMEOUT,
+            client_handshake(&mut raw, host_key, data_dir, &identity, insecure),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "secure handshake with {host_key} timed out after {}s",
+                SECURE_HANDSHAKE_TIMEOUT.as_secs()
+            )
+        })?
+        .with_context(|| format!("secure handshake with {host_key}"))?;
         let peer_public_key = identity.public_key.clone();
         let client_public = auth::ed25519_public_key_bytes(&peer_public_key)?.to_vec();
         let signature = auth::sign_identity(&identity, transport.handshake_hash.as_slice())?;
@@ -253,8 +263,23 @@ impl Listener {
         loop {
             let (mut raw, remote_addr) = self.inner.accept().await.context("accept KCP stream")?;
             let local_addr = raw.local_addr().context("get local KCP address")?;
-            match server_handshake(&mut raw, &self.data_dir).await {
-                Ok((transport, auth)) => {
+            match tokio::time::timeout(
+                SECURE_HANDSHAKE_TIMEOUT,
+                server_handshake(&mut raw, &self.data_dir),
+            )
+            .await
+            {
+                Err(_) => {
+                    tracing::warn!(
+                        %remote_addr,
+                        timeout_secs = SECURE_HANDSHAKE_TIMEOUT.as_secs(),
+                        "secure handshake timed out"
+                    );
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(%remote_addr, %err, "secure handshake failed");
+                }
+                Ok(Ok((transport, auth))) => {
                     return Ok(Connection::start(
                         raw,
                         transport,
@@ -263,9 +288,6 @@ impl Listener {
                         auth,
                         StreamIdSide::Server,
                     ));
-                }
-                Err(err) => {
-                    tracing::warn!(%remote_addr, %err, "secure handshake failed");
                 }
             }
         }
@@ -488,6 +510,20 @@ fn kcp_config() -> KcpConfig {
         .window_size(KCP_SEND_WINDOW, KCP_RECV_WINDOW)
         .connect_timeout(KCP_CONNECT_TIMEOUT)
         .keep_alive(Some(KCP_KEEPALIVE))
+}
+
+async fn connect_kcp(addr: SocketAddr) -> Result<RawStream> {
+    let bind_addr = if addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let transport = UdpTransport::bind(bind_addr)
+        .await
+        .with_context(|| format!("bind client UDP socket {bind_addr}"))?;
+    KcpStream::connect_with_transport(Arc::new(transport), addr, kcp_config())
+        .await
+        .context("connect KCP stream")
 }
 
 async fn write_loop<W>(
