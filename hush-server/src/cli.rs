@@ -6,14 +6,14 @@ use std::{net::SocketAddr, path::PathBuf};
     name = "hush-server",
     version,
     about = "Server for hush, an SSH-like remote shell over QUIC",
-    long_about = "hush-server listens for QUIC connections, authenticates clients with Ed25519 SSH keys, and runs remote shell sessions.\n\nConfiguration is read from the XDG config path, normally $XDG_CONFIG_HOME/hush/server_config.toml or ~/.config/hush/server_config.toml. When running as root, the default is /etc/hush/server_config.toml. Command-line flags override config file values."
+    long_about = "hush-server listens for QUIC connections, authenticates clients with Ed25519 SSH keys, and runs remote shell sessions.\n\nServer files live under the data directory's server/ subdirectory. The default config path is $DATA_DIR/server/config.toml, and the default host certificate and key are $DATA_DIR/server/host_cert.der and $DATA_DIR/server/host_key.der. When running as root, the default data directory is /etc/hush. Command-line flags override config file values."
 )]
 pub(crate) struct Args {
     /// Enable verbose server logging.
     #[arg(short, long)]
     pub(crate) verbose: bool,
 
-    /// Data directory for host keys and server state.
+    /// Base data directory. Server files live under DIR/server.
     #[arg(long, value_name = "DIR", help_heading = "Configuration")]
     pub(crate) data_dir: Option<PathBuf>,
 
@@ -21,7 +21,7 @@ pub(crate) struct Args {
     #[arg(short, long, value_name = "ADDR", default_value = "[::]:4433")]
     pub(crate) listen: SocketAddr,
 
-    /// Path to server_config.toml.
+    /// Path to server/config.toml.
     #[arg(short, long, value_name = "PATH", help_heading = "Configuration")]
     pub(crate) config: Option<PathBuf>,
 

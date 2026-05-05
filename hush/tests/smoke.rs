@@ -68,6 +68,29 @@ impl TestEnv {
         thread::sleep(Duration::from_millis(350));
     }
 
+    fn start_server_from_config(&mut self) {
+        let server_dir = self.data.join("server");
+        fs::create_dir_all(&server_dir).unwrap();
+        let authorized_keys = self.authorized_keys.to_str().unwrap();
+        fs::write(
+            server_dir.join("config.toml"),
+            format!(
+                "listen = \"127.0.0.1:{}\"\nauthorized_keys_path = {authorized_keys:?}\n",
+                self.port
+            ),
+        )
+        .unwrap();
+        let child = Command::new(server_bin())
+            .arg("--data-dir")
+            .arg(&self.data)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        self.server = Some(child);
+        thread::sleep(Duration::from_millis(350));
+    }
+
     fn hush(&self) -> Command {
         let mut cmd = Command::new(hush_bin());
         cmd.env("HOME", &self.home)
@@ -116,6 +139,28 @@ fn propagates_exit_status() {
         String::from_utf8_lossy(&out.stdout).trim(),
         "exit-status-ok"
     );
+}
+
+#[test]
+fn server_uses_server_subdir_for_config_and_host_key() {
+    let mut env = TestEnv::new();
+    env.start_server_from_config();
+    let out = env
+        .hush()
+        .arg("-T")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("printf server-subdir-ok")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "server-subdir-ok");
+    assert!(env.data.join("server/host_cert.der").exists());
+    assert!(env.data.join("server/host_key.der").exists());
+    assert!(!env.data.join("host_cert.der").exists());
+    assert!(!env.data.join("host_key.der").exists());
 }
 
 #[test]

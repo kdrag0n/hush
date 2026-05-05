@@ -11,15 +11,19 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::Semaphore;
 
 pub(crate) async fn run(args: Args) -> Result<()> {
+    let initial_data_dir = args
+        .data_dir
+        .clone()
+        .unwrap_or_else(hush_core::paths::default_data_dir);
     let config_path = args
         .config
         .clone()
-        .unwrap_or_else(hush_core::paths::default_server_config_path);
+        .unwrap_or_else(|| hush_core::paths::server_config_path(&initial_data_dir));
     let file_cfg = config::read_server_config(&config_path)?.unwrap_or_else(empty_file_config);
     let data_dir = args
         .data_dir
         .or(file_cfg.data_dir)
-        .unwrap_or_else(hush_core::paths::default_data_dir);
+        .unwrap_or(initial_data_dir);
     let listen = if args.listen.to_string() != "[::]:4433" {
         args.listen
     } else {

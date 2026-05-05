@@ -145,13 +145,14 @@ pub fn load_or_create_host_cert(
     cert_path: Option<&Path>,
     key_path: Option<&Path>,
 ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
-    ensure_private_dir(data_dir)?;
+    let server_dir = crate::paths::server_dir(data_dir);
+    ensure_private_dir(&server_dir)?;
     let cert_path = cert_path
         .map(Path::to_owned)
-        .unwrap_or_else(|| data_dir.join("host_cert.der"));
+        .unwrap_or_else(|| server_dir.join("host_cert.der"));
     let key_path = key_path
         .map(Path::to_owned)
-        .unwrap_or_else(|| data_dir.join("host_key.der"));
+        .unwrap_or_else(|| server_dir.join("host_key.der"));
     if cert_path.exists() && key_path.exists() {
         return Ok((
             CertificateDer::from(fs::read(cert_path)?),
