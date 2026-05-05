@@ -1,1 +1,3 @@
-- Always make small, atomic commits for completed changes.
+- Always make small, atomic commits for completed changes
+- Never push without approval
+- Careful of CLOEXEC, O_NONBLOCK, and TOCTOU races
