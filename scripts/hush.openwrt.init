@@ -8,6 +8,11 @@ STOP=10
 PROG=/usr/local/bin/hush-server
 
 start_service() {
+	if [ ! -x "$PROG" ]; then
+		echo "$PROG is not executable" >&2
+		return 1
+	fi
+
 	procd_open_instance
 	procd_set_param command "$PROG"
 	procd_set_param respawn

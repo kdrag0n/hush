@@ -297,6 +297,12 @@ install_server_binary_from_release() {
 	success "Installed hush-server to $INSTALL_PATH"
 }
 
+validate_server_binary() {
+	if ! "$INSTALL_PATH" --version >/dev/null 2>&1; then
+		die "installed $INSTALL_PATH, but it could not run; check CPU architecture and executable support"
+	fi
+}
+
 brew_install_server() {
 	if brew list --formula hush >/dev/null 2>&1; then
 		log "Upgrading hush with Homebrew"
@@ -400,6 +406,11 @@ STOP=10
 PROG=$INSTALL_PATH
 
 start_service() {
+	if [ ! -x "\$PROG" ]; then
+		echo "\$PROG is not executable" >&2
+		return 1
+	fi
+
 	procd_open_instance
 	procd_set_param command "\$PROG"
 	procd_set_param respawn
@@ -414,9 +425,10 @@ EOF
 
 install_openwrt_service() {
 	write_openwrt_init
-	as_root "$OPENWRT_INIT_PATH" enable
-	as_root "$OPENWRT_INIT_PATH" restart
-	success "Enabled and restarted OpenWrt init service hush"
+	as_root /etc/init.d/hush enable
+	as_root /etc/init.d/hush stop >/dev/null 2>&1 || true
+	as_root /etc/init.d/hush start
+	success "Enabled and started OpenWrt init service hush"
 }
 
 is_openwrt() {
@@ -440,6 +452,7 @@ install_macos() {
 
 install_linux() {
 	install_server_binary_from_release
+	validate_server_binary
 
 	if is_openwrt; then
 		install_openwrt_service
