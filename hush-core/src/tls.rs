@@ -3,6 +3,7 @@ use crate::{
     auth::{self, IdentityKey},
 };
 use anyhow::{Result, bail};
+use quinn::TransportConfig;
 use quinn::{ClientConfig, ServerConfig};
 use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::{
@@ -21,8 +22,10 @@ use std::{
     collections::HashMap,
     fmt, fs,
     net::SocketAddr,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 #[derive(Debug, Clone)]
@@ -64,7 +67,7 @@ impl KnownHosts {
 
     fn save(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
+            ensure_private_dir(parent)?;
         }
         let mut data = String::new();
         for (host, fp) in &self.entries {
@@ -73,7 +76,7 @@ impl KnownHosts {
             data.push_str(fp);
             data.push('\n');
         }
-        fs::write(&self.path, data)?;
+        write_private_file_atomic(&self.path, data.as_bytes())?;
         Ok(())
     }
 }
@@ -113,14 +116,18 @@ pub fn make_client_config(
         }
     };
     cfg.alpn_protocols = vec![ALPN.to_vec()];
-    Ok(ClientConfig::new(Arc::new(QuicClientConfig::try_from(
-        cfg,
-    )?)))
+    let mut quic_cfg = ClientConfig::new(Arc::new(QuicClientConfig::try_from(cfg)?));
+    quic_cfg.transport_config(Arc::new(long_idle_transport()?));
+    Ok(quic_cfg)
 }
 
-pub fn make_server_config(data_dir: &Path) -> Result<ServerConfig> {
+pub fn make_server_config(
+    data_dir: &Path,
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+) -> Result<ServerConfig> {
     let provider = pq_provider();
-    let (cert, key) = load_or_create_host_cert(data_dir)?;
+    let (cert, key) = load_or_create_host_cert(data_dir, cert_path, key_path)?;
     let mut cfg = RustlsServerConfig::builder_with_provider(provider.into())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(Arc::new(AuthorizedClientVerifier {
@@ -128,17 +135,23 @@ pub fn make_server_config(data_dir: &Path) -> Result<ServerConfig> {
         }))
         .with_single_cert(vec![cert], key)?;
     cfg.alpn_protocols = vec![ALPN.to_vec()];
-    Ok(ServerConfig::with_crypto(Arc::new(
-        QuicServerConfig::try_from(cfg)?,
-    )))
+    let mut quic_cfg = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(cfg)?));
+    quic_cfg.transport = Arc::new(long_idle_transport()?);
+    Ok(quic_cfg)
 }
 
 pub fn load_or_create_host_cert(
     data_dir: &Path,
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
 ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
-    fs::create_dir_all(data_dir)?;
-    let cert_path = data_dir.join("host_cert.der");
-    let key_path = data_dir.join("host_key.der");
+    ensure_private_dir(data_dir)?;
+    let cert_path = cert_path
+        .map(Path::to_owned)
+        .unwrap_or_else(|| data_dir.join("host_cert.der"));
+    let key_path = key_path
+        .map(Path::to_owned)
+        .unwrap_or_else(|| data_dir.join("host_key.der"));
     if cert_path.exists() && key_path.exists() {
         return Ok((
             CertificateDer::from(fs::read(cert_path)?),
@@ -149,8 +162,8 @@ pub fn load_or_create_host_cert(
     let key_der = signing_key.serialize_der();
     let cert =
         rcgen::CertificateParams::new(vec!["hush-server".to_owned()])?.self_signed(&signing_key)?;
-    fs::write(&cert_path, cert.der().as_ref())?;
-    fs::write(&key_path, &key_der)?;
+    write_private_file_atomic(&cert_path, cert.der().as_ref())?;
+    write_private_file_atomic(&key_path, &key_der)?;
     Ok((
         cert.der().clone(),
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der)),
@@ -268,6 +281,43 @@ impl Signer for AgentTlsSigner {
 fn pq_provider() -> CryptoProvider {
     let provider = rustls::crypto::aws_lc_rs::default_provider();
     provider
+}
+
+fn long_idle_transport() -> Result<TransportConfig> {
+    let mut transport = TransportConfig::default();
+    transport.max_idle_timeout(Some(Duration::from_secs(7 * 24 * 60 * 60).try_into()?));
+    transport.keep_alive_interval(None);
+    Ok(transport)
+}
+
+fn ensure_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn write_private_file_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_private_dir(parent)?;
+    }
+    let tmp = path.with_extension(format!(
+        "{}.tmp",
+        path.extension().and_then(|s| s.to_str()).unwrap_or("hush")
+    ));
+    {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        use std::io::Write;
+        file.write_all(data)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 #[derive(Debug)]

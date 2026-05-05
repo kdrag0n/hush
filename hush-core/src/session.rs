@@ -1,8 +1,10 @@
 use crate::{
     auth,
+    config::ServerRuntimeConfig,
     net::{copy_quic_to_writer, copy_reader_to_quic},
     protocol::{
-        ControlResponse, OpenSession, SessionMode, StreamOpen, TermSize, read_frame, write_frame,
+        ControlRequest, ControlResponse, OpenSession, RemoteSignal, SessionMode, StreamOpen,
+        TermSize, read_frame, write_frame,
     },
 };
 use anyhow::{Context, Result, bail};
@@ -19,9 +21,18 @@ use tokio::{io::unix::AsyncFd, process::Command};
 pub async fn run_server_session(
     conn: Connection,
     mut control_send: SendStream,
+    mut control_recv: RecvStream,
     request: OpenSession,
     peer_key: ssh_key::PublicKey,
+    config: ServerRuntimeConfig,
 ) -> Result<i32> {
+    if !config.allow_users.is_empty()
+        && !config.allow_users.iter().any(|user| user == &request.user)
+    {
+        let msg = format!("user {} is not allowed by server config", request.user);
+        send_control_error(&mut control_send, &msg).await;
+        bail!("{msg}");
+    }
     if !auth::can_login_as(&request.user) {
         let msg = format!(
             "server is not root; only {} may log in",
@@ -30,14 +41,20 @@ pub async fn run_server_session(
         send_control_error(&mut control_send, &msg).await;
         bail!("{msg}");
     }
-    if !auth::is_authorized(&request.user, &peer_key)? {
+    if !auth::is_authorized(
+        &request.user,
+        &peer_key,
+        config.authorized_keys_path.as_deref(),
+    )? {
         let fp = auth::public_key_fingerprint(&peer_key).unwrap_or_else(|_| "unknown".into());
         let msg = format!("public key {fp} is not authorized for {}", request.user);
         send_control_error(&mut control_send, &msg).await;
         bail!("{msg}");
     }
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(4);
+    let (resize_tx, resize_rx) = tokio::sync::mpsc::channel(16);
+    let (signal_tx, signal_rx) = tokio::sync::mpsc::channel(16);
     let accept_conn = conn.clone();
     let accept_task = tokio::spawn(async move {
         while let Ok((send, mut recv)) = accept_conn.accept_bi().await {
@@ -49,7 +66,7 @@ pub async fn run_server_session(
                 }
             };
             match header {
-                StreamOpen::LocalTcpForward { target } => {
+                StreamOpen::LocalTcpForward { target } if config.allow_tcp_forwarding => {
                     tokio::spawn(async move {
                         if let Err(err) =
                             crate::forwarding::serve_local_forward_stream(target, send, recv).await
@@ -58,8 +75,11 @@ pub async fn run_server_session(
                         }
                     });
                 }
+                StreamOpen::LocalTcpForward { .. } => {
+                    tracing::warn!("rejected local forward stream because forwarding is disabled");
+                }
                 other => {
-                    if tx.send((other, send, recv)).await.is_err() {
+                    if stream_tx.send((other, send, recv)).await.is_err() {
                         break;
                     }
                 }
@@ -67,7 +87,24 @@ pub async fn run_server_session(
         }
     });
 
-    while let Some((header, send, recv)) = rx.recv().await {
+    let control_task = tokio::spawn(async move {
+        while let Ok(request) = read_frame::<ControlRequest>(&mut control_recv).await {
+            match request {
+                ControlRequest::Resize(size) => {
+                    let _ = resize_tx.send(size).await;
+                }
+                ControlRequest::Signal(signal) => {
+                    let _ = signal_tx.send(signal).await;
+                }
+                ControlRequest::Close => break,
+                ControlRequest::OpenSession(_) | ControlRequest::OpenRemoteForward(_) => {}
+            }
+        }
+    });
+
+    let mut resize_rx = Some(resize_rx);
+    let mut signal_rx = Some(signal_rx);
+    while let Some((header, send, recv)) = stream_rx.recv().await {
         match (&request.mode, header) {
             (SessionMode::Pty { term, size }, StreamOpen::SessionPtyData) => {
                 write_frame(&mut control_send, &ControlResponse::SessionReady).await?;
@@ -76,8 +113,11 @@ pub async fn run_server_session(
                     &request.command,
                     term,
                     size.clone(),
+                    request.use_shell,
                     send,
                     recv,
+                    resize_rx.take().context("resize channel already used")?,
+                    signal_rx.take().context("signal channel already used")?,
                 )
                 .await
                 {
@@ -91,24 +131,35 @@ pub async fn run_server_session(
                 control_send.finish()?;
                 let _ = control_send.stopped().await;
                 accept_task.abort();
+                control_task.abort();
                 return Ok(status);
             }
             (SessionMode::Pipes, StreamOpen::SessionStdIo) => {
                 write_frame(&mut control_send, &ControlResponse::SessionReady).await?;
                 let mut err_send = conn.open_uni().await?;
                 write_frame(&mut err_send, &StreamOpen::SessionStderr).await?;
-                let status =
-                    match run_pipes(&request.user, &request.command, send, recv, err_send).await {
-                        Ok(status) => status,
-                        Err(err) => {
-                            send_control_error(&mut control_send, &err.to_string()).await;
-                            return Err(err);
-                        }
-                    };
+                let status = match run_pipes(
+                    &request.user,
+                    &request.command,
+                    request.use_shell,
+                    send,
+                    recv,
+                    err_send,
+                    signal_rx.take().context("signal channel already used")?,
+                )
+                .await
+                {
+                    Ok(status) => status,
+                    Err(err) => {
+                        send_control_error(&mut control_send, &err.to_string()).await;
+                        return Err(err);
+                    }
+                };
                 write_frame(&mut control_send, &ControlResponse::ExitStatus(status)).await?;
                 control_send.finish()?;
                 let _ = control_send.stopped().await;
                 accept_task.abort();
+                control_task.abort();
                 return Ok(status);
             }
             _ => bail!("unexpected stream for requested session mode"),
@@ -126,15 +177,18 @@ async fn send_control_error(send: &mut SendStream, msg: &str) {
 async fn run_pipes(
     user: &str,
     command: &[String],
+    use_shell: bool,
     send: SendStream,
     recv: RecvStream,
     err_send: SendStream,
+    mut signal_rx: tokio::sync::mpsc::Receiver<RemoteSignal>,
 ) -> Result<i32> {
-    let mut cmd = command_for_user(user, command, false)?;
+    let mut cmd = command_for_user(user, command, false, use_shell)?;
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().context("spawn remote command")?;
+    let child_pid = child.id().context("child pid missing")? as i32;
     let stdin = child.stdin.take().context("child stdin missing")?;
     let stdout = child.stdout.take().context("child stdout missing")?;
     let stderr = child.stderr.take().context("child stderr missing")?;
@@ -142,7 +196,12 @@ async fn run_pipes(
     let in_task = tokio::spawn(copy_quic_to_writer(recv, stdin));
     let out_task = tokio::spawn(copy_reader_to_quic(stdout, send));
     let err_task = tokio::spawn(copy_reader_to_quic(stderr, err_send));
-    let status = child.wait().await.context("wait for remote command")?;
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status.context("wait for remote command")?,
+            Some(signal) = signal_rx.recv() => send_process_group_signal(child_pid, signal)?,
+        }
+    };
     in_task.await.ok();
     out_task.await.ok();
     err_task.await.ok();
@@ -154,10 +213,13 @@ async fn run_pty(
     command: &[String],
     term: &str,
     size: TermSize,
+    use_shell: bool,
     send: SendStream,
     recv: RecvStream,
+    mut resize_rx: tokio::sync::mpsc::Receiver<TermSize>,
+    mut signal_rx: tokio::sync::mpsc::Receiver<RemoteSignal>,
 ) -> Result<i32> {
-    let argv = pty_argv(user, command)?;
+    let argv = pty_argv(user, command, use_shell)?;
     let pty = open_pty(&size)?;
     set_nonblocking(pty.master.as_raw_fd())?;
     let fd = Arc::new(AsyncFd::new(pty.master)?);
@@ -170,9 +232,24 @@ async fn run_pty(
         .stderr(unsafe { Stdio::from_raw_fd(stderr_fd) });
     configure_child_pre_exec(&mut cmd, true, Some(term.to_owned()));
     let mut child = cmd.spawn().context("spawn remote pty command")?;
+    let child_pid = child.id().context("child pid missing")? as i32;
+    let resize_fd = fd.clone();
+    let resize_task = tokio::spawn(async move {
+        while let Some(size) = resize_rx.recv().await {
+            if let Err(err) = set_winsize(resize_fd.get_ref().as_raw_fd(), &size) {
+                tracing::warn!(%err, "failed to resize pty");
+            }
+        }
+    });
     let in_task = tokio::spawn(copy_quic_to_pty(recv, fd.clone()));
     let out_task = tokio::spawn(copy_pty_to_quic(fd, send));
-    let status = child.wait().await.context("wait for remote pty command")?;
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status.context("wait for remote pty command")?,
+            Some(signal) = signal_rx.recv() => send_process_group_signal(child_pid, signal)?,
+        }
+    };
+    resize_task.abort();
     in_task.abort();
     let _ = in_task.await;
     match tokio::time::timeout(std::time::Duration::from_secs(2), out_task).await {
@@ -282,6 +359,22 @@ fn open_pty(size: &TermSize) -> Result<OpenPty> {
     })
 }
 
+fn set_winsize(fd: RawFd, size: &TermSize) -> Result<()> {
+    let winsize = libc::winsize {
+        ws_row: size.rows,
+        ws_col: size.cols,
+        ws_xpixel: size.width_px,
+        ws_ypixel: size.height_px,
+    };
+    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize) } < 0 {
+        bail!(
+            "ioctl(TIOCSWINSZ) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
 fn dup_fd(fd: RawFd) -> Result<RawFd> {
     let dup = unsafe { libc::dup(fd) };
     if dup < 0 {
@@ -299,14 +392,30 @@ fn command_from_argv(argv: &[CString]) -> Result<Command> {
     Ok(cmd)
 }
 
-fn command_for_user(user: &str, command: &[String], login_shell: bool) -> Result<Command> {
+fn command_for_user(
+    user: &str,
+    command: &[String],
+    login_shell: bool,
+    use_shell: bool,
+) -> Result<Command> {
     let root_switch = unsafe { libc::geteuid() == 0 } && user != auth::current_username();
     if root_switch {
         let mut cmd = Command::new("su");
         cmd.arg("-l").arg(user);
         if !command.is_empty() {
-            cmd.arg("-c").arg(shell_words::join(command));
+            if use_shell {
+                cmd.arg("-c").arg(shell_words::join(command));
+            } else {
+                cmd.arg("-c").arg(exec_argv_command(command));
+            }
         }
+        configure_child_pre_exec(&mut cmd, false, None);
+        return Ok(cmd);
+    }
+
+    if !use_shell && !command.is_empty() {
+        let mut cmd = Command::new(&command[0]);
+        cmd.args(&command[1..]);
         configure_child_pre_exec(&mut cmd, false, None);
         return Ok(cmd);
     }
@@ -380,7 +489,7 @@ fn reset_child_signal_state() -> std::io::Result<()> {
     Ok(())
 }
 
-fn pty_argv(user: &str, command: &[String]) -> Result<Vec<CString>> {
+fn pty_argv(user: &str, command: &[String], use_shell: bool) -> Result<Vec<CString>> {
     let root_switch = unsafe { libc::geteuid() == 0 } && user != auth::current_username();
     let args = if root_switch && command.is_empty() {
         #[cfg(target_os = "macos")]
@@ -399,13 +508,19 @@ fn pty_argv(user: &str, command: &[String]) -> Result<Vec<CString>> {
             "-l".to_string(),
             user.to_string(),
             "-c".to_string(),
-            shell_words::join(command),
+            if use_shell {
+                shell_words::join(command)
+            } else {
+                exec_argv_command(command)
+            },
         ]
     } else {
         let shell = shell_for_user(user)
             .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
         if command.is_empty() {
             vec![shell]
+        } else if !use_shell {
+            command.to_vec()
         } else {
             vec![shell, "-lc".to_string(), shell_words::join(command)]
         }
@@ -413,6 +528,26 @@ fn pty_argv(user: &str, command: &[String]) -> Result<Vec<CString>> {
     args.into_iter()
         .map(|s| CString::new(s).context("argument contains NUL"))
         .collect()
+}
+
+fn exec_argv_command(command: &[String]) -> String {
+    let mut script = String::from("exec");
+    for arg in command {
+        script.push(' ');
+        script.push_str(&shell_words::quote(arg));
+    }
+    script
+}
+
+fn send_process_group_signal(pid: i32, signal: RemoteSignal) -> Result<()> {
+    let rc = unsafe { libc::kill(-pid, signal.as_raw()) };
+    if rc < 0 {
+        bail!(
+            "kill process group failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
 }
 
 fn shell_for_user(user: &str) -> Option<String> {

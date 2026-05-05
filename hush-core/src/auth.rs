@@ -31,6 +31,16 @@ pub fn load_identity() -> Result<LoadedIdentity> {
     load_identity_from_file(&path)
 }
 
+pub fn load_identity_with_file(identity_file: Option<&Path>) -> Result<LoadedIdentity> {
+    if let Some(path) = identity_file {
+        if let Some(identity) = load_identity_from_agent_matching_file(path)? {
+            return Ok(identity);
+        }
+        return load_identity_from_file(path);
+    }
+    load_identity()
+}
+
 fn load_identity_from_agent() -> Result<Option<LoadedIdentity>> {
     let Ok(sock) = env::var("SSH_AUTH_SOCK") else {
         return Ok(None);
@@ -62,6 +72,51 @@ fn load_identity_from_agent() -> Result<Option<LoadedIdentity>> {
         }
         let spki_der = ed25519_public_key_to_spki(&public_key)?;
         tracing::debug!("using Ed25519 identity from ssh-agent");
+        return Ok(Some(LoadedIdentity {
+            public_key,
+            key: IdentityKey::Agent { socket, spki_der },
+        }));
+    }
+    Ok(None)
+}
+
+fn load_identity_from_agent_matching_file(path: &Path) -> Result<Option<LoadedIdentity>> {
+    let public_path = public_key_path_for_private_key(path);
+    let preferred = fs::read_to_string(&public_path)
+        .ok()
+        .and_then(|data| PublicKey::from_openssh(&data).ok());
+    let Some(preferred) = preferred else {
+        return Ok(None);
+    };
+    load_identity_from_agent_matching(&preferred)
+}
+
+fn load_identity_from_agent_matching(preferred: &PublicKey) -> Result<Option<LoadedIdentity>> {
+    let Ok(sock) = env::var("SSH_AUTH_SOCK") else {
+        return Ok(None);
+    };
+    let socket = PathBuf::from(sock);
+    let mut client = match ssh_agent_client_rs::Client::connect(&socket) {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::debug!(%err, "failed to connect to ssh-agent");
+            return Ok(None);
+        }
+    };
+    let identities = client
+        .list_all_identities()
+        .context("list ssh-agent identities")?;
+    for identity in identities {
+        let ssh_agent_client_rs::Identity::PublicKey(public_key) = identity else {
+            continue;
+        };
+        let public_key = public_key.into_owned();
+        if public_key.algorithm() != Algorithm::Ed25519 || !same_public_key(&public_key, preferred)?
+        {
+            continue;
+        }
+        let spki_der = ed25519_public_key_to_spki(&public_key)?;
+        tracing::debug!("using matching Ed25519 identity from ssh-agent");
         return Ok(Some(LoadedIdentity {
             public_key,
             key: IdentityKey::Agent { socket, spki_der },
@@ -134,8 +189,11 @@ pub fn authorized_keys_for_user(user: &str) -> Result<PathBuf> {
     Ok(crate::paths::ssh_dir_for_home(home).join("authorized_keys"))
 }
 
-pub fn is_authorized(user: &str, key: &PublicKey) -> Result<bool> {
-    let path = authorized_keys_for_user(user)?;
+pub fn is_authorized(user: &str, key: &PublicKey, override_path: Option<&Path>) -> Result<bool> {
+    let path = match override_path {
+        Some(path) => path.to_owned(),
+        None => authorized_keys_for_user(user)?,
+    };
     let Ok(data) = fs::read_to_string(&path) else {
         return Ok(false);
     };
@@ -145,19 +203,25 @@ pub fn is_authorized(user: &str, key: &PublicKey) -> Result<bool> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let parsed = if line.starts_with("ssh-ed25519 ") {
-            PublicKey::from_openssh(line)
-        } else {
-            let mut fields = line.splitn(2, char::is_whitespace);
-            let _options = fields.next();
-            let Some(rest) = fields.next() else { continue };
-            PublicKey::from_openssh(rest)
-        };
+        let parsed = PublicKey::from_openssh(line);
         if let Ok(candidate) = parsed {
             if candidate.algorithm() == Algorithm::Ed25519
                 && candidate.to_bytes().ok().as_deref() == Some(wanted.as_slice())
             {
                 return Ok(true);
+            }
+            continue;
+        }
+
+        if let Some(key_start) = line.find("ssh-ed25519 ") {
+            let candidate_line = &line[key_start..];
+            if let Ok(candidate) = PublicKey::from_openssh(candidate_line) {
+                if candidate.to_bytes().ok().as_deref() == Some(wanted.as_slice()) {
+                    bail!(
+                        "{} contains options for a matching key; authorized_keys options are not supported yet",
+                        path.display()
+                    );
+                }
             }
         }
     }
@@ -214,4 +278,10 @@ fn preferred_public_key() -> Option<PublicKey> {
 
 fn same_public_key(a: &PublicKey, b: &PublicKey) -> Result<bool> {
     Ok(a.to_bytes()? == b.to_bytes()?)
+}
+
+fn public_key_path_for_private_key(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".pub");
+    PathBuf::from(s)
 }

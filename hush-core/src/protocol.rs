@@ -34,6 +34,7 @@ pub enum SessionMode {
 pub struct OpenSession {
     pub user: String,
     pub command: Vec<String>,
+    pub use_shell: bool,
     pub mode: SessionMode,
 }
 
@@ -54,8 +55,26 @@ pub struct RemoteForwardRequest {
 pub enum ControlRequest {
     OpenSession(OpenSession),
     Resize(TermSize),
+    Signal(RemoteSignal),
     OpenRemoteForward(RemoteForwardRequest),
     Close,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum RemoteSignal {
+    Interrupt,
+    Terminate,
+    Hangup,
+}
+
+impl RemoteSignal {
+    pub fn as_raw(self) -> i32 {
+        match self {
+            Self::Interrupt => libc::SIGINT,
+            Self::Terminate => libc::SIGTERM,
+            Self::Hangup => libc::SIGHUP,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

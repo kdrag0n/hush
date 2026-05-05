@@ -6,6 +6,28 @@ use std::{fs, net::SocketAddr, path::Path};
 pub struct ServerConfigFile {
     pub listen: Option<SocketAddr>,
     pub data_dir: Option<std::path::PathBuf>,
+    pub host_cert_path: Option<std::path::PathBuf>,
+    pub host_key_path: Option<std::path::PathBuf>,
+    pub authorized_keys_path: Option<std::path::PathBuf>,
+    pub allow_users: Option<Vec<String>>,
+    pub allow_tcp_forwarding: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerRuntimeConfig {
+    pub authorized_keys_path: Option<std::path::PathBuf>,
+    pub allow_users: Vec<String>,
+    pub allow_tcp_forwarding: bool,
+}
+
+impl Default for ServerRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            authorized_keys_path: None,
+            allow_users: Vec::new(),
+            allow_tcp_forwarding: true,
+        }
+    }
 }
 
 pub fn read_server_config(path: &Path) -> Result<Option<ServerConfigFile>> {
@@ -22,6 +44,7 @@ pub struct SshHostConfig {
     pub user: Option<String>,
     pub hostname: Option<String>,
     pub port: Option<u16>,
+    pub identity_file: Option<std::path::PathBuf>,
 }
 
 pub fn read_ssh_config(alias: &str) -> Result<SshHostConfig> {
@@ -53,10 +76,21 @@ pub fn read_ssh_config(alias: &str) -> Result<SshHostConfig> {
             "user" if cfg.user.is_none() => cfg.user = Some(value.to_owned()),
             "hostname" if cfg.hostname.is_none() => cfg.hostname = Some(value.to_owned()),
             "port" if cfg.port.is_none() => cfg.port = value.parse().ok(),
+            "identityfile" if cfg.identity_file.is_none() => {
+                cfg.identity_file = Some(expand_home(value))
+            }
             _ => {}
         }
     }
     Ok(cfg)
+}
+
+fn expand_home(value: &str) -> std::path::PathBuf {
+    if let Some(rest) = value.strip_prefix("~/") {
+        crate::paths::current_home().join(rest)
+    } else {
+        std::path::PathBuf::from(value)
+    }
 }
 
 fn host_pattern_matches(pattern: &str, host: &str) -> bool {

@@ -4,8 +4,8 @@ use hush_core::{
     auth, config,
     forwarding::LocalForward,
     protocol::{
-        ControlRequest, ControlResponse, OpenSession, RemoteForwardRequest, SessionMode,
-        StreamOpen, TcpTarget, TermSize, read_frame, write_frame,
+        ControlRequest, ControlResponse, OpenSession, RemoteForwardRequest, RemoteSignal,
+        SessionMode, StreamOpen, TcpTarget, TermSize, read_frame, write_frame,
     },
 };
 use quinn::Endpoint;
@@ -33,6 +33,10 @@ struct Args {
     no_tty: bool,
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    #[arg(short = 'i')]
+    identity_file: Option<PathBuf>,
+    #[arg(short = 'S', long)]
+    no_shell: bool,
     #[arg(short = 'L', value_parser = parse_forward)]
     local_forward: Vec<ForwardArg>,
     #[arg(short = 'R', value_parser = parse_forward)]
@@ -65,8 +69,9 @@ async fn main() -> Result<()> {
     let data_dir = args
         .data_dir
         .unwrap_or_else(hush_core::paths::default_data_dir);
+    let identity_file = args.identity_file.or(ssh_cfg.identity_file);
 
-    let identity = auth::load_identity()?;
+    let identity = auth::load_identity_with_file(identity_file.as_deref())?;
     let mut endpoint = Endpoint::client("[::]:0".parse::<SocketAddr>()?)?;
     endpoint.set_default_client_config(hush_core::tls::make_client_config(
         &data_dir,
@@ -132,6 +137,7 @@ async fn main() -> Result<()> {
     let session = OpenSession {
         user,
         command: args.command,
+        use_shell: !args.no_shell,
         mode,
     };
     write_frame(
@@ -139,17 +145,35 @@ async fn main() -> Result<()> {
         &ControlRequest::OpenSession(session.clone()),
     )
     .await?;
+    let (control_tx, control_rx) = tokio::sync::mpsc::channel(32);
+    tokio::spawn(control_writer(control_send, control_rx));
     match session.mode {
-        SessionMode::Pty { .. } => run_pty(conn, control_recv).await,
-        SessionMode::Pipes => run_pipes(conn, control_recv).await,
+        SessionMode::Pty { .. } => run_pty(conn, control_recv, control_tx).await,
+        SessionMode::Pipes => run_pipes(conn, control_recv, control_tx).await,
     }
 }
 
-async fn run_pty(conn: quinn::Connection, mut control_recv: quinn::RecvStream) -> Result<()> {
+async fn control_writer(
+    mut control_send: quinn::SendStream,
+    mut rx: tokio::sync::mpsc::Receiver<ControlRequest>,
+) -> Result<()> {
+    while let Some(request) = rx.recv().await {
+        write_frame(&mut control_send, &request).await?;
+    }
+    let _ = control_send.finish();
+    Ok(())
+}
+
+async fn run_pty(
+    conn: quinn::Connection,
+    mut control_recv: quinn::RecvStream,
+    control_tx: tokio::sync::mpsc::Sender<ControlRequest>,
+) -> Result<()> {
     let _raw = RawModeGuard::enable_if_terminal()?;
     let (mut send, recv) = conn.open_bi().await?;
     write_frame(&mut send, &StreamOpen::SessionPtyData).await?;
     expect_session_ready(&mut control_recv).await?;
+    tokio::spawn(watch_resize(control_tx.clone()));
     let in_task = tokio::spawn(stdio_to_quic(libc::STDIN_FILENO, send));
     let out_task = tokio::spawn(quic_to_stdio(recv, libc::STDOUT_FILENO));
     let status = read_exit_status(&mut control_recv).await?;
@@ -158,7 +182,11 @@ async fn run_pty(conn: quinn::Connection, mut control_recv: quinn::RecvStream) -
     std::process::exit(status);
 }
 
-async fn run_pipes(conn: quinn::Connection, mut control_recv: quinn::RecvStream) -> Result<()> {
+async fn run_pipes(
+    conn: quinn::Connection,
+    mut control_recv: quinn::RecvStream,
+    control_tx: tokio::sync::mpsc::Sender<ControlRequest>,
+) -> Result<()> {
     let (mut send, recv) = conn.open_bi().await?;
     write_frame(&mut send, &StreamOpen::SessionStdIo).await?;
     expect_session_ready(&mut control_recv).await?;
@@ -174,11 +202,38 @@ async fn run_pipes(conn: quinn::Connection, mut control_recv: quinn::RecvStream)
     let in_task = tokio::spawn(stdio_to_quic(libc::STDIN_FILENO, send));
     let out_task = tokio::spawn(quic_to_stdio(recv, libc::STDOUT_FILENO));
     let err_task = tokio::spawn(quic_to_stdio(stderr_recv, libc::STDERR_FILENO));
+    tokio::spawn(watch_signals(control_tx));
     let status = read_exit_status(&mut control_recv).await?;
     in_task.abort();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), out_task).await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), err_task).await;
     std::process::exit(status);
+}
+
+#[cfg(unix)]
+async fn watch_resize(tx: tokio::sync::mpsc::Sender<ControlRequest>) -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigwinch = signal(SignalKind::window_change())?;
+    while sigwinch.recv().await.is_some() {
+        let _ = tx.send(ControlRequest::Resize(terminal_size())).await;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn watch_signals(tx: tokio::sync::mpsc::Sender<ControlRequest>) -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
+    loop {
+        let signal = tokio::select! {
+            _ = sigint.recv() => RemoteSignal::Interrupt,
+            _ = sigterm.recv() => RemoteSignal::Terminate,
+            _ = sighup.recv() => RemoteSignal::Hangup,
+        };
+        let _ = tx.send(ControlRequest::Signal(signal)).await;
+    }
 }
 
 async fn stdio_to_quic(fd: RawFd, mut send: quinn::SendStream) -> Result<()> {
@@ -335,10 +390,7 @@ impl Target {
             Some((user, rest)) => (Some(user.to_owned()), rest),
             None => (None, input),
         };
-        let (host, port) = match rest.rsplit_once(':') {
-            Some((host, port)) if !host.is_empty() => (host.to_owned(), Some(port.parse()?)),
-            _ => (rest.to_owned(), None),
-        };
+        let (host, port) = parse_optional_host_port(rest)?;
         Ok(Self {
             user,
             host_alias: host.clone(),
@@ -349,18 +401,75 @@ impl Target {
 }
 
 fn parse_forward(s: &str) -> Result<ForwardArg, String> {
-    let parts: Vec<_> = s.split(':').collect();
+    let parts = split_colon_bracketed(s);
     let (listen_host, listen_port, target_host, target_port) = match parts.as_slice() {
-        [lp, th, tp] => ("127.0.0.1".to_string(), *lp, *th, *tp),
-        [lh, lp, th, tp] => ((*lh).to_string(), *lp, *th, *tp),
+        [lp, th, tp] => (
+            "127.0.0.1".to_string(),
+            lp.as_str(),
+            th.as_str(),
+            tp.as_str(),
+        ),
+        [lh, lp, th, tp] => (unbracket_host(lh), lp.as_str(), th.as_str(), tp.as_str()),
         _ => return Err("expected [listen_host:]listen_port:target_host:target_port".into()),
     };
     Ok(ForwardArg {
         listen_host,
         listen_port: listen_port.parse().map_err(|_| "bad listen port")?,
-        target_host: target_host.to_string(),
+        target_host: unbracket_host(target_host),
         target_port: target_port.parse().map_err(|_| "bad target port")?,
     })
+}
+
+fn parse_optional_host_port(input: &str) -> Result<(String, Option<u16>)> {
+    if let Some(rest) = input.strip_prefix('[') {
+        let Some((host, suffix)) = rest.split_once(']') else {
+            bail!("missing closing ']' in IPv6 host");
+        };
+        if suffix.is_empty() {
+            return Ok((host.to_owned(), None));
+        }
+        let Some(port) = suffix.strip_prefix(':') else {
+            bail!("unexpected text after bracketed host");
+        };
+        return Ok((host.to_owned(), Some(port.parse()?)));
+    }
+    match input.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !host.contains(':') => {
+            Ok((host.to_owned(), Some(port.parse()?)))
+        }
+        _ => Ok((input.to_owned(), None)),
+    }
+}
+
+fn split_colon_bracketed(input: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut bracket_depth = 0usize;
+    for ch in input.chars() {
+        match ch {
+            '[' => {
+                bracket_depth += 1;
+                current.push(ch);
+            }
+            ']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ':' if bracket_depth == 0 => {
+                parts.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    parts.push(current);
+    parts
+}
+
+fn unbracket_host(host: &str) -> String {
+    host.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_owned()
 }
 
 fn init_logging(verbose: bool) {
