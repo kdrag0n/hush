@@ -11,12 +11,30 @@ INSTALL_PATH=${HUSH_INSTALL_PATH:-"$INSTALL_DIR/hush-server"}
 HUSH_REPO=${HUSH_REPO:-kdrag0n/hush}
 HUSH_VERSION=${HUSH_VERSION:-latest}
 
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != dumb ]; then
+	COLOR_BLUE=$(printf '\033[34m')
+	COLOR_GREEN=$(printf '\033[32m')
+	COLOR_RED=$(printf '\033[31m')
+	COLOR_BOLD=$(printf '\033[1m')
+	COLOR_RESET=$(printf '\033[0m')
+else
+	COLOR_BLUE=
+	COLOR_GREEN=
+	COLOR_RED=
+	COLOR_BOLD=
+	COLOR_RESET=
+fi
+
 log() {
-	printf '%s\n' "$*" >&2
+	printf '%s==>%s %s\n' "$COLOR_BLUE" "$COLOR_RESET" "$*" >&2
+}
+
+success() {
+	printf '%s==>%s %s%s%s\n' "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_BOLD" "$*" "$COLOR_RESET" >&2
 }
 
 die() {
-	printf 'error: %s\n' "$*" >&2
+	printf '%serror:%s %s\n' "$COLOR_RED" "$COLOR_RESET" "$*" >&2
 	exit 1
 }
 
@@ -242,7 +260,7 @@ install_server_binary_from_release() {
 	server=$(download_server "$work")
 	as_root mkdir -p "$INSTALL_DIR"
 	as_root install -m 0755 "$server" "$INSTALL_PATH"
-	log "Installed hush-server to $INSTALL_PATH"
+	success "Installed hush-server to $INSTALL_PATH"
 }
 
 brew_install_server() {
@@ -300,7 +318,7 @@ load_launchd_service() {
 	as_root launchctl bootstrap system "$PLIST_PATH"
 	as_root launchctl enable "system/$SERVICE_LABEL" >/dev/null 2>&1 || true
 	as_root launchctl kickstart -k "system/$SERVICE_LABEL"
-	log "Loaded launch daemon $SERVICE_LABEL"
+	success "Loaded launch daemon $SERVICE_LABEL"
 }
 
 write_systemd_service() {
@@ -326,7 +344,7 @@ install_systemd_service() {
 	write_systemd_service
 	as_root systemctl daemon-reload
 	as_root systemctl enable --now hush.service
-	log "Enabled and started hush.service"
+	success "Enabled and started hush.service"
 }
 
 write_openwrt_init() {
@@ -357,7 +375,7 @@ install_openwrt_service() {
 	write_openwrt_init
 	as_root "$OPENWRT_INIT_PATH" enable
 	as_root "$OPENWRT_INIT_PATH" restart
-	log "Enabled and started OpenWrt init service hush"
+	success "Enabled and started OpenWrt init service hush"
 }
 
 is_openwrt() {
