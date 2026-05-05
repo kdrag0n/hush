@@ -1,0 +1,150 @@
+name: prerelease
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: prerelease-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            artifact: hush-linux-x86_64-musl
+            use_cross: true
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-musl
+            artifact: hush-linux-aarch64-musl
+            use_cross: true
+          - os: macos-15
+            target: aarch64-apple-darwin
+            artifact: hush-macos-aarch64
+            use_cross: false
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --locked
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.use_cross }}" == "true" ]]; then
+            cross build --release --locked --target "${{ matrix.target }}" --bin hush --bin hush-server
+          else
+            cargo build --release --locked --target "${{ matrix.target }}" --bin hush --bin hush-server
+          fi
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          artifact="${{ matrix.artifact }}"
+          target="${{ matrix.target }}"
+          out="dist/${artifact}"
+          mkdir -p "${out}"
+
+          cp "target/${target}/release/hush" "${out}/hush"
+          cp "target/${target}/release/hush-server" "${out}/hush-server"
+
+          if [[ "${target}" == *-musl ]]; then
+            file "${out}/hush" "${out}/hush-server"
+            if file "${out}/hush" "${out}/hush-server" | grep -q "dynamically linked"; then
+              echo "musl release binaries must be static" >&2
+              exit 1
+            fi
+          fi
+
+          tar -C "dist" -czf "dist/${artifact}.tar.gz" "${artifact}"
+          shasum -a 256 "dist/${artifact}.tar.gz" > "dist/${artifact}.tar.gz.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}.tar.gz
+            dist/${{ matrix.artifact }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish prerelease
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          safe_ref="$(printf '%s' "${REF_NAME}" | tr -c 'A-Za-z0-9._-' '-')"
+          tag="prerelease-${safe_ref}"
+          short_sha="${SHA:0:12}"
+          run_url="${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "${tag}" "${SHA}"
+          git push --force origin "refs/tags/${tag}"
+
+          notes="$(mktemp)"
+          {
+            printf 'Automatic hush prerelease for `%s` at `%s`.\n\n' "${REF_NAME}" "${short_sha}"
+            printf 'Built by %s.\n\n' "${run_url}"
+            printf 'Assets contain both `hush` and `hush-server`:\n\n'
+            printf -- '- `hush-linux-x86_64-musl.tar.gz`\n'
+            printf -- '- `hush-linux-aarch64-musl.tar.gz`\n'
+            printf -- '- `hush-macos-aarch64.tar.gz`\n'
+          } > "${notes}"
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release edit "${tag}" \
+              --title "hush prerelease ${REF_NAME} (${short_sha})" \
+              --notes-file "${notes}" \
+              --prerelease
+          else
+            gh release create "${tag}" \
+              --title "hush prerelease ${REF_NAME} (${short_sha})" \
+              --notes-file "${notes}" \
+              --prerelease
+          fi
+
+          gh release upload "${tag}" dist/* --clobber
