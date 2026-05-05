@@ -2,6 +2,7 @@ pub mod auth;
 pub mod config;
 pub mod forwarding;
 pub mod net;
+pub mod os;
 pub mod paths;
 pub mod protocol;
 pub mod resource;

@@ -86,40 +86,11 @@ pub enum RemoteSignal {
 
 impl RemoteSignal {
     pub fn as_raw(self) -> i32 {
-        match self {
-            Self::SIGABRT => libc::SIGABRT,
-            Self::SIGALRM => libc::SIGALRM,
-            Self::SIGFPE => libc::SIGFPE,
-            Self::SIGHUP => libc::SIGHUP,
-            Self::SIGILL => libc::SIGILL,
-            Self::SIGINT => libc::SIGINT,
-            Self::SIGKILL => libc::SIGKILL,
-            Self::SIGPIPE => libc::SIGPIPE,
-            Self::SIGQUIT => libc::SIGQUIT,
-            Self::SIGSEGV => libc::SIGSEGV,
-            Self::SIGTERM => libc::SIGTERM,
-            Self::SIGUSR1 => libc::SIGUSR1,
-            Self::SIGUSR2 => libc::SIGUSR2,
-        }
+        crate::os::remote_signal_as_raw(self)
     }
 
     pub fn from_raw(signal: i32) -> Option<Self> {
-        match signal {
-            libc::SIGABRT => Some(Self::SIGABRT),
-            libc::SIGALRM => Some(Self::SIGALRM),
-            libc::SIGFPE => Some(Self::SIGFPE),
-            libc::SIGHUP => Some(Self::SIGHUP),
-            libc::SIGILL => Some(Self::SIGILL),
-            libc::SIGINT => Some(Self::SIGINT),
-            libc::SIGKILL => Some(Self::SIGKILL),
-            libc::SIGPIPE => Some(Self::SIGPIPE),
-            libc::SIGQUIT => Some(Self::SIGQUIT),
-            libc::SIGSEGV => Some(Self::SIGSEGV),
-            libc::SIGTERM => Some(Self::SIGTERM),
-            libc::SIGUSR1 => Some(Self::SIGUSR1),
-            libc::SIGUSR2 => Some(Self::SIGUSR2),
-            _ => None,
-        }
+        crate::os::remote_signal_from_raw(signal)
     }
 }
 

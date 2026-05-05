@@ -2,6 +2,10 @@ use crate::{
     auth,
     config::ServerRuntimeConfig,
     net::{copy_quic_to_writer, copy_reader_to_quic},
+    os::{
+        AsyncPty, configure_child_pre_exec, dup_fd, open_pty, process_exit_from_status,
+        send_process_group_signal, set_nonblocking, shell_for_user, tty_name,
+    },
     protocol::{
         ControlRequest, ControlResponse, EnvVar, OpenSession, ProcessExit, RemoteSignal,
         SessionMode, StreamOpen, TermSize, read_frame, write_frame,
@@ -10,20 +14,15 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use quinn::{Connection, RecvStream, SendStream};
 use std::{
-    ffi::{CStr, CString},
-    io,
+    ffi::CString,
     net::SocketAddr,
-    os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
-    os::unix::process::ExitStatusExt,
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd},
     path::PathBuf,
-    pin::Pin,
     process::Stdio,
     sync::Arc,
-    task::{Context as TaskContext, Poll},
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::process::Command;
 use tokio::sync::Semaphore;
-use tokio::{io::unix::AsyncFd, process::Command};
 
 struct ConnectionEnv {
     ssh_client: String,
@@ -342,229 +341,6 @@ async fn copy_quic_to_pty(mut recv: RecvStream, mut pty: AsyncPty) -> Result<()>
     Ok(())
 }
 
-fn set_nonblocking(fd: RawFd) -> Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        bail!("fcntl(F_GETFL) failed: {}", std::io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        bail!("fcntl(F_SETFL) failed: {}", std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn set_cloexec(fd: RawFd) -> Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 {
-        bail!("fcntl(F_GETFD) failed: {}", std::io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-        bail!("fcntl(F_SETFD) failed: {}", std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn write_fd(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
-    let rc = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
-    if rc >= 0 {
-        Ok(rc as usize)
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-fn process_exit_from_status(status: std::process::ExitStatus) -> ProcessExit {
-    if let Some(code) = status.code() {
-        ProcessExit::Code(code)
-    } else if let Some(signal) = status.signal().and_then(RemoteSignal::from_raw) {
-        ProcessExit::Signal(signal)
-    } else {
-        ProcessExit::Code(255)
-    }
-}
-
-#[derive(Clone)]
-struct AsyncPty {
-    fd: Arc<AsyncFd<OwnedFd>>,
-}
-
-impl AsyncPty {
-    fn new(fd: OwnedFd) -> io::Result<Self> {
-        Ok(Self {
-            fd: Arc::new(AsyncFd::new(fd)?),
-        })
-    }
-
-    fn resize(&self, size: &TermSize) -> Result<()> {
-        set_winsize(self.fd.get_ref().as_raw_fd(), size)
-    }
-}
-
-impl AsyncRead for AsyncPty {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        loop {
-            let mut guard = std::task::ready!(self.fd.poll_read_ready(cx))?;
-            let result = guard.try_io(|inner| {
-                let unfilled = buf.initialize_unfilled();
-                let n = unsafe {
-                    libc::read(
-                        inner.get_ref().as_raw_fd(),
-                        unfilled.as_mut_ptr().cast(),
-                        unfilled.len(),
-                    )
-                };
-                if n >= 0 {
-                    Ok(n as usize)
-                } else {
-                    let err = io::Error::last_os_error();
-                    if err.raw_os_error() == Some(libc::EIO) {
-                        Ok(0)
-                    } else {
-                        Err(err)
-                    }
-                }
-            });
-
-            match result {
-                Ok(Ok(0)) => return Poll::Ready(Ok(())),
-                Ok(Ok(n)) => {
-                    buf.advance(n);
-                    return Poll::Ready(Ok(()));
-                }
-                Ok(Err(err)) => return Poll::Ready(Err(err)),
-                Err(_) => continue,
-            }
-        }
-    }
-}
-
-impl AsyncWrite for AsyncPty {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        data: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        loop {
-            let mut guard = std::task::ready!(self.fd.poll_write_ready(cx))?;
-            let result = guard.try_io(|inner| write_fd(inner.get_ref().as_raw_fd(), data));
-            match result {
-                Ok(result) => return Poll::Ready(result),
-                Err(_) => continue,
-            }
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-struct OpenPty {
-    master: OwnedFd,
-    slave: OwnedFd,
-}
-
-fn open_pty(size: &TermSize) -> Result<OpenPty> {
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    let mut winsize = libc::winsize {
-        ws_row: size.rows,
-        ws_col: size.cols,
-        ws_xpixel: size.width_px,
-        ws_ypixel: size.height_px,
-    };
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut winsize,
-        )
-    };
-    if rc < 0 {
-        bail!("openpty failed: {}", std::io::Error::last_os_error());
-    }
-    let pty = OpenPty {
-        master: unsafe { OwnedFd::from_raw_fd(master) },
-        slave: unsafe { OwnedFd::from_raw_fd(slave) },
-    };
-    set_cloexec(pty.master.as_raw_fd())?;
-    set_cloexec(pty.slave.as_raw_fd())?;
-    configure_pty_slave(pty.slave.as_raw_fd())?;
-    Ok(pty)
-}
-
-fn configure_pty_slave(fd: RawFd) -> Result<()> {
-    let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
-    if unsafe { libc::tcgetattr(fd, &mut termios) } < 0 {
-        bail!(
-            "tcgetattr pty slave failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    termios.c_iflag |= libc::BRKINT | libc::ICRNL | libc::IXON;
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-    {
-        termios.c_iflag |= libc::IUTF8;
-    }
-    termios.c_oflag |= libc::OPOST | libc::ONLCR;
-    termios.c_cflag |= libc::CREAD | libc::CS8;
-    termios.c_lflag |=
-        libc::ECHO | libc::ECHOE | libc::ECHOK | libc::ICANON | libc::IEXTEN | libc::ISIG;
-    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) } < 0 {
-        bail!(
-            "tcsetattr pty slave failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
-}
-
-fn tty_name(fd: RawFd) -> Option<String> {
-    let mut buf = [0 as libc::c_char; 1024];
-    if unsafe { libc::ttyname_r(fd, buf.as_mut_ptr(), buf.len()) } != 0 {
-        return None;
-    }
-    Some(
-        unsafe { CStr::from_ptr(buf.as_ptr()) }
-            .to_string_lossy()
-            .into_owned(),
-    )
-}
-
-fn set_winsize(fd: RawFd, size: &TermSize) -> Result<()> {
-    let winsize = libc::winsize {
-        ws_row: size.rows,
-        ws_col: size.cols,
-        ws_xpixel: size.width_px,
-        ws_ypixel: size.height_px,
-    };
-    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize) } < 0 {
-        bail!(
-            "ioctl(TIOCSWINSZ) failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
-}
-
-fn dup_fd(fd: RawFd) -> Result<RawFd> {
-    let dup = unsafe { libc::dup(fd) };
-    if dup < 0 {
-        bail!("dup failed: {}", std::io::Error::last_os_error());
-    }
-    Ok(dup)
-}
-
 fn command_from_argv(argv: &[CString]) -> Result<Command> {
     let program = argv.first().context("empty argv")?.to_string_lossy();
     let mut cmd = Command::new(program.as_ref());
@@ -581,7 +357,7 @@ fn command_for_user(
     use_shell: bool,
     env: &[EnvVar],
 ) -> Result<Command> {
-    let root_switch = unsafe { libc::geteuid() == 0 } && user != auth::current_username();
+    let root_switch = crate::os::is_root() && user != auth::current_username();
     if root_switch {
         let mut cmd = Command::new("su");
         cmd.arg("-l").arg(user);
@@ -667,56 +443,8 @@ fn allowed_env_key(key: &str) -> bool {
     key == "TERM" || key == "LANG" || key.starts_with("LC_")
 }
 
-fn configure_child_pre_exec(cmd: &mut Command, controlling_tty: bool, term: Option<String>) {
-    let term = term.map(|term| CString::new(term).expect("TERM contains NUL"));
-    let term_key = CString::new("TERM").expect("TERM key contains NUL");
-    unsafe {
-        cmd.pre_exec(move || {
-            reset_child_signal_state()?;
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if controlling_tty && libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if let Some(term) = &term {
-                if libc::setenv(term_key.as_ptr(), term.as_ptr(), 1) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        });
-    }
-}
-
-fn reset_child_signal_state() -> std::io::Result<()> {
-    unsafe {
-        for signo in [
-            libc::SIGCHLD,
-            libc::SIGHUP,
-            libc::SIGINT,
-            libc::SIGQUIT,
-            libc::SIGTERM,
-            libc::SIGALRM,
-            libc::SIGPIPE,
-            libc::SIGTTIN,
-            libc::SIGTTOU,
-        ] {
-            if libc::signal(signo, libc::SIG_DFL) == libc::SIG_ERR {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-        let mut empty_set = std::mem::zeroed::<libc::sigset_t>();
-        libc::sigemptyset(&mut empty_set);
-        if libc::sigprocmask(libc::SIG_SETMASK, &empty_set, std::ptr::null_mut()) == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
 fn pty_argv(user: &str, command: &[String], use_shell: bool) -> Result<Vec<CString>> {
-    let root_switch = unsafe { libc::geteuid() == 0 } && user != auth::current_username();
+    let root_switch = crate::os::is_root() && user != auth::current_username();
     let args = if root_switch && command.is_empty() {
         #[cfg(target_os = "macos")]
         let args = vec!["login".to_string(), "-fp".to_string(), user.to_string()];
@@ -763,30 +491,4 @@ fn exec_argv_command(command: &[String]) -> String {
         script.push_str(&shell_words::quote(arg));
     }
     script
-}
-
-fn send_process_group_signal(pid: i32, signal: RemoteSignal) -> Result<()> {
-    let rc = unsafe { libc::kill(-pid, signal.as_raw()) };
-    if rc < 0 {
-        bail!(
-            "kill process group failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
-}
-
-fn shell_for_user(user: &str) -> Option<String> {
-    unsafe {
-        let c_user = CString::new(user).ok()?;
-        let pwd = libc::getpwnam(c_user.as_ptr());
-        if pwd.is_null() {
-            return None;
-        }
-        Some(
-            std::ffi::CStr::from_ptr((*pwd).pw_shell)
-                .to_string_lossy()
-                .into_owned(),
-        )
-    }
 }

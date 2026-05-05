@@ -22,9 +22,9 @@ pub(crate) struct Args {
     #[arg(short = 'p', value_name = "PORT")]
     pub(crate) port: Option<u16>,
 
-    /// Force PTY allocation. Repeat as -tt for ssh compatibility.
-    #[arg(short = 't', action = clap::ArgAction::Count)]
-    pub(crate) tty: u8,
+    /// Force PTY allocation.
+    #[arg(short = 't')]
+    pub(crate) tty: bool,
 
     /// Disable PTY allocation and use stdin/stdout/stderr pipes.
     #[arg(short = 'T')]
@@ -176,6 +176,7 @@ fn unbracket_host(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{Parser, error::ErrorKind};
 
     #[test]
     fn target_accepts_domain_names() {
@@ -202,5 +203,11 @@ mod tests {
         assert_eq!(forward.listen_port, 8080);
         assert_eq!(forward.target_host, "db.internal.example");
         assert_eq!(forward.target_port, 5432);
+    }
+
+    #[test]
+    fn tty_short_flag_cannot_be_repeated() {
+        let err = Args::try_parse_from(["hush", "-tt", "example.test"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
     }
 }

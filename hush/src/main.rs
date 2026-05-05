@@ -1,6 +1,7 @@
 mod cli;
 mod logging;
 mod net;
+mod os;
 mod session;
 
 use anyhow::{Result, bail};

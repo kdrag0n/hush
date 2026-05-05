@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 pub fn default_data_dir() -> PathBuf {
-    if unsafe { libc::geteuid() } == 0 {
+    if crate::os::is_root() {
         PathBuf::from("/etc/hush")
     } else {
         xdg_dirs()
@@ -11,7 +11,7 @@ pub fn default_data_dir() -> PathBuf {
 }
 
 pub fn default_server_config_path() -> PathBuf {
-    if unsafe { libc::geteuid() } == 0 {
+    if crate::os::is_root() {
         PathBuf::from("/etc/hush/server_config.toml")
     } else {
         let dirs = xdg_dirs();
