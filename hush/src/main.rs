@@ -209,8 +209,25 @@ async fn run_pipes(
     let in_task = tokio::spawn(stdio_to_quic(libc::STDIN_FILENO, send));
     let out_task = tokio::spawn(quic_to_stdio(recv, libc::STDOUT_FILENO));
     let err_task = tokio::spawn(quic_to_stdio(stderr_recv, libc::STDERR_FILENO));
-    let signal_task = tokio::spawn(watch_signals(control_tx));
-    let status = read_exit_status(&mut control_recv).await?;
+    let (local_signal_tx, mut local_signal_rx) = tokio::sync::mpsc::channel(8);
+    let signal_task = tokio::spawn(watch_signals(control_tx, local_signal_tx));
+    let mut sigterm_watchdog = None;
+    let status = loop {
+        tokio::select! {
+            status = read_exit_status(&mut control_recv) => break status?,
+            Some(signal) = local_signal_rx.recv() => {
+                if signal == RemoteSignal::SIGTERM && sigterm_watchdog.is_none() {
+                    sigterm_watchdog = Some(tokio::spawn(async {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        self_terminate_with_signal(RemoteSignal::SIGTERM);
+                    }));
+                }
+            }
+        }
+    };
+    if let Some(watchdog) = sigterm_watchdog {
+        watchdog.abort();
+    }
     signal_task.abort();
     in_task.abort();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), out_task).await;
@@ -229,7 +246,10 @@ async fn watch_resize(tx: tokio::sync::mpsc::Sender<ControlRequest>) -> Result<(
 }
 
 #[cfg(unix)]
-async fn watch_signals(tx: tokio::sync::mpsc::Sender<ControlRequest>) -> Result<()> {
+async fn watch_signals(
+    tx: tokio::sync::mpsc::Sender<ControlRequest>,
+    local_tx: tokio::sync::mpsc::Sender<RemoteSignal>,
+) -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -247,6 +267,7 @@ async fn watch_signals(tx: tokio::sync::mpsc::Sender<ControlRequest>) -> Result<
             _ = sigusr2.recv() => RemoteSignal::SIGUSR2,
         };
         let _ = tx.send(ControlRequest::Signal(signal)).await;
+        let _ = local_tx.send(signal).await;
     }
 }
 
@@ -414,7 +435,7 @@ fn self_terminate_with_signal(signal: RemoteSignal) -> ! {
         libc::sigaddset(&mut set, signal);
         libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
         libc::signal(signal, libc::SIG_DFL);
-        libc::kill(libc::getpid(), signal);
+        libc::raise(signal);
         libc::_exit(128 + signal);
     }
 }

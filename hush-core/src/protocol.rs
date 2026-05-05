@@ -67,7 +67,7 @@ pub enum ControlRequest {
     Close,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteSignal {
     SIGABRT,
     SIGALRM,

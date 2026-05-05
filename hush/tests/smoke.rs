@@ -233,6 +233,57 @@ fn non_pty_signal_forwarding_propagates_interrupt() {
 }
 
 #[test]
+fn non_pty_signal_forwarding_propagates_terminate() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let child = env
+        .hush()
+        .arg("-T")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("trap 'echo terminated; exit 43' TERM; while true; do sleep 1; done")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_secs(1));
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(43), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("terminated"));
+}
+
+#[test]
+fn non_pty_sigterm_times_out_if_remote_does_not_exit() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let child = env
+        .hush()
+        .arg("-T")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("trap '' TERM; sleep 5")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_secs(1));
+    let start = Instant::now();
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.signal(), Some(libc::SIGTERM), "{out:?}");
+    assert!(start.elapsed() < Duration::from_secs(3), "{out:?}");
+}
+
+#[test]
 fn local_forwarding_carries_tcp() {
     let mut env = TestEnv::new();
     env.start_server();
