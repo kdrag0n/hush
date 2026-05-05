@@ -15,7 +15,7 @@ use tokio::sync::Semaphore;
     name = "hush-server",
     version,
     about = "Server for hush, an SSH-like remote shell over QUIC",
-    long_about = "hush-server listens for QUIC connections, authenticates clients with Ed25519 SSH keys, and runs remote shell sessions.\n\nConfiguration is read from ~/.hush/server_config.toml, or /etc/hush/server_config.toml when running as root, unless --config is supplied. Command-line flags override config file values."
+    long_about = "hush-server listens for QUIC connections, authenticates clients with Ed25519 SSH keys, and runs remote shell sessions.\n\nConfiguration is read from the XDG config path, normally $XDG_CONFIG_HOME/hush/server_config.toml or ~/.config/hush/server_config.toml. When running as root, the default is /etc/hush/server_config.toml. Command-line flags override config file values."
 )]
 struct Args {
     /// Enable verbose server logging.
