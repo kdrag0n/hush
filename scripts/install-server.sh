@@ -6,6 +6,7 @@ SERVICE_LABEL=dev.kdrag0n.hush
 PLIST_PATH=/Library/LaunchDaemons/dev.kdrag0n.hush.plist
 SYSTEMD_SERVICE_PATH=/etc/systemd/system/hush.service
 OPENWRT_INIT_PATH=/etc/init.d/hush
+OPENWRT_AUTHORIZED_KEYS=/etc/dropbear/authorized_keys
 INSTALL_DIR=${HUSH_INSTALL_DIR:-/usr/local/bin}
 INSTALL_PATH=${HUSH_INSTALL_PATH:-"$INSTALL_DIR/hush-server"}
 HUSH_REPO=${HUSH_REPO:-kdrag0n/hush}
@@ -423,7 +424,26 @@ EOF
 	as_root chmod 0755 "$OPENWRT_INIT_PATH"
 }
 
+write_openwrt_config() {
+	as_root mkdir -p /etc/hush/server
+	if [ ! -f /etc/hush/server/config.toml ]; then
+		cat <<EOF | as_root tee /etc/hush/server/config.toml >/dev/null
+# OpenWrt hush-server configuration.
+listen = "[::]:22022"
+authorized_keys_path = "$OPENWRT_AUTHORIZED_KEYS"
+allow_tcp_forwarding = true
+EOF
+	elif ! grep -Eq '^[[:space:]]*authorized_keys_path[[:space:]]*=' /etc/hush/server/config.toml; then
+		cat <<EOF | as_root tee -a /etc/hush/server/config.toml >/dev/null
+
+# OpenWrt Dropbear authorized_keys location.
+authorized_keys_path = "$OPENWRT_AUTHORIZED_KEYS"
+EOF
+	fi
+}
+
 install_openwrt_service() {
+	write_openwrt_config
 	write_openwrt_init
 	as_root /etc/init.d/hush enable
 	as_root /etc/init.d/hush stop >/dev/null 2>&1 || true
