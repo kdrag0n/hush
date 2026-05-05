@@ -17,6 +17,9 @@ use tokio::{
     process::Command,
 };
 
+const DEFAULT_PASSWD_BUFFER_LEN: usize = 16 * 1024;
+const TTY_NAME_BUFFER_LEN: usize = 1024;
+
 pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
@@ -34,7 +37,14 @@ fn current_username_from_passwd() -> Option<String> {
         let mut pwd = std::mem::zeroed::<libc::passwd>();
         let mut result = std::ptr::null_mut();
         let size = libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX);
-        let mut buf = vec![0 as libc::c_char; if size > 0 { size as usize } else { 16 * 1024 }];
+        let mut buf = vec![
+            0 as libc::c_char;
+            if size > 0 {
+                size as usize
+            } else {
+                DEFAULT_PASSWD_BUFFER_LEN
+            }
+        ];
         let rc = libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result);
         if rc != 0 || result.is_null() || pwd.pw_name.is_null() {
             return None;
@@ -318,7 +328,7 @@ fn configure_pty_slave(fd: RawFd) -> Result<()> {
 }
 
 pub fn tty_name(fd: RawFd) -> Option<String> {
-    let mut buf = [0 as libc::c_char; 1024];
+    let mut buf = [0 as libc::c_char; TTY_NAME_BUFFER_LEN];
     if unsafe { libc::ttyname_r(fd, buf.as_mut_ptr(), buf.len()) } != 0 {
         return None;
     }

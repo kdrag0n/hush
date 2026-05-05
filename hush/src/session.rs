@@ -5,6 +5,8 @@ use hush_core::protocol::{
     read_frame, write_frame,
 };
 
+const STDIO_BUFFER_LEN: usize = 8192;
+
 pub(crate) async fn control_writer(
     mut control_send: quinn::SendStream,
     mut rx: tokio::sync::mpsc::Receiver<ControlRequest>,
@@ -159,7 +161,7 @@ async fn stdio_to_quic(mut send: quinn::SendStream) -> Result<StdinPumpExit> {
     let enable_escape = os::stdin_is_terminal();
     let fd = os::AsyncStdioFd::duplicate(os::STDIN_FD)?;
     let mut escape = EscapeFilter::new(enable_escape);
-    let mut buf = vec![0u8; 8192];
+    let mut buf = vec![0u8; STDIO_BUFFER_LEN];
     let mut out = Vec::with_capacity(buf.len());
     loop {
         match fd.read(&mut buf).await {
@@ -239,7 +241,7 @@ impl EscapeFilter {
 
 async fn quic_to_stdio(mut recv: quinn::RecvStream, fd: i32) -> Result<()> {
     let fd = os::AsyncStdioFd::duplicate(fd)?;
-    let mut buf = vec![0u8; 8192];
+    let mut buf = vec![0u8; STDIO_BUFFER_LEN];
     loop {
         let n = recv.read(&mut buf).await?.unwrap_or(0);
         if n == 0 {
