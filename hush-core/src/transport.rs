@@ -767,7 +767,22 @@ fn read_known_hosts(path: &Path) -> Result<KnownHostsFile> {
     let Ok(data) = fs::read_to_string(path) else {
         return Ok(KnownHostsFile::default());
     };
-    toml::from_str(&data).with_context(|| format!("parse {}", path.display()))
+    match toml::from_str(&data) {
+        Ok(known) => Ok(known),
+        Err(err) if is_obsolete_certificate_known_hosts(&data) => {
+            tracing::warn!(
+                path = %path.display(),
+                %err,
+                "discarding obsolete certificate known_hosts format"
+            );
+            Ok(KnownHostsFile::default())
+        }
+        Err(err) => Err(err).with_context(|| format!("parse {}", path.display())),
+    }
+}
+
+fn is_obsolete_certificate_known_hosts(data: &str) -> bool {
+    data.contains("[[hosts]]") && data.contains("x509-certificate")
 }
 
 fn write_known_hosts(path: &Path, known: &KnownHostsFile) -> Result<()> {
