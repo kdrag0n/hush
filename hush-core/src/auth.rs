@@ -6,20 +6,68 @@ use ssh_key::{
     public::{Ed25519PublicKey, KeyData},
 };
 use std::{
-    fs,
+    env, fs,
     path::{Path, PathBuf},
 };
 use x509_parser::prelude::FromDer;
 
 #[derive(Debug, Clone)]
 pub struct LoadedIdentity {
-    pub private_key_der: Vec<u8>,
     pub public_key: PublicKey,
+    pub key: IdentityKey,
+}
+
+#[derive(Debug, Clone)]
+pub enum IdentityKey {
+    Agent { socket: PathBuf, spki_der: Vec<u8> },
+    File { private_key_der: Vec<u8> },
 }
 
 pub fn load_identity() -> Result<LoadedIdentity> {
+    if let Some(identity) = load_identity_from_agent()? {
+        return Ok(identity);
+    }
     let path = crate::paths::current_home().join(".ssh/id_ed25519");
     load_identity_from_file(&path)
+}
+
+fn load_identity_from_agent() -> Result<Option<LoadedIdentity>> {
+    let Ok(sock) = env::var("SSH_AUTH_SOCK") else {
+        return Ok(None);
+    };
+    let socket = PathBuf::from(sock);
+    let mut client = match ssh_agent_client_rs::Client::connect(&socket) {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::debug!(%err, "failed to connect to ssh-agent");
+            return Ok(None);
+        }
+    };
+    let identities = client
+        .list_all_identities()
+        .context("list ssh-agent identities")?;
+    let preferred = preferred_public_key();
+    for identity in identities {
+        let ssh_agent_client_rs::Identity::PublicKey(public_key) = identity else {
+            continue;
+        };
+        let public_key = public_key.into_owned();
+        if public_key.algorithm() != Algorithm::Ed25519 {
+            continue;
+        }
+        if let Some(preferred) = &preferred {
+            if !same_public_key(&public_key, preferred)? {
+                continue;
+            }
+        }
+        let spki_der = ed25519_public_key_to_spki(&public_key)?;
+        tracing::debug!("using Ed25519 identity from ssh-agent");
+        return Ok(Some(LoadedIdentity {
+            public_key,
+            key: IdentityKey::Agent { socket, spki_der },
+        }));
+    }
+    Ok(None)
 }
 
 pub fn load_identity_from_file(path: &Path) -> Result<LoadedIdentity> {
@@ -39,9 +87,21 @@ pub fn load_identity_from_file(path: &Path) -> Result<LoadedIdentity> {
         .context("private key is not Ed25519")?;
     let private_key_der = ed25519_seed_to_pkcs8_der(keypair.private.as_ref());
     Ok(LoadedIdentity {
-        private_key_der,
         public_key: key.public_key().clone(),
+        key: IdentityKey::File { private_key_der },
     })
+}
+
+pub fn agent_sign(socket: &Path, public_key: &PublicKey, message: &[u8]) -> Result<Vec<u8>> {
+    let mut client = ssh_agent_client_rs::Client::connect(socket)
+        .with_context(|| format!("connect ssh-agent {}", socket.display()))?;
+    let sig = client
+        .sign(public_key, message)
+        .context("ssh-agent sign request")?;
+    if sig.algorithm() != Algorithm::Ed25519 {
+        bail!("ssh-agent returned non-Ed25519 signature");
+    }
+    Ok(sig.as_bytes().to_vec())
 }
 
 pub fn public_key_from_cert_der(cert_der: &[u8]) -> Result<PublicKey> {
@@ -130,4 +190,28 @@ fn ed25519_seed_to_pkcs8_der(seed: &[u8; 32]) -> Vec<u8> {
     let mut der = hex::decode("302e020100300506032b657004220420").expect("valid pkcs8 prefix");
     der.extend_from_slice(seed);
     der
+}
+
+pub fn ed25519_public_key_to_spki(public_key: &PublicKey) -> Result<Vec<u8>> {
+    let raw = ed25519_public_key_bytes(public_key)?;
+    let mut der = hex::decode("302a300506032b6570032100").expect("valid spki prefix");
+    der.extend_from_slice(raw);
+    Ok(der)
+}
+
+pub fn ed25519_public_key_bytes(public_key: &PublicKey) -> Result<&[u8; 32]> {
+    match public_key.key_data() {
+        KeyData::Ed25519(key) => Ok(key.as_ref()),
+        _ => bail!("only Ed25519 SSH keys are supported for now"),
+    }
+}
+
+fn preferred_public_key() -> Option<PublicKey> {
+    let path = crate::paths::current_home().join(".ssh/id_ed25519.pub");
+    let data = fs::read_to_string(path).ok()?;
+    PublicKey::from_openssh(&data).ok()
+}
+
+fn same_public_key(a: &PublicKey, b: &PublicKey) -> Result<bool> {
+    Ok(a.to_bytes()? == b.to_bytes()?)
 }

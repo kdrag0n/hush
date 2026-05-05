@@ -1,18 +1,25 @@
-use crate::{ALPN, auth};
+use crate::{
+    ALPN,
+    auth::{self, IdentityKey},
+};
 use anyhow::{Result, bail};
 use quinn::{ClientConfig, ServerConfig};
 use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::{
     ClientConfig as RustlsClientConfig, DigitallySignedStruct, Error as RustlsError,
-    ServerConfig as RustlsServerConfig, SignatureScheme,
+    ServerConfig as RustlsServerConfig, SignatureAlgorithm, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature},
-    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
+    pki_types::{
+        CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, SubjectPublicKeyInfoDer,
+        UnixTime,
+    },
     server::danger::{ClientCertVerified, ClientCertVerifier},
+    sign::{CertifiedKey, Signer, SigningKey, SingleCertAndKey},
 };
 use std::{
     collections::HashMap,
-    fs,
+    fmt, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -84,13 +91,27 @@ pub fn make_client_config(
         host_key,
         insecure,
     });
-    let cert = self_signed_cert("hush-client", &identity.private_key_der)?;
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key_der));
-    let mut cfg = RustlsClientConfig::builder_with_provider(provider.into())
+    let builder = RustlsClientConfig::builder_with_provider(provider.into())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_client_auth_cert(vec![cert], key)?;
+        .with_custom_certificate_verifier(verifier);
+    let mut cfg = match identity.key {
+        IdentityKey::File { private_key_der } => {
+            let cert = self_signed_cert("hush-client", &private_key_der)?;
+            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der));
+            builder.with_client_auth_cert(vec![cert], key)?
+        }
+        IdentityKey::Agent { socket, spki_der } => {
+            let cert = self_signed_agent_cert("hush-client", &identity.public_key, &socket)?;
+            let key = AgentTlsSigningKey {
+                socket,
+                public_key: identity.public_key,
+                spki_der,
+            };
+            let certified_key = CertifiedKey::new(vec![cert], Arc::new(key));
+            builder.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key)))
+        }
+    };
     cfg.alpn_protocols = vec![ALPN.to_vec()];
     Ok(ClientConfig::new(Arc::new(QuicClientConfig::try_from(
         cfg,
@@ -149,6 +170,99 @@ fn self_signed_cert(name: &str, pkcs8_der: &[u8]) -> Result<CertificateDer<'stat
     let key = rcgen::KeyPair::from_der_and_sign_algo(&key, &rcgen::PKCS_ED25519)?;
     let cert = rcgen::CertificateParams::new(vec![name.to_owned()])?.self_signed(&key)?;
     Ok(cert.der().clone())
+}
+
+fn self_signed_agent_cert(
+    name: &str,
+    public_key: &ssh_key::PublicKey,
+    socket: &Path,
+) -> Result<CertificateDer<'static>> {
+    let key = AgentRcgenSigningKey {
+        socket: socket.to_owned(),
+        public_key: public_key.clone(),
+        raw_public_key: auth::ed25519_public_key_bytes(public_key)?.to_vec(),
+    };
+    let cert = rcgen::CertificateParams::new(vec![name.to_owned()])?.self_signed(&key)?;
+    Ok(cert.der().clone())
+}
+
+struct AgentRcgenSigningKey {
+    socket: PathBuf,
+    public_key: ssh_key::PublicKey,
+    raw_public_key: Vec<u8>,
+}
+
+impl fmt::Debug for AgentRcgenSigningKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentRcgenSigningKey")
+            .finish_non_exhaustive()
+    }
+}
+
+impl rcgen::PublicKeyData for AgentRcgenSigningKey {
+    fn der_bytes(&self) -> &[u8] {
+        &self.raw_public_key
+    }
+
+    fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
+        &rcgen::PKCS_ED25519
+    }
+}
+
+impl rcgen::SigningKey for AgentRcgenSigningKey {
+    fn sign(&self, msg: &[u8]) -> std::result::Result<Vec<u8>, rcgen::Error> {
+        auth::agent_sign(&self.socket, &self.public_key, msg)
+            .map_err(|_| rcgen::Error::RemoteKeyError)
+    }
+}
+
+#[derive(Clone)]
+struct AgentTlsSigningKey {
+    socket: PathBuf,
+    public_key: ssh_key::PublicKey,
+    spki_der: Vec<u8>,
+}
+
+impl fmt::Debug for AgentTlsSigningKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentTlsSigningKey").finish_non_exhaustive()
+    }
+}
+
+impl SigningKey for AgentTlsSigningKey {
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+        offered
+            .contains(&SignatureScheme::ED25519)
+            .then(|| Box::new(AgentTlsSigner(self.clone())) as Box<dyn Signer>)
+    }
+
+    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+        Some(SubjectPublicKeyInfoDer::from(self.spki_der.as_slice()))
+    }
+
+    fn algorithm(&self) -> SignatureAlgorithm {
+        SignatureAlgorithm::ED25519
+    }
+}
+
+#[derive(Clone)]
+struct AgentTlsSigner(AgentTlsSigningKey);
+
+impl fmt::Debug for AgentTlsSigner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentTlsSigner").finish_non_exhaustive()
+    }
+}
+
+impl Signer for AgentTlsSigner {
+    fn sign(&self, message: &[u8]) -> std::result::Result<Vec<u8>, RustlsError> {
+        auth::agent_sign(&self.0.socket, &self.0.public_key, message)
+            .map_err(|err| RustlsError::General(format!("ssh-agent signing failed: {err}")))
+    }
+
+    fn scheme(&self) -> SignatureScheme {
+        SignatureScheme::ED25519
+    }
 }
 
 fn pq_provider() -> CryptoProvider {

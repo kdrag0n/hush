@@ -12,9 +12,11 @@ use quinn::Endpoint;
 use std::{
     io::IsTerminal,
     net::{SocketAddr, ToSocketAddrs},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     path::PathBuf,
+    sync::Arc,
 };
-use tokio::io::{self, AsyncWriteExt};
+use tokio::io::unix::AsyncFd;
 
 #[derive(Debug, Parser)]
 #[command(name = "hush", version)]
@@ -36,6 +38,7 @@ struct Args {
     #[arg(short = 'R', value_parser = parse_forward)]
     remote_forward: Vec<ForwardArg>,
     target: String,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
 }
 
@@ -147,10 +150,8 @@ async fn run_pty(conn: quinn::Connection, mut control_recv: quinn::RecvStream) -
     let (mut send, recv) = conn.open_bi().await?;
     write_frame(&mut send, &StreamOpen::SessionPtyData).await?;
     expect_session_ready(&mut control_recv).await?;
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let in_task = tokio::spawn(hush_core::net::copy_reader_to_quic(stdin, send));
-    let out_task = tokio::spawn(hush_core::net::copy_quic_to_writer(recv, stdout));
+    let in_task = tokio::spawn(stdio_to_quic(libc::STDIN_FILENO, send));
+    let out_task = tokio::spawn(quic_to_stdio(recv, libc::STDOUT_FILENO));
     let status = read_exit_status(&mut control_recv).await?;
     in_task.abort();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), out_task).await;
@@ -162,7 +163,7 @@ async fn run_pipes(conn: quinn::Connection, mut control_recv: quinn::RecvStream)
     write_frame(&mut send, &StreamOpen::SessionStdIo).await?;
     expect_session_ready(&mut control_recv).await?;
 
-    let mut stderr_recv = loop {
+    let stderr_recv = loop {
         let mut recv = conn.accept_uni().await?;
         let header: StreamOpen = read_frame(&mut recv).await?;
         if matches!(header, StreamOpen::SessionStderr) {
@@ -170,18 +171,90 @@ async fn run_pipes(conn: quinn::Connection, mut control_recv: quinn::RecvStream)
         }
     };
 
-    let in_task = tokio::spawn(hush_core::net::copy_reader_to_quic(io::stdin(), send));
-    let out_task = tokio::spawn(hush_core::net::copy_quic_to_writer(recv, io::stdout()));
-    let err_task = tokio::spawn(async move {
-        io::copy(&mut stderr_recv, &mut io::stderr()).await?;
-        io::stderr().shutdown().await.ok();
-        anyhow::Ok(())
-    });
+    let in_task = tokio::spawn(stdio_to_quic(libc::STDIN_FILENO, send));
+    let out_task = tokio::spawn(quic_to_stdio(recv, libc::STDOUT_FILENO));
+    let err_task = tokio::spawn(quic_to_stdio(stderr_recv, libc::STDERR_FILENO));
     let status = read_exit_status(&mut control_recv).await?;
     in_task.abort();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), out_task).await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), err_task).await;
     std::process::exit(status);
+}
+
+async fn stdio_to_quic(fd: RawFd, mut send: quinn::SendStream) -> Result<()> {
+    let fd = Arc::new(async_stdio_fd(fd)?);
+    let mut buf = vec![0u8; 8192];
+    loop {
+        let mut guard = fd.readable().await?;
+        match guard.try_io(|inner| read_fd(inner.get_ref().as_raw_fd(), &mut buf)) {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => send.write_all(&buf[..n]).await?,
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_) => continue,
+        }
+    }
+    send.finish()?;
+    let _ = send.stopped().await;
+    Ok(())
+}
+
+async fn quic_to_stdio(mut recv: quinn::RecvStream, fd: RawFd) -> Result<()> {
+    let fd = Arc::new(async_stdio_fd(fd)?);
+    let mut buf = vec![0u8; 8192];
+    loop {
+        let n = recv.read(&mut buf).await?.unwrap_or(0);
+        if n == 0 {
+            return Ok(());
+        }
+        let mut written = 0;
+        while written < n {
+            let mut guard = fd.writable().await?;
+            match guard.try_io(|inner| write_fd(inner.get_ref().as_raw_fd(), &buf[written..n])) {
+                Ok(Ok(0)) => return Ok(()),
+                Ok(Ok(m)) => written += m,
+                Ok(Err(err)) => return Err(err.into()),
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
+fn async_stdio_fd(fd: RawFd) -> Result<AsyncFd<OwnedFd>> {
+    let dup = unsafe { libc::dup(fd) };
+    if dup < 0 {
+        bail!("dup stdio fd failed: {}", std::io::Error::last_os_error());
+    }
+    set_nonblocking(dup)?;
+    Ok(AsyncFd::new(unsafe { OwnedFd::from_raw_fd(dup) })?)
+}
+
+fn set_nonblocking(fd: RawFd) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        bail!("fcntl(F_GETFL) failed: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        bail!("fcntl(F_SETFL) failed: {}", std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
+    let rc = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if rc >= 0 {
+        Ok(rc as usize)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn write_fd(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
+    let rc = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+    if rc >= 0 {
+        Ok(rc as usize)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 fn choose_mode(force_tty: u8, no_tty: bool) -> SessionMode {

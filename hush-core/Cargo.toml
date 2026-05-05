@@ -21,6 +21,7 @@ rustls-pki-types.workspace = true
 serde.workspace = true
 sha2.workspace = true
 shell-words.workspace = true
+ssh-agent-client-rs.workspace = true
 ssh-key.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
