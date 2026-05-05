@@ -137,8 +137,9 @@ async fn main() -> Result<()> {
     let server_config =
         hush_core::tls::make_server_config(&data_dir, host_cert.as_deref(), host_key.as_deref())?;
     let endpoint = Endpoint::server(server_config, listen)?;
+    let local_addr = endpoint.local_addr()?;
     tracing::info!(
-        addr = %endpoint.local_addr()?,
+        addr = %local_addr,
         max_connections = runtime_config.max_connections,
         max_sessions_per_connection = runtime_config.max_sessions_per_connection,
         max_forwards_per_connection = runtime_config.max_forwards_per_connection,
@@ -165,7 +166,7 @@ async fn main() -> Result<()> {
             let _permit = permit;
             match connecting.await {
                 Ok(conn) => {
-                    if let Err(err) = handle_connection(conn, runtime_config).await {
+                    if let Err(err) = handle_connection(conn, runtime_config, local_addr).await {
                         tracing::warn!(%err, "connection failed");
                     }
                 }
@@ -176,7 +177,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_connection(conn: quinn::Connection, config: ServerRuntimeConfig) -> Result<()> {
+async fn handle_connection(
+    conn: quinn::Connection,
+    config: ServerRuntimeConfig,
+    server_addr: SocketAddr,
+) -> Result<()> {
     let peer_key = peer_public_key(&conn)?;
     let (mut control_send, mut control_recv) = conn.accept_bi().await?;
     let mut remote_forwards = 0usize;
@@ -230,7 +235,16 @@ async fn handle_connection(conn: quinn::Connection, config: ServerRuntimeConfig)
             ControlRequest::Resize(_) | ControlRequest::Signal(_) => {}
         }
     };
-    run_session(conn, control_send, control_recv, session, peer_key, config).await
+    run_session(
+        conn,
+        control_send,
+        control_recv,
+        session,
+        peer_key,
+        config,
+        server_addr,
+    )
+    .await
 }
 
 async fn run_session(
@@ -240,6 +254,7 @@ async fn run_session(
     session: OpenSession,
     peer_key: ssh_key::PublicKey,
     config: ServerRuntimeConfig,
+    server_addr: SocketAddr,
 ) -> Result<()> {
     match hush_core::session::run_server_session(
         conn,
@@ -248,6 +263,7 @@ async fn run_session(
         session,
         peer_key,
         config,
+        server_addr,
     )
     .await
     {

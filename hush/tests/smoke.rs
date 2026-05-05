@@ -191,6 +191,58 @@ fn selected_environment_is_propagated() {
 }
 
 #[test]
+fn openssh_connection_environment_is_set() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let out = env
+        .hush()
+        .arg("-T")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("printf '%s\n%s\n%s\n' \"$SSH_CLIENT\" \"$SSH_CONNECTION\" \"${SSH_TTY-unset}\"")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<_> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "{out:?}");
+    let client: Vec<_> = lines[0].split_whitespace().collect();
+    assert_eq!(client.len(), 3, "{out:?}");
+    assert_eq!(client[0], "127.0.0.1", "{out:?}");
+    assert_eq!(client[2], env.port.to_string(), "{out:?}");
+    let connection: Vec<_> = lines[1].split_whitespace().collect();
+    assert_eq!(connection.len(), 4, "{out:?}");
+    assert_eq!(connection[0], "127.0.0.1", "{out:?}");
+    assert_eq!(connection[1], client[1], "{out:?}");
+    assert_eq!(connection[2], "127.0.0.1", "{out:?}");
+    assert_eq!(connection[3], env.port.to_string(), "{out:?}");
+    assert_eq!(lines[2], "unset", "{out:?}");
+}
+
+#[test]
+fn openssh_tty_environment_is_set_for_pty() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let out = env
+        .hush()
+        .arg("-t")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-lc")
+        .arg("printf '%s' \"$SSH_TTY\"")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("/dev/"),
+        "{out:?}"
+    );
+}
+
+#[test]
 fn remote_signal_exit_is_reemitted_by_client() {
     let mut env = TestEnv::new();
     env.start_server();

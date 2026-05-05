@@ -10,8 +10,9 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use quinn::{Connection, RecvStream, SendStream};
 use std::{
-    ffi::CString,
+    ffi::{CStr, CString},
     io,
+    net::SocketAddr,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
     os::unix::process::ExitStatusExt,
     path::PathBuf,
@@ -24,6 +25,29 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Semaphore;
 use tokio::{io::unix::AsyncFd, process::Command};
 
+struct ConnectionEnv {
+    ssh_client: String,
+    ssh_connection: String,
+}
+
+impl ConnectionEnv {
+    fn from_connection(conn: &Connection, server_addr: SocketAddr) -> Self {
+        let remote = conn.remote_address();
+        let local_ip = conn.local_ip().unwrap_or_else(|| server_addr.ip());
+        let local_port = server_addr.port();
+        Self {
+            ssh_client: format!("{} {} {}", remote.ip(), remote.port(), local_port),
+            ssh_connection: format!(
+                "{} {} {} {}",
+                remote.ip(),
+                remote.port(),
+                local_ip,
+                local_port
+            ),
+        }
+    }
+}
+
 pub async fn run_server_session(
     conn: Connection,
     mut control_send: SendStream,
@@ -31,7 +55,9 @@ pub async fn run_server_session(
     request: OpenSession,
     peer_key: ssh_key::PublicKey,
     config: ServerRuntimeConfig,
+    server_addr: SocketAddr,
 ) -> Result<ProcessExit> {
+    let connection_env = ConnectionEnv::from_connection(&conn, server_addr);
     let peer_fp = auth::public_key_fingerprint(&peer_key).unwrap_or_else(|_| "unknown".into());
     tracing::info!(user = %request.user, key = %peer_fp, "auth attempt");
     if !config.allow_users.is_empty()
@@ -149,6 +175,7 @@ pub async fn run_server_session(
                     resize_rx.take().context("resize channel already used")?,
                     signal_rx.take().context("signal channel already used")?,
                     &request.env,
+                    &connection_env,
                 )
                 .await
                 {
@@ -178,6 +205,7 @@ pub async fn run_server_session(
                     err_send,
                     signal_rx.take().context("signal channel already used")?,
                     &request.env,
+                    &connection_env,
                 )
                 .await
                 {
@@ -215,8 +243,10 @@ async fn run_pipes(
     err_send: SendStream,
     mut signal_rx: tokio::sync::mpsc::Receiver<RemoteSignal>,
     env: &[EnvVar],
+    connection_env: &ConnectionEnv,
 ) -> Result<ProcessExit> {
-    let mut cmd = command_for_user(user, command, false, use_shell, env)?;
+    let env = session_env(env, connection_env, None);
+    let mut cmd = command_for_user(user, command, false, use_shell, &env)?;
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -252,13 +282,16 @@ async fn run_pty(
     mut resize_rx: tokio::sync::mpsc::Receiver<TermSize>,
     mut signal_rx: tokio::sync::mpsc::Receiver<RemoteSignal>,
     env: &[EnvVar],
+    connection_env: &ConnectionEnv,
 ) -> Result<ProcessExit> {
     let argv = pty_argv(user, command, use_shell)?;
     let pty = open_pty(&size)?;
+    let ssh_tty = tty_name(pty.slave.as_raw_fd());
+    let env = session_env(env, connection_env, ssh_tty.as_deref());
     set_nonblocking(pty.master.as_raw_fd())?;
     let pty_master = AsyncPty::new(pty.master)?;
     let mut cmd = command_from_argv(&argv)?;
-    apply_session_env(&mut cmd, env);
+    apply_session_env(&mut cmd, &env);
     cmd.env("TERM", term);
     let stdin_fd = dup_fd(pty.slave.as_raw_fd())?;
     let stdout_fd = dup_fd(pty.slave.as_raw_fd())?;
@@ -496,6 +529,18 @@ fn configure_pty_slave(fd: RawFd) -> Result<()> {
     Ok(())
 }
 
+fn tty_name(fd: RawFd) -> Option<String> {
+    let mut buf = [0 as libc::c_char; 1024];
+    if unsafe { libc::ttyname_r(fd, buf.as_mut_ptr(), buf.len()) } != 0 {
+        return None;
+    }
+    Some(
+        unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
 fn set_winsize(fd: RawFd, size: &TermSize) -> Result<()> {
     let winsize = libc::winsize {
         ws_row: size.rows,
@@ -584,10 +629,38 @@ fn command_for_user(
 
 fn apply_session_env(cmd: &mut Command, env: &[EnvVar]) {
     for var in env {
-        if allowed_env_key(&var.key) && !var.key.contains('\0') && !var.value.contains('\0') {
+        if !var.key.contains('\0') && !var.value.contains('\0') {
             cmd.env(&var.key, &var.value);
         }
     }
+}
+
+fn session_env(
+    client_env: &[EnvVar],
+    connection_env: &ConnectionEnv,
+    ssh_tty: Option<&str>,
+) -> Vec<EnvVar> {
+    let mut env = Vec::new();
+    for var in client_env {
+        if allowed_env_key(&var.key) {
+            env.push(var.clone());
+        }
+    }
+    env.push(EnvVar {
+        key: "SSH_CLIENT".to_owned(),
+        value: connection_env.ssh_client.clone(),
+    });
+    env.push(EnvVar {
+        key: "SSH_CONNECTION".to_owned(),
+        value: connection_env.ssh_connection.clone(),
+    });
+    if let Some(ssh_tty) = ssh_tty {
+        env.push(EnvVar {
+            key: "SSH_TTY".to_owned(),
+            value: ssh_tty.to_owned(),
+        });
+    }
+    env
 }
 
 fn allowed_env_key(key: &str) -> bool {
