@@ -4,22 +4,24 @@ use hush_core::protocol::{
     EnvVar, OpenSession, ProcessExit, RemoteSignal, SessionMode, StreamOpen, StreamResponse,
     read_frame, write_frame,
 };
+use hush_core::transport::{Connection, RecvStream, SendStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const STDIO_BUFFER_LEN: usize = 8192;
 
 async fn stream_open_writer(
-    conn: quinn::Connection,
+    conn: Connection,
     mut rx: tokio::sync::mpsc::Receiver<StreamOpen>,
 ) -> Result<()> {
     while let Some(header) = rx.recv().await {
         let mut send = conn.open_uni().await?;
         write_frame(&mut send, &header).await?;
-        send.finish()?;
+        send.finish().await?;
     }
     Ok(())
 }
 
-pub(crate) async fn run_pty(conn: quinn::Connection, session: OpenSession) -> Result<()> {
+pub(crate) async fn run_pty(conn: Connection, session: OpenSession) -> Result<()> {
     let raw = os::RawModeGuard::enable_if_terminal()?;
     let (mut send, recv) = conn.open_bi().await?;
     write_frame(&mut send, &StreamOpen::Session { request: session }).await?;
@@ -29,12 +31,12 @@ pub(crate) async fn run_pty(conn: quinn::Connection, session: OpenSession) -> Re
     let resize_task = tokio::spawn(os::watch_resize(stream_tx.clone()));
     let mut status_task = tokio::spawn(read_exit_status(conn.clone()));
     let (in_task, mut escape_rx) = spawn_stdin_pump(send);
-    let out_task = tokio::spawn(quic_to_stdio(recv, os::STDOUT_FD));
+    let out_task = tokio::spawn(stream_to_stdio(recv, os::STDOUT_FD));
     let end = loop {
         tokio::select! {
             status = &mut status_task => break SessionEnd::Remote(status??),
             Some(()) = escape_rx.recv() => {
-                conn.close(0u32.into(), b"~.");
+                conn.close();
                 break SessionEnd::Escape;
             }
         }
@@ -48,7 +50,7 @@ pub(crate) async fn run_pty(conn: quinn::Connection, session: OpenSession) -> Re
     finish_session(end);
 }
 
-pub(crate) async fn run_pipes(conn: quinn::Connection, session: OpenSession) -> Result<()> {
+pub(crate) async fn run_pipes(conn: Connection, session: OpenSession) -> Result<()> {
     let (local_signal_tx, mut local_signal_rx) = tokio::sync::mpsc::channel(8);
     let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(32);
     let stream_writer_task = tokio::spawn(stream_open_writer(conn.clone(), stream_rx));
@@ -75,8 +77,8 @@ pub(crate) async fn run_pipes(conn: quinn::Connection, session: OpenSession) -> 
     };
 
     let (in_task, mut escape_rx) = spawn_stdin_pump(send);
-    let out_task = tokio::spawn(quic_to_stdio(recv, os::STDOUT_FD));
-    let err_task = tokio::spawn(quic_to_stdio(stderr_recv, os::STDERR_FD));
+    let out_task = tokio::spawn(stream_to_stdio(recv, os::STDOUT_FD));
+    let err_task = tokio::spawn(stream_to_stdio(stderr_recv, os::STDERR_FD));
     let status_conn = conn.clone();
     let mut status_task = tokio::spawn(async move {
         match deferred_status {
@@ -88,7 +90,7 @@ pub(crate) async fn run_pipes(conn: quinn::Connection, session: OpenSession) -> 
         tokio::select! {
             status = &mut status_task => break SessionEnd::Remote(status??),
             Some(()) = escape_rx.recv() => {
-                conn.close(0u32.into(), b"~.");
+                conn.close();
                 break SessionEnd::Escape;
             }
             Some(signal) = local_signal_rx.recv() => {
@@ -155,11 +157,11 @@ enum SessionEnd {
 }
 
 fn spawn_stdin_pump(
-    send: quinn::SendStream,
+    send: SendStream,
 ) -> (tokio::task::JoinHandle<()>, tokio::sync::mpsc::Receiver<()>) {
     let (escape_tx, escape_rx) = tokio::sync::mpsc::channel(1);
     let task = tokio::spawn(async move {
-        match stdio_to_quic(send).await {
+        match stdio_to_stream(send).await {
             Ok(StdinPumpExit::Escape) => {
                 let _ = escape_tx.try_send(());
             }
@@ -170,7 +172,7 @@ fn spawn_stdin_pump(
     (task, escape_rx)
 }
 
-async fn stdio_to_quic(mut send: quinn::SendStream) -> Result<StdinPumpExit> {
+async fn stdio_to_stream(mut send: SendStream) -> Result<StdinPumpExit> {
     let enable_escape = os::stdin_is_terminal();
     let fd = os::AsyncStdioFd::duplicate(os::STDIN_FD)?;
     let mut escape = EscapeFilter::new(enable_escape);
@@ -196,8 +198,7 @@ async fn stdio_to_quic(mut send: quinn::SendStream) -> Result<StdinPumpExit> {
     if !out.is_empty() {
         send.write_all(&out).await?;
     }
-    send.finish()?;
-    let _ = send.stopped().await;
+    send.finish().await?;
     Ok(StdinPumpExit::Eof)
 }
 
@@ -252,11 +253,11 @@ impl EscapeFilter {
     }
 }
 
-async fn quic_to_stdio(mut recv: quinn::RecvStream, fd: i32) -> Result<()> {
+async fn stream_to_stdio(mut recv: RecvStream, fd: i32) -> Result<()> {
     let fd = os::AsyncStdioFd::duplicate(fd)?;
     let mut buf = vec![0u8; STDIO_BUFFER_LEN];
     loop {
-        let n = recv.read(&mut buf).await?.unwrap_or(0);
+        let n = recv.read(&mut buf).await?;
         if n == 0 {
             return Ok(());
         }
@@ -264,7 +265,7 @@ async fn quic_to_stdio(mut recv: quinn::RecvStream, fd: i32) -> Result<()> {
     }
 }
 
-async fn expect_session_ready(mut recv: quinn::RecvStream) -> Result<quinn::RecvStream> {
+async fn expect_session_ready(mut recv: RecvStream) -> Result<RecvStream> {
     match read_frame::<StreamResponse>(&mut recv).await? {
         StreamResponse::SessionReady => Ok(recv),
         StreamResponse::Error(err) => bail!("{err}"),
@@ -272,7 +273,7 @@ async fn expect_session_ready(mut recv: quinn::RecvStream) -> Result<quinn::Recv
     }
 }
 
-async fn read_exit_status(conn: quinn::Connection) -> Result<ProcessExit> {
+async fn read_exit_status(conn: Connection) -> Result<ProcessExit> {
     loop {
         let mut recv = conn.accept_uni().await?;
         match read_frame::<StreamOpen>(&mut recv).await? {

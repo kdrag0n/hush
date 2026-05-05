@@ -11,8 +11,6 @@ pub const DEFAULT_MAX_FORWARD_STREAMS_PER_CONNECTION: usize = 64;
 pub struct ServerConfigFile {
     pub listen: Option<SocketAddr>,
     pub data_dir: Option<std::path::PathBuf>,
-    pub host_cert_path: Option<std::path::PathBuf>,
-    pub host_key_path: Option<std::path::PathBuf>,
     pub authorized_keys_path: Option<std::path::PathBuf>,
     pub allow_users: Option<Vec<String>>,
     pub allow_tcp_forwarding: Option<bool>,

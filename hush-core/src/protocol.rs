@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, bail};
-use quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
 
@@ -111,7 +110,10 @@ pub enum StreamOpen {
     RemoteTcpForward { target: TcpTarget },
 }
 
-pub async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<()> {
+pub async fn write_frame<T>(send: &mut (impl AsyncWrite + Unpin), value: &T) -> Result<()>
+where
+    T: Serialize,
+{
     let bytes = postcard::to_allocvec(value).context("serialize frame")?;
     if bytes.len() > MAX_FRAME_LEN {
         bail!("frame too large: {} bytes", bytes.len());
@@ -121,7 +123,10 @@ pub async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Resu
     Ok(())
 }
 
-pub async fn read_frame<T: for<'de> Deserialize<'de>>(recv: &mut RecvStream) -> Result<T> {
+pub async fn read_frame<T>(recv: &mut (impl AsyncRead + Unpin)) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
     let len = recv.read_u32().await? as usize;
     if len > MAX_FRAME_LEN {
         bail!("frame too large: {len} bytes");

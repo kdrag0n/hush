@@ -1,9 +1,9 @@
 use crate::{
-    net::{copy_quic_to_writer, copy_reader_to_quic},
+    net::{copy_reader_to_stream, copy_stream_to_writer},
     protocol::{StreamOpen, TcpTarget, read_frame, write_frame},
+    transport::{Connection, RecvStream, SendStream},
 };
 use anyhow::{Context, Result};
-use quinn::{Connection, RecvStream, SendStream};
 use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Debug, Clone)]
@@ -46,7 +46,7 @@ async fn open_local_forward_stream(
 ) -> Result<()> {
     let (mut send, recv) = conn.open_bi().await?;
     write_frame(&mut send, &StreamOpen::LocalTcpForward { target }).await?;
-    bridge_tcp_quic(tcp, send, recv).await
+    bridge_tcp_streams(tcp, send, recv).await
 }
 
 pub async fn serve_local_forward_stream(
@@ -57,7 +57,7 @@ pub async fn serve_local_forward_stream(
     let tcp = TcpStream::connect((target.host.as_str(), target.port))
         .await
         .with_context(|| format!("connect remote target {}:{}", target.host, target.port))?;
-    bridge_tcp_quic(tcp, send, recv).await
+    bridge_tcp_streams(tcp, send, recv).await
 }
 
 pub async fn serve_remote_forward_stream(send: SendStream, mut recv: RecvStream) -> Result<()> {
@@ -68,7 +68,7 @@ pub async fn serve_remote_forward_stream(send: SendStream, mut recv: RecvStream)
     let tcp = TcpStream::connect((target.host.as_str(), target.port))
         .await
         .with_context(|| format!("connect local target {}:{}", target.host, target.port))?;
-    bridge_tcp_quic(tcp, send, recv).await
+    bridge_tcp_streams(tcp, send, recv).await
 }
 
 pub async fn run_remote_forward_listener(
@@ -104,13 +104,13 @@ async fn open_remote_forward_stream(
 ) -> Result<()> {
     let (mut send, recv) = conn.open_bi().await?;
     write_frame(&mut send, &StreamOpen::RemoteTcpForward { target }).await?;
-    bridge_tcp_quic(tcp, send, recv).await
+    bridge_tcp_streams(tcp, send, recv).await
 }
 
-async fn bridge_tcp_quic(tcp: TcpStream, send: SendStream, recv: RecvStream) -> Result<()> {
+async fn bridge_tcp_streams(tcp: TcpStream, send: SendStream, recv: RecvStream) -> Result<()> {
     let (read_half, write_half) = tcp.into_split();
-    let a = tokio::spawn(copy_reader_to_quic(read_half, send));
-    let b = tokio::spawn(copy_quic_to_writer(recv, write_half));
+    let a = tokio::spawn(copy_reader_to_stream(read_half, send));
+    let b = tokio::spawn(copy_stream_to_writer(recv, write_half));
     let (ra, rb) = tokio::join!(a, b);
     ra??;
     rb??;

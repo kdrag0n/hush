@@ -8,8 +8,6 @@ license.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 hush-core = { path = "../hush-core" }
-quinn.workspace = true
-rustls-pki-types.workspace = true
 ssh-key.workspace = true
 tokio.workspace = true
 tracing.workspace = true

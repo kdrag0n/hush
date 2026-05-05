@@ -1,15 +1,15 @@
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use sha2::{Digest, Sha256};
+use signature::{Signer, Verifier};
 use ssh_key::{
-    Algorithm, PrivateKey, PublicKey,
+    Algorithm, PrivateKey, PublicKey, Signature,
     public::{Ed25519PublicKey, KeyData},
 };
 use std::{
     env, fs,
     path::{Path, PathBuf},
 };
-use x509_parser::prelude::FromDer;
 
 #[derive(Debug, Clone)]
 pub struct LoadedIdentity {
@@ -19,8 +19,8 @@ pub struct LoadedIdentity {
 
 #[derive(Debug, Clone)]
 pub enum IdentityKey {
-    Agent { socket: PathBuf, spki_der: Vec<u8> },
-    File { private_key_der: Vec<u8> },
+    Agent { socket: PathBuf },
+    File { private_key: PrivateKey },
 }
 
 pub fn load_identity() -> Result<LoadedIdentity> {
@@ -70,11 +70,10 @@ fn load_identity_from_agent() -> Result<Option<LoadedIdentity>> {
                 continue;
             }
         }
-        let spki_der = ed25519_public_key_to_spki(&public_key)?;
         tracing::debug!("using Ed25519 identity from ssh-agent");
         return Ok(Some(LoadedIdentity {
             public_key,
-            key: IdentityKey::Agent { socket, spki_der },
+            key: IdentityKey::Agent { socket },
         }));
     }
     Ok(None)
@@ -115,11 +114,10 @@ fn load_identity_from_agent_matching(preferred: &PublicKey) -> Result<Option<Loa
         {
             continue;
         }
-        let spki_der = ed25519_public_key_to_spki(&public_key)?;
         tracing::debug!("using matching Ed25519 identity from ssh-agent");
         return Ok(Some(LoadedIdentity {
             public_key,
-            key: IdentityKey::Agent { socket, spki_der },
+            key: IdentityKey::Agent { socket },
         }));
     }
     Ok(None)
@@ -136,14 +134,9 @@ pub fn load_identity_from_file(path: &Path) -> Result<LoadedIdentity> {
     if key.algorithm() != Algorithm::Ed25519 {
         bail!("only Ed25519 SSH keys are supported for now");
     }
-    let keypair = key
-        .key_data()
-        .ed25519()
-        .context("private key is not Ed25519")?;
-    let private_key_der = ed25519_seed_to_pkcs8_der(keypair.private.as_ref());
     Ok(LoadedIdentity {
         public_key: key.public_key().clone(),
-        key: IdentityKey::File { private_key_der },
+        key: IdentityKey::File { private_key: key },
     })
 }
 
@@ -159,20 +152,46 @@ pub fn agent_sign(socket: &Path, public_key: &PublicKey, message: &[u8]) -> Resu
     Ok(sig.as_bytes().to_vec())
 }
 
-pub fn public_key_from_cert_der(cert_der: &[u8]) -> Result<PublicKey> {
-    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(cert_der)
-        .context("parse peer certificate")?;
-    let raw = &cert.public_key().subject_public_key.data;
-    let ed = Ed25519PublicKey::try_from(raw.as_ref()).context("extract Ed25519 public key")?;
-    Ok(PublicKey::new(KeyData::Ed25519(ed), "hush-client"))
+pub fn sign_identity(identity: &LoadedIdentity, message: &[u8]) -> Result<Vec<u8>> {
+    match &identity.key {
+        IdentityKey::Agent { socket } => agent_sign(socket, &identity.public_key, message),
+        IdentityKey::File { private_key } => {
+            let sig: Signature = private_key.try_sign(message).context("sign with SSH key")?;
+            if sig.algorithm() != Algorithm::Ed25519 {
+                bail!("private key returned non-Ed25519 signature");
+            }
+            Ok(sig.as_bytes().to_vec())
+        }
+    }
 }
 
-pub fn cert_fingerprint(cert_der: &[u8]) -> String {
-    let digest = Sha256::digest(cert_der);
+pub fn verify_public_key_signature(
+    key: &PublicKey,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<()> {
+    let sig = Signature::new(Algorithm::Ed25519, signature).context("parse SSH signature")?;
+    Verifier::verify(key, message, &sig).context("verify SSH public key signature")
+}
+
+pub fn bytes_fingerprint(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
     format!(
         "SHA256:{}",
         base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest)
     )
+}
+
+pub fn ed25519_public_key_bytes(public_key: &PublicKey) -> Result<&[u8; 32]> {
+    match public_key.key_data() {
+        KeyData::Ed25519(key) => Ok(key.as_ref()),
+        _ => bail!("only Ed25519 SSH keys are supported for now"),
+    }
+}
+
+pub fn ed25519_public_key_from_bytes(bytes: &[u8]) -> Result<PublicKey> {
+    let ed = Ed25519PublicKey::try_from(bytes).context("parse raw Ed25519 public key")?;
+    Ok(PublicKey::new(KeyData::Ed25519(ed), "hush-client"))
 }
 
 pub fn public_key_fingerprint(key: &PublicKey) -> Result<String> {
@@ -238,26 +257,6 @@ pub fn can_login_as(user: &str) -> bool {
 
 pub fn home_for_user(user: &str) -> Result<Option<PathBuf>> {
     crate::os::home_for_user(user)
-}
-
-fn ed25519_seed_to_pkcs8_der(seed: &[u8; 32]) -> Vec<u8> {
-    let mut der = hex::decode("302e020100300506032b657004220420").expect("valid pkcs8 prefix");
-    der.extend_from_slice(seed);
-    der
-}
-
-pub fn ed25519_public_key_to_spki(public_key: &PublicKey) -> Result<Vec<u8>> {
-    let raw = ed25519_public_key_bytes(public_key)?;
-    let mut der = hex::decode("302a300506032b6570032100").expect("valid spki prefix");
-    der.extend_from_slice(raw);
-    Ok(der)
-}
-
-pub fn ed25519_public_key_bytes(public_key: &PublicKey) -> Result<&[u8; 32]> {
-    match public_key.key_data() {
-        KeyData::Ed25519(key) => Ok(key.as_ref()),
-        _ => bail!("only Ed25519 SSH keys are supported for now"),
-    }
 }
 
 fn preferred_public_key() -> Option<PublicKey> {

@@ -1,12 +1,10 @@
 use crate::cli::Args;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use hush_core::{
-    auth,
     config::{self, ServerRuntimeConfig},
     protocol::{StreamOpen, StreamResponse, read_frame, write_frame},
+    transport::{Connection, Listener},
 };
-use quinn::Endpoint;
-use rustls_pki_types::CertificateDer;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::Semaphore;
 
@@ -29,8 +27,6 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     } else {
         file_cfg.listen.unwrap_or(args.listen)
     };
-    let host_cert = args.host_cert.or(file_cfg.host_cert_path);
-    let host_key = args.host_key.or(file_cfg.host_key_path);
     let runtime_config = ServerRuntimeConfig {
         authorized_keys_path: args.authorized_keys.or(file_cfg.authorized_keys_path),
         allow_users: if args.allow_user.is_empty() {
@@ -61,10 +57,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             .unwrap_or(config::DEFAULT_MAX_FORWARD_STREAMS_PER_CONNECTION),
     };
 
-    let server_config =
-        hush_core::tls::make_server_config(&data_dir, host_cert.as_deref(), host_key.as_deref())?;
-    let endpoint = Endpoint::server(server_config, listen)?;
-    let local_addr = endpoint.local_addr()?;
+    let mut listener = Listener::bind(listen, data_dir).await?;
+    let local_addr = listener.local_addr();
     tracing::info!(
         addr = %local_addr,
         max_connections = runtime_config.max_connections,
@@ -75,41 +69,31 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     );
 
     let connection_slots = Arc::new(Semaphore::new(runtime_config.max_connections));
-    while let Some(connecting) = endpoint.accept().await {
+    loop {
         let permit = match connection_slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 tracing::warn!("rejecting connection because max_connections is reached");
-                tokio::spawn(async move {
-                    if let Ok(conn) = connecting.await {
-                        conn.close(0u32.into(), b"server connection limit reached");
-                    }
-                });
+                let conn = listener.accept().await?;
+                conn.close();
                 continue;
             }
         };
+        let conn = listener.accept().await?;
         let runtime_config = runtime_config.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            match connecting.await {
-                Ok(conn) => {
-                    if let Err(err) = handle_connection(conn, runtime_config, local_addr).await {
-                        tracing::warn!(%err, "connection failed");
-                    }
-                }
-                Err(err) => tracing::warn!(%err, "accept failed"),
+            if let Err(err) = handle_connection(conn, runtime_config, local_addr).await {
+                tracing::warn!(%err, "connection failed");
             }
         });
     }
-    Ok(())
 }
 
 fn empty_file_config() -> config::ServerConfigFile {
     config::ServerConfigFile {
         listen: None,
         data_dir: None,
-        host_cert_path: None,
-        host_key_path: None,
         authorized_keys_path: None,
         allow_users: None,
         allow_tcp_forwarding: None,
@@ -121,11 +105,11 @@ fn empty_file_config() -> config::ServerConfigFile {
 }
 
 async fn handle_connection(
-    conn: quinn::Connection,
+    conn: Connection,
     config: ServerRuntimeConfig,
     server_addr: SocketAddr,
 ) -> Result<()> {
-    let peer_key = peer_public_key(&conn)?;
+    let peer_key = conn.peer_public_key();
     let mut remote_forwards = 0usize;
     loop {
         let (mut send, mut recv) = conn.accept_bi().await?;
@@ -137,7 +121,7 @@ async fn handle_connection(
                         &StreamResponse::Error("TCP forwarding is disabled".to_owned()),
                     )
                     .await?;
-                    send.finish()?;
+                    send.finish().await?;
                     continue;
                 }
                 if remote_forwards >= config.max_forwards_per_connection {
@@ -146,7 +130,7 @@ async fn handle_connection(
                         &StreamResponse::Error("remote forward limit reached".to_owned()),
                     )
                     .await?;
-                    send.finish()?;
+                    send.finish().await?;
                     continue;
                 }
                 remote_forwards += 1;
@@ -164,7 +148,7 @@ async fn handle_connection(
                     }
                 });
                 write_frame(&mut send, &StreamResponse::Ok).await?;
-                send.finish()?;
+                send.finish().await?;
             }
             StreamOpen::Session { request: session } => {
                 if config.max_sessions_per_connection == 0 {
@@ -173,7 +157,7 @@ async fn handle_connection(
                         &StreamResponse::Error("session limit reached".to_owned()),
                     )
                     .await?;
-                    send.finish()?;
+                    send.finish().await?;
                     continue;
                 }
                 return match hush_core::session::run_server_session(
@@ -199,15 +183,4 @@ async fn handle_connection(
             }
         };
     }
-}
-
-fn peer_public_key(conn: &quinn::Connection) -> Result<ssh_key::PublicKey> {
-    let identity = conn
-        .peer_identity()
-        .context("client did not present a certificate")?;
-    let certs = identity
-        .downcast::<Vec<CertificateDer<'static>>>()
-        .map_err(|_| anyhow::anyhow!("unexpected peer identity type"))?;
-    let cert = certs.first().context("client certificate chain is empty")?;
-    auth::public_key_from_cert_der(cert.as_ref())
 }

@@ -14,9 +14,8 @@ use hush_core::{
         OpenSession, RemoteForwardRequest, SessionMode, StreamOpen, StreamResponse, TcpTarget,
         read_frame, write_frame,
     },
+    transport::RecvStream,
 };
-use quinn::Endpoint;
-use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,15 +37,7 @@ async fn main() -> Result<()> {
     let identity_file = args.identity_file.or(ssh_cfg.identity_file);
 
     let identity = auth::load_identity_with_file(identity_file.as_deref())?;
-    let mut endpoint = Endpoint::client("[::]:0".parse::<SocketAddr>()?)?;
-    endpoint.set_default_client_config(hush_core::tls::make_client_config(
-        &data_dir,
-        hush_core::tls::host_key(&host, port),
-        identity,
-        args.insecure,
-    )?);
-
-    let conn = net::connect_any(&endpoint, &host, port).await?;
+    let conn = net::connect_any(&host, port, &data_dir, identity, args.insecure).await?;
 
     for spec in args.local_forward.iter().cloned() {
         let conn = conn.clone();
@@ -92,7 +83,7 @@ async fn main() -> Result<()> {
             }),
         )
         .await?;
-        send.finish()?;
+        send.finish().await?;
         expect_ok(&mut recv).await?;
     }
 
@@ -111,7 +102,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn expect_ok(recv: &mut quinn::RecvStream) -> Result<()> {
+async fn expect_ok(recv: &mut RecvStream) -> Result<()> {
     match read_frame::<StreamResponse>(recv).await? {
         StreamResponse::Ok => Ok(()),
         StreamResponse::Error(err) => bail!("{err}"),

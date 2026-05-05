@@ -157,10 +157,8 @@ fn server_uses_server_subdir_for_config_and_host_key() {
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "server-subdir-ok");
-    assert!(env.data.join("server/host_cert.der").exists());
-    assert!(env.data.join("server/host_key.der").exists());
-    assert!(!env.data.join("host_cert.der").exists());
-    assert!(!env.data.join("host_key.der").exists());
+    assert!(env.data.join("server/host_key.noise").exists());
+    assert!(!env.data.join("host_key.noise").exists());
 }
 
 #[test]
@@ -520,7 +518,7 @@ fn tofu_mismatch_fails_without_insecure() {
         .output()
         .unwrap();
     assert!(!out.status.success(), "{out:?}");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("host certificate mismatch"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("host key mismatch"));
 }
 
 fn ensure_server_built() {

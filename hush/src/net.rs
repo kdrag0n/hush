@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use quinn::{Connection, Endpoint};
+use hush_core::{auth::LoadedIdentity, transport::Connection};
 use std::{collections::VecDeque, net::SocketAddr};
 use tokio::{
     task::JoinSet,
@@ -9,14 +9,31 @@ use tokio::{
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub(crate) async fn connect_any(endpoint: &Endpoint, host: &str, port: u16) -> Result<Connection> {
-    match tokio::time::timeout(CONNECT_TIMEOUT, connect_any_inner(endpoint, host, port)).await {
+pub(crate) async fn connect_any(
+    host: &str,
+    port: u16,
+    data_dir: &std::path::Path,
+    identity: LoadedIdentity,
+    insecure: bool,
+) -> Result<Connection> {
+    match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        connect_any_inner(host, port, data_dir, identity, insecure),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(_) => bail!("connect to {host}:{port}: timed out after 60s"),
     }
 }
 
-async fn connect_any_inner(endpoint: &Endpoint, host: &str, port: u16) -> Result<Connection> {
+async fn connect_any_inner(
+    host: &str,
+    port: u16,
+    data_dir: &std::path::Path,
+    identity: LoadedIdentity,
+    insecure: bool,
+) -> Result<Connection> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
         .with_context(|| format!("resolve {host}:{port}"))?
@@ -30,7 +47,7 @@ async fn connect_any_inner(endpoint: &Endpoint, host: &str, port: u16) -> Result
     let label = format!("{host}:{port}");
 
     if let Some(addr) = pending.pop_front() {
-        spawn_connect_attempt(&mut attempts, endpoint, addr, host, &label);
+        spawn_connect_attempt(&mut attempts, addr, &label, data_dir, &identity, insecure);
     }
 
     let mut last_err = None;
@@ -41,7 +58,7 @@ async fn connect_any_inner(endpoint: &Endpoint, host: &str, port: u16) -> Result
         }
         if attempts.is_empty() {
             if let Some(addr) = pending.pop_front() {
-                spawn_connect_attempt(&mut attempts, endpoint, addr, host, &label);
+                spawn_connect_attempt(&mut attempts, addr, &label, data_dir, &identity, insecure);
                 next_attempt_at =
                     (!pending.is_empty()).then(|| Instant::now() + HAPPY_EYEBALLS_DELAY);
                 continue;
@@ -64,7 +81,7 @@ async fn connect_any_inner(endpoint: &Endpoint, host: &str, port: u16) -> Result
                     }
                     _ = tokio::time::sleep_until(deadline) => {
                         if let Some(addr) = pending.pop_front() {
-                            spawn_connect_attempt(&mut attempts, endpoint, addr, host, &label);
+                            spawn_connect_attempt(&mut attempts, addr, &label, data_dir, &identity, insecure);
                         }
                         next_attempt_at =
                             (!pending.is_empty()).then(|| Instant::now() + HAPPY_EYEBALLS_DELAY);
@@ -84,18 +101,18 @@ async fn connect_any_inner(endpoint: &Endpoint, host: &str, port: u16) -> Result
 
 fn spawn_connect_attempt(
     attempts: &mut JoinSet<Result<Connection>>,
-    endpoint: &Endpoint,
     addr: SocketAddr,
-    server_name: &str,
     label: &str,
+    data_dir: &std::path::Path,
+    identity: &LoadedIdentity,
+    insecure: bool,
 ) {
-    let endpoint = endpoint.clone();
-    let server_name = server_name.to_owned();
     let label = label.to_owned();
+    let host_key = label.clone();
+    let data_dir = data_dir.to_owned();
+    let identity = identity.clone();
     attempts.spawn(async move {
-        endpoint
-            .connect(addr, &server_name)
-            .with_context(|| format!("start QUIC connect to {addr} for {label}"))?
+        Connection::connect(addr, &host_key, &data_dir, identity, insecure)
             .await
             .with_context(|| format!("connect to {addr} for {label}"))
     });

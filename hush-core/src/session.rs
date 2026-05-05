@@ -1,7 +1,7 @@
 use crate::{
     auth,
     config::ServerRuntimeConfig,
-    net::{copy_quic_to_writer, copy_reader_to_quic},
+    net::{copy_reader_to_stream, copy_stream_to_writer},
     os::{
         AsyncPty, configure_child_pre_exec, dup_fd, open_pty, process_exit_from_status,
         send_process_group_signal, set_nonblocking, shell_for_user, tty_name,
@@ -10,9 +10,9 @@ use crate::{
         EnvVar, OpenSession, ProcessExit, RemoteSignal, SessionMode, StreamOpen, StreamResponse,
         TermSize, read_frame, write_frame,
     },
+    transport::{Connection, RecvStream, SendStream},
 };
 use anyhow::{Context, Result, bail};
-use quinn::{Connection, RecvStream, SendStream};
 use std::{
     ffi::CString,
     net::SocketAddr,
@@ -32,7 +32,7 @@ struct ConnectionEnv {
 impl ConnectionEnv {
     fn from_connection(conn: &Connection, server_addr: SocketAddr) -> Self {
         let remote = conn.remote_address();
-        let local_ip = conn.local_ip().unwrap_or_else(|| server_addr.ip());
+        let local_ip = conn.local_address().ip();
         let local_port = server_addr.port();
         Self {
             ssh_client: format!("{} {} {}", remote.ip(), remote.port(), local_port),
@@ -209,15 +209,13 @@ pub async fn run_server_session(
 
 async fn send_response_error(send: &mut SendStream, msg: &str) {
     let _ = write_frame(send, &StreamResponse::Error(msg.to_owned())).await;
-    let _ = send.finish();
-    let _ = send.stopped().await;
+    let _ = send.finish().await;
 }
 
 async fn send_session_end(conn: &Connection, header: StreamOpen) -> Result<()> {
     let mut send = conn.open_uni().await?;
     write_frame(&mut send, &header).await?;
-    send.finish()?;
-    let _ = send.stopped().await;
+    send.finish().await?;
     Ok(())
 }
 
@@ -243,9 +241,9 @@ async fn run_pipes(
     let stdout = child.stdout.take().context("child stdout missing")?;
     let stderr = child.stderr.take().context("child stderr missing")?;
 
-    let in_task = tokio::spawn(copy_quic_to_writer(recv, stdin));
-    let out_task = tokio::spawn(copy_reader_to_quic(stdout, send));
-    let err_task = tokio::spawn(copy_reader_to_quic(stderr, err_send));
+    let in_task = tokio::spawn(copy_stream_to_writer(recv, stdin));
+    let out_task = tokio::spawn(copy_reader_to_stream(stdout, send));
+    let err_task = tokio::spawn(copy_reader_to_stream(stderr, err_send));
     let status = loop {
         tokio::select! {
             status = child.wait() => break status.context("wait for remote command")?,
@@ -297,8 +295,8 @@ async fn run_pty(
             }
         }
     });
-    let in_task = tokio::spawn(copy_quic_to_pty(recv, pty_master.clone()));
-    let out_task = tokio::spawn(copy_pty_to_quic(pty_master, send));
+    let in_task = tokio::spawn(copy_stream_to_pty(recv, pty_master.clone()));
+    let out_task = tokio::spawn(copy_pty_to_stream(pty_master, send));
     let status = loop {
         tokio::select! {
             status = child.wait() => break status.context("wait for remote pty command")?,
@@ -317,14 +315,13 @@ async fn run_pty(
     Ok(process_exit_from_status(status))
 }
 
-async fn copy_pty_to_quic(mut pty: AsyncPty, mut send: SendStream) -> Result<()> {
+async fn copy_pty_to_stream(mut pty: AsyncPty, mut send: SendStream) -> Result<()> {
     tokio::io::copy(&mut pty, &mut send).await?;
-    send.finish()?;
-    let _ = send.stopped().await;
+    send.finish().await?;
     Ok(())
 }
 
-async fn copy_quic_to_pty(mut recv: RecvStream, mut pty: AsyncPty) -> Result<()> {
+async fn copy_stream_to_pty(mut recv: RecvStream, mut pty: AsyncPty) -> Result<()> {
     tokio::io::copy(&mut recv, &mut pty).await?;
     Ok(())
 }
