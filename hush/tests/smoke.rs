@@ -3,7 +3,7 @@ use std::{
     net::{TcpListener, UdpSocket},
     os::unix::process::ExitStatusExt,
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::OnceLock,
     thread,
     time::{Duration, Instant},
@@ -89,6 +89,13 @@ impl TestEnv {
             .unwrap();
         self.server = Some(child);
         thread::sleep(Duration::from_millis(350));
+    }
+
+    fn stop_server(&mut self) {
+        if let Some(mut server) = self.server.take() {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
     }
 
     fn hush(&self) -> Command {
@@ -195,6 +202,49 @@ fn domain_name_target_works() {
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "domain-ok");
+}
+
+#[test]
+fn stateless_reset_after_server_restart_closes_client() {
+    use std::io::{Read, Write};
+
+    let mut env = TestEnv::new();
+    env.start_server();
+    let mut client = env
+        .hush()
+        .arg("-T")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    client
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"before\n")
+        .unwrap();
+    let mut before = [0u8; 7];
+    client
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut before)
+        .unwrap();
+    assert_eq!(&before, b"before\n");
+
+    env.stop_server();
+    env.start_server();
+    let _ = client.stdin.as_mut().unwrap().write_all(b"after\n");
+    let status = wait_for_child_exit(&mut client, Duration::from_secs(5)).unwrap_or_else(|| {
+        let _ = client.kill();
+        let _ = client.wait();
+        panic!("client did not exit after server restart");
+    });
+    assert!(!status.success(), "{status:?}");
 }
 
 #[test]
@@ -571,6 +621,19 @@ fn wait_for_tcp(port: u16) {
         thread::sleep(Duration::from_millis(50));
     }
     panic!("tcp port {port} did not open");
+}
+
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        if start.elapsed() >= timeout {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn http_get(port: u16) -> String {

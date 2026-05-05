@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use aws_lc_rs::{hmac, rand};
 use quinn::EndpointConfig;
+use quinn_proto::HashedConnectionIdGenerator;
 use std::{
     fs,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -12,10 +13,14 @@ const STATELESS_RESET_KEY_LEN: usize = 64;
 
 pub fn server_endpoint_config(data_dir: &Path) -> Result<EndpointConfig> {
     let key = load_or_create_stateless_reset_key(data_dir)?;
-    Ok(EndpointConfig::new(Arc::new(hmac::Key::new(
-        hmac::HMAC_SHA256,
-        &key,
-    ))))
+    let cid_key = cid_generator_key_from_reset_key(&key);
+    let mut config = EndpointConfig::new(Arc::new(hmac::Key::new(hmac::HMAC_SHA256, &key)));
+    config.cid_generator(move || Box::new(HashedConnectionIdGenerator::from_key(cid_key)));
+    Ok(config)
+}
+
+fn cid_generator_key_from_reset_key(key: &[u8; STATELESS_RESET_KEY_LEN]) -> u64 {
+    u64::from_le_bytes(key[..8].try_into().expect("slice length is fixed"))
 }
 
 fn load_or_create_stateless_reset_key(data_dir: &Path) -> Result<[u8; STATELESS_RESET_KEY_LEN]> {
@@ -76,5 +81,13 @@ mod tests {
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn cid_generator_key_is_stable() {
+        let mut key = [0u8; STATELESS_RESET_KEY_LEN];
+        key[..8].copy_from_slice(&1234u64.to_le_bytes());
+
+        assert_eq!(cid_generator_key_from_reset_key(&key), 1234);
     }
 }
