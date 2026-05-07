@@ -1,8 +1,16 @@
 # hush
 
-Modern fuss-free SSH.
+Modern fuss-free SSH over QUIC
 
-## Install server
+## Install
+
+Client:
+
+```sh
+brew install kdrag0n/tap/hush
+```
+
+Server:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/kdrag0n/hush/refs/heads/main/scripts/install-server.sh | sh
@@ -10,7 +18,6 @@ curl -fsSL https://raw.githubusercontent.com/kdrag0n/hush/refs/heads/main/script
 
 ## Features
 
-- Built on QUIC protocol
 - High performance on flaky networks
     - Aggressive retransmits and congestion control, similar to KCP
 - Roaming + long connection lifetime
