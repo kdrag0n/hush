@@ -35,6 +35,7 @@ const QUIC_FAST_PACKET_THRESHOLD: u32 = 3;
 const QUIC_FAST_TIME_THRESHOLD: f32 = 1.0;
 const QUIC_FAST_INITIAL_RTT: Duration = Duration::from_millis(100);
 const QUIC_FAST_ACK_DELAY: Duration = Duration::from_millis(1);
+const QUIC_CLIENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(75);
 
 #[derive(Debug, Clone)]
 struct KnownHosts {
@@ -138,7 +139,9 @@ pub fn make_client_config(
     };
     cfg.alpn_protocols = vec![ALPN.to_vec()];
     let mut quic_cfg = ClientConfig::new(Arc::new(QuicClientConfig::try_from(cfg)?));
-    quic_cfg.transport_config(Arc::new(long_idle_transport()?));
+    quic_cfg.transport_config(Arc::new(long_idle_transport(Some(
+        QUIC_CLIENT_KEEP_ALIVE_INTERVAL,
+    ))?));
     Ok(quic_cfg)
 }
 
@@ -157,7 +160,7 @@ pub fn make_server_config(
         .with_single_cert(vec![cert], key)?;
     cfg.alpn_protocols = vec![ALPN.to_vec()];
     let mut quic_cfg = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(cfg)?));
-    quic_cfg.transport = Arc::new(long_idle_transport()?);
+    quic_cfg.transport = Arc::new(long_idle_transport(None)?);
     Ok(quic_cfg)
 }
 
@@ -306,10 +309,10 @@ fn pq_provider() -> CryptoProvider {
     provider
 }
 
-fn long_idle_transport() -> Result<TransportConfig> {
+fn long_idle_transport(keep_alive_interval: Option<Duration>) -> Result<TransportConfig> {
     let mut transport = TransportConfig::default();
     transport.max_idle_timeout(Some(Duration::from_secs(7 * 24 * 60 * 60).try_into()?));
-    transport.keep_alive_interval(None);
+    transport.keep_alive_interval(keep_alive_interval);
     transport.send_window(QUIC_FAST_SEND_WINDOW);
     transport.stream_receive_window(VarInt::from_u32(QUIC_FAST_STREAM_RECV_WINDOW));
     transport.receive_window(VarInt::from_u32(QUIC_FAST_CONN_RECV_WINDOW));
