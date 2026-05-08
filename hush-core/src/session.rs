@@ -447,15 +447,22 @@ fn pty_argv(user: &str, command: &[String], use_shell: bool) -> Result<Vec<CStri
     let root_switch = crate::os::is_root() && user != auth::current_username();
     let args = if root_switch && command.is_empty() {
         #[cfg(target_os = "macos")]
-        let args = vec!["login".to_string(), "-fp".to_string(), user.to_string()];
+        {
+            vec!["login".to_string(), "-fp".to_string(), user.to_string()]
+        }
         #[cfg(target_os = "linux")]
-        let args = vec![
-            "login".to_string(),
-            "-p".to_string(),
-            "-f".to_string(),
-            user.to_string(),
-        ];
-        args
+        {
+            vec![
+                "login".to_string(),
+                "-p".to_string(),
+                "-f".to_string(),
+                user.to_string(),
+            ]
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            bail!("user switching is unsupported on this platform");
+        }
     } else if root_switch {
         vec![
             "su".to_string(),
