@@ -35,7 +35,7 @@ const QUIC_FAST_PACKET_THRESHOLD: u32 = 3;
 const QUIC_FAST_TIME_THRESHOLD: f32 = 1.0;
 const QUIC_FAST_INITIAL_RTT: Duration = Duration::from_millis(100);
 const QUIC_FAST_ACK_DELAY: Duration = Duration::from_millis(1);
-const QUIC_CLIENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(75);
+const QUIC_CLIENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Clone)]
 struct KnownHosts {
