@@ -444,27 +444,52 @@ fn allowed_env_key(key: &str) -> bool {
 }
 
 fn pty_argv(user: &str, command: &[String], use_shell: bool) -> Result<Vec<CString>> {
-    let root_switch = crate::os::is_root() && user != auth::current_username();
-    let args = if root_switch && command.is_empty() {
+    let args = pty_argv_strings(
+        crate::os::is_root(),
+        &auth::current_username(),
+        user,
+        command,
+        use_shell,
+    )?;
+    args.into_iter()
+        .map(|s| CString::new(s).context("argument contains NUL"))
+        .collect()
+}
+
+fn pty_argv_strings(
+    is_root: bool,
+    current_user: &str,
+    user: &str,
+    command: &[String],
+    use_shell: bool,
+) -> Result<Vec<String>> {
+    let root_switch = is_root && user != current_user;
+    if is_root && command.is_empty() {
         #[cfg(target_os = "macos")]
         {
-            vec!["login".to_string(), "-fp".to_string(), user.to_string()]
+            return Ok(vec![
+                "login".to_string(),
+                "-fp".to_string(),
+                user.to_string(),
+            ]);
         }
         #[cfg(target_os = "linux")]
         {
-            vec![
+            return Ok(vec![
                 "login".to_string(),
                 "-p".to_string(),
                 "-f".to_string(),
                 user.to_string(),
-            ]
+            ]);
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             bail!("user switching is unsupported on this platform");
         }
-    } else if root_switch {
-        vec![
+    }
+
+    if root_switch {
+        return Ok(vec![
             "su".to_string(),
             "-l".to_string(),
             user.to_string(),
@@ -474,21 +499,18 @@ fn pty_argv(user: &str, command: &[String], use_shell: bool) -> Result<Vec<CStri
             } else {
                 exec_argv_command(command)
             },
-        ]
+        ]);
+    }
+
+    let shell = shell_for_user(user)
+        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
+    if command.is_empty() {
+        Ok(vec![shell])
+    } else if !use_shell {
+        Ok(command.to_vec())
     } else {
-        let shell = shell_for_user(user)
-            .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
-        if command.is_empty() {
-            vec![shell]
-        } else if !use_shell {
-            command.to_vec()
-        } else {
-            vec![shell, "-lc".to_string(), shell_words::join(command)]
-        }
-    };
-    args.into_iter()
-        .map(|s| CString::new(s).context("argument contains NUL"))
-        .collect()
+        Ok(vec![shell, "-lc".to_string(), shell_words::join(command)])
+    }
 }
 
 fn exec_argv_command(command: &[String]) -> String {
@@ -498,4 +520,20 @@ fn exec_argv_command(command: &[String]) -> String {
         script.push_str(&shell_words::quote(arg));
     }
     script
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_pty_login_shell_uses_login_even_for_root_user() {
+        let argv = pty_argv_strings(true, "root", "root", &[], true).unwrap();
+
+        #[cfg(target_os = "linux")]
+        assert_eq!(argv, ["login", "-p", "-f", "root"]);
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(argv, ["login", "-fp", "root"]);
+    }
 }
