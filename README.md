@@ -10,6 +10,13 @@ Client:
 brew install kdrag0n/tap/hush
 ```
 
+Copy files:
+
+```sh
+hush cp ./build.tar user@example.com:/tmp/build.tar
+hcp user@example.com:/var/log/app.log ./app.log
+```
+
 Server:
 
 ```sh
@@ -32,6 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/kdrag0n/hush/refs/heads/main/script
 - Server can run as root (multi-user mode) or as an unprivileged user (single-user mode)
 - Classic SSH features:
     - Local and remote TCP port forwarding
+    - File copy with `hush cp` / `hcp`
     - `~.` escape to disconnect
     - PTY and piped modes with separate stdin/stdout/stderr
     - Login shells

@@ -59,6 +59,39 @@ pub struct RemoteForwardRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileCopyDirection {
+    Upload,
+    Download,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileCopyCompression {
+    None,
+    Zstd,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileCopyEntry {
+    pub path: String,
+    pub archive_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileCopyRequest {
+    pub direction: FileCopyDirection,
+    pub user: String,
+    pub entries: Vec<FileCopyEntry>,
+    pub destination: String,
+    pub compression: FileCopyCompression,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileCopyPlan {
+    pub extract_dir: String,
+    pub entries: Vec<FileCopyEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteSignal {
     SIGABRT,
     SIGALRM,
@@ -89,6 +122,7 @@ impl RemoteSignal {
 pub enum StreamResponse {
     Ok,
     SessionReady,
+    FileCopyReady(FileCopyPlan),
     Error(String),
 }
 
@@ -109,6 +143,7 @@ pub enum StreamOpen {
     OpenRemoteForward(RemoteForwardRequest),
     LocalTcpForward { target: TcpTarget },
     RemoteTcpForward { target: TcpTarget },
+    FileCopy(FileCopyRequest),
 }
 
 pub async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<()> {

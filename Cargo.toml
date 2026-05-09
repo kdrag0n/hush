@@ -9,6 +9,8 @@ repository = "https://example.invalid/hush"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+astral-tokio-tar = "0.6.1"
+async-compression = { version = "0.4.42", features = ["tokio", "zstd"] }
 aws-lc-rs = "1.15.1"
 base64 = "0.22.1"
 clap = { version = "4.5.51", features = ["derive"] }

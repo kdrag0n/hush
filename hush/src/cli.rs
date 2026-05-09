@@ -2,6 +2,31 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use std::path::PathBuf;
 
+#[derive(Debug)]
+pub(crate) enum Cli {
+    Session(Args),
+    Copy(crate::cp::CpArgs),
+}
+
+impl Cli {
+    pub(crate) fn parse_from_env() -> Result<Self> {
+        let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        let argv0 = args
+            .first()
+            .and_then(|arg| std::path::Path::new(arg).file_stem())
+            .and_then(|arg| arg.to_str())
+            .unwrap_or("hush");
+        if argv0 == "hcp" {
+            return Ok(Self::Copy(crate::cp::CpArgs::parse_from(args)));
+        }
+        if args.get(1).and_then(|arg| arg.to_str()) == Some("cp") {
+            args.remove(1);
+            return Ok(Self::Copy(crate::cp::CpArgs::parse_from(args)));
+        }
+        Ok(Self::Session(Args::parse_from(args)))
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "hush",
@@ -77,7 +102,7 @@ pub(crate) struct ForwardArg {
     pub(crate) target_port: u16,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Target {
     pub(crate) user: Option<String>,
     pub(crate) host: String,

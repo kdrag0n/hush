@@ -3,6 +3,7 @@ pub mod config;
 pub mod congestion;
 pub mod defaults;
 pub mod endpoint;
+pub mod filecopy;
 pub mod forwarding;
 pub mod net;
 pub mod os;

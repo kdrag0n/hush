@@ -1,9 +1,11 @@
 use crate::cli::Args;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use hush_core::{
     auth,
     config::{self, ServerRuntimeConfig},
-    protocol::{StreamOpen, StreamResponse, read_frame, write_frame},
+    protocol::{
+        FileCopyDirection, FileCopyRequest, StreamOpen, StreamResponse, read_frame, write_frame,
+    },
 };
 use quinn::{Endpoint, default_runtime};
 use rustls_pki_types::CertificateDer;
@@ -278,11 +280,57 @@ async fn handle_connection(
                     }
                 };
             }
+            StreamOpen::FileCopy(request) => {
+                if let Err(err) = authorize_file_copy(&mut send, &request, &peer_key, &config).await
+                {
+                    tracing::warn!(%err, "file copy rejected");
+                    continue;
+                }
+                let result = match request.direction {
+                    FileCopyDirection::Upload => {
+                        hush_core::filecopy::handle_upload(send, recv, request).await
+                    }
+                    FileCopyDirection::Download => {
+                        hush_core::filecopy::handle_download(send, request).await
+                    }
+                };
+                if let Err(err) = result {
+                    tracing::warn!(%err, "file copy failed");
+                }
+            }
             other => {
                 tracing::warn!(?other, "unexpected pre-session stream");
             }
         };
     }
+}
+
+async fn authorize_file_copy(
+    send: &mut quinn::SendStream,
+    request: &FileCopyRequest,
+    peer_key: &ssh_key::PublicKey,
+    config: &ServerRuntimeConfig,
+) -> Result<()> {
+    let peer_fp = auth::public_key_fingerprint(peer_key).unwrap_or_else(|_| "unknown".into());
+    tracing::info!(user = %request.user, key = %peer_fp, "file copy auth attempt");
+    let allowed_by_config = config.allow_users.is_empty()
+        || config.allow_users.iter().any(|user| user == &request.user);
+    let authorized = allowed_by_config
+        && auth::can_login_as(&request.user)
+        && auth::is_authorized(
+            &request.user,
+            peer_key,
+            config.authorized_keys_path.as_deref(),
+        )
+        .unwrap_or(false);
+    if authorized {
+        tracing::info!(user = %request.user, key = %peer_fp, "file copy auth accepted");
+        return Ok(());
+    }
+
+    write_frame(send, &StreamResponse::Error("unauthorized".to_owned())).await?;
+    send.finish()?;
+    bail!("unauthorized");
 }
 
 fn peer_public_key(conn: &quinn::Connection) -> Result<ssh_key::PublicKey> {

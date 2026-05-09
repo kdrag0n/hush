@@ -109,6 +109,32 @@ impl TestEnv {
         cmd
     }
 
+    fn hcp(&self) -> Command {
+        let mut cmd = Command::new(hush_bin());
+        cmd.arg("cp")
+            .env("HOME", &self.home)
+            .env_remove("SSH_AUTH_SOCK")
+            .arg("--data-dir")
+            .arg(self.home.join(".hush"))
+            .arg("-p")
+            .arg(self.port.to_string());
+        cmd
+    }
+
+    fn hcp_argv0(&self) -> Command {
+        let hcp = self.temp.path().join("hcp");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(hush_bin(), &hcp).unwrap();
+        let mut cmd = Command::new(hcp);
+        cmd.env("HOME", &self.home)
+            .env_remove("SSH_AUTH_SOCK")
+            .arg("--data-dir")
+            .arg(self.home.join(".hush"))
+            .arg("-p")
+            .arg(self.port.to_string());
+        cmd
+    }
+
     fn target(&self) -> String {
         self.target_for_host("127.0.0.1")
     }
@@ -314,6 +340,65 @@ fn openssh_connection_environment_is_set() {
     assert_eq!(connection[2], "127.0.0.1", "{out:?}");
     assert_eq!(connection[3], env.port.to_string(), "{out:?}");
     assert_eq!(lines[2], "unset", "{out:?}");
+}
+
+#[test]
+fn hcp_uploads_file_with_zstd() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let source = env.temp.path().join("local.txt");
+    let destination = env.temp.path().join("remote.txt");
+    fs::write(&source, "upload-ok\n").unwrap();
+
+    let out = env
+        .hcp()
+        .arg(&source)
+        .arg(format!("{}:{}", env.target(), destination.display()))
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(fs::read_to_string(destination).unwrap(), "upload-ok\n");
+}
+
+#[test]
+fn hcp_downloads_file_without_compression() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let source = env.temp.path().join("remote.txt");
+    let destination = env.temp.path().join("local.txt");
+    fs::write(&source, "download-ok\n").unwrap();
+
+    let out = env
+        .hcp()
+        .arg("-C")
+        .arg(format!("{}:{}", env.target(), source.display()))
+        .arg(&destination)
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(fs::read_to_string(destination).unwrap(), "download-ok\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn hcp_dispatches_from_argv0() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let source = env.temp.path().join("argv0-remote.txt");
+    let destination = env.temp.path().join("argv0-local.txt");
+    fs::write(&source, "argv0-ok\n").unwrap();
+
+    let out = env
+        .hcp_argv0()
+        .arg(format!("{}:{}", env.target(), source.display()))
+        .arg(&destination)
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(fs::read_to_string(destination).unwrap(), "argv0-ok\n");
 }
 
 #[test]
