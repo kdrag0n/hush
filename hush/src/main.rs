@@ -36,6 +36,7 @@ async fn main() -> Result<()> {
         hostname: config_hostname,
         port: config_port,
         identity_file: config_identity_file,
+        set_env,
         local_forwards,
         remote_forwards,
     } = ssh_cfg;
@@ -91,7 +92,11 @@ async fn main() -> Result<()> {
         request_remote_forward(&conn, cli_forward_to_ssh_forward(spec)).await?;
     }
 
-    let mode = session::choose_mode(args.tty, args.no_tty);
+    let set_env_term = set_env
+        .iter()
+        .find(|var| var.key == "TERM")
+        .map(|var| var.value.as_str());
+    let mode = session::choose_mode(args.tty, args.no_tty, set_env_term);
     let env = session::session_env(&mode);
     let session = OpenSession {
         user,
@@ -99,6 +104,7 @@ async fn main() -> Result<()> {
         use_shell: !args.no_shell,
         mode,
         env,
+        set_env,
     };
     match session.mode {
         SessionMode::Pty { .. } => session::run_pty(conn, session).await,

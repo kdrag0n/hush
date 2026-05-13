@@ -113,13 +113,20 @@ pub(crate) async fn run_pipes(conn: quinn::Connection, session: OpenSession) -> 
     finish_session(end);
 }
 
-pub(crate) fn choose_mode(force_tty: bool, no_tty: bool) -> SessionMode {
+pub(crate) fn choose_mode(
+    force_tty: bool,
+    no_tty: bool,
+    term_override: Option<&str>,
+) -> SessionMode {
     if no_tty {
         return SessionMode::Pipes;
     }
     if force_tty || (os::stdin_is_terminal() && os::stdout_is_terminal()) {
         return SessionMode::Pty {
-            term: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
+            term: term_override
+                .map(str::to_owned)
+                .or_else(|| std::env::var("TERM").ok())
+                .unwrap_or_else(|| "xterm-256color".into()),
             size: os::terminal_size(),
         };
     }

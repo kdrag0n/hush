@@ -178,6 +178,7 @@ pub async fn run_server_session(
                 resize_rx,
                 signal_rx,
                 &request.env,
+                &request.set_env,
                 &connection_env,
             )
             .await
@@ -195,6 +196,7 @@ pub async fn run_server_session(
                 err_send,
                 signal_rx,
                 &request.env,
+                &request.set_env,
                 &connection_env,
             )
             .await
@@ -241,9 +243,10 @@ async fn run_pipes(
     err_send: SendStream,
     mut signal_rx: tokio::sync::mpsc::Receiver<RemoteSignal>,
     env: &[EnvVar],
+    set_env: &[EnvVar],
     connection_env: &ConnectionEnv,
 ) -> Result<ProcessExit> {
-    let env = session_env(env, connection_env, None);
+    let env = session_env(env, set_env, connection_env, None);
     let mut cmd = command_for_user(user, command, false, use_shell, &env)?;
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -280,12 +283,13 @@ async fn run_pty(
     mut resize_rx: tokio::sync::mpsc::Receiver<TermSize>,
     mut signal_rx: tokio::sync::mpsc::Receiver<RemoteSignal>,
     env: &[EnvVar],
+    set_env: &[EnvVar],
     connection_env: &ConnectionEnv,
 ) -> Result<ProcessExit> {
     let argv = pty_argv(user, command, use_shell)?;
     let pty = open_pty(&size)?;
     let ssh_tty = tty_name(pty.slave.as_raw_fd());
-    let env = session_env(env, connection_env, ssh_tty.as_deref());
+    let env = session_env(env, set_env, connection_env, ssh_tty.as_deref());
     set_nonblocking(pty.master.as_raw_fd())?;
     let pty_master = AsyncPty::new(pty.master)?;
     let mut cmd = command_from_argv(&argv)?;
@@ -413,6 +417,7 @@ fn apply_session_env(cmd: &mut Command, env: &[EnvVar]) {
 
 fn session_env(
     client_env: &[EnvVar],
+    set_env: &[EnvVar],
     connection_env: &ConnectionEnv,
     ssh_tty: Option<&str>,
 ) -> Vec<EnvVar> {
@@ -420,6 +425,11 @@ fn session_env(
     for var in client_env {
         if allowed_env_key(&var.key) {
             env.push(var.clone());
+        }
+    }
+    for var in set_env {
+        if valid_env_key(&var.key) {
+            push_or_replace_env(&mut env, var.clone());
         }
     }
     env.push(EnvVar {
@@ -441,6 +451,15 @@ fn session_env(
 
 fn allowed_env_key(key: &str) -> bool {
     key == "TERM" || key == "LANG" || key.starts_with("LC_")
+}
+
+fn valid_env_key(key: &str) -> bool {
+    !key.is_empty() && !key.contains('=')
+}
+
+fn push_or_replace_env(env: &mut Vec<EnvVar>, var: EnvVar) {
+    env.retain(|existing| existing.key != var.key);
+    env.push(var);
 }
 
 fn pty_argv(user: &str, command: &[String], use_shell: bool) -> Result<Vec<CString>> {

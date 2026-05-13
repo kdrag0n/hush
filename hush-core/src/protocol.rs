@@ -37,9 +37,11 @@ pub struct OpenSession {
     pub use_shell: bool,
     pub mode: SessionMode,
     pub env: Vec<EnvVar>,
+    #[serde(default)]
+    pub set_env: Vec<EnvVar>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvVar {
     pub key: String,
     pub value: String,

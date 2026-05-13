@@ -1,3 +1,4 @@
+use crate::protocol::EnvVar;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::{
@@ -85,6 +86,7 @@ pub struct SshHostConfig {
     pub hostname: Option<String>,
     pub port: Option<u16>,
     pub identity_file: Option<std::path::PathBuf>,
+    pub set_env: Vec<EnvVar>,
     pub local_forwards: Vec<SshForward>,
     pub remote_forwards: Vec<SshForward>,
 }
@@ -133,6 +135,9 @@ fn parse_ssh_config(alias: &str, data: &str) -> Result<SshHostConfig> {
             "identityfile" if cfg.identity_file.is_none() => {
                 cfg.identity_file = Some(expand_home(value))
             }
+            "setenv" if cfg.set_env.is_empty() => {
+                cfg.set_env = parse_set_env(value).context("parse SetEnv")?;
+            }
             "localforward" => cfg.local_forwards.push(
                 parse_ssh_forward(value)
                     .with_context(|| format!("parse LocalForward {value:?}"))?,
@@ -145,6 +150,30 @@ fn parse_ssh_config(alias: &str, data: &str) -> Result<SshHostConfig> {
         }
     }
     Ok(cfg)
+}
+
+fn parse_set_env(value: &str) -> Result<Vec<EnvVar>> {
+    let args = shell_words::split(value).context("split SetEnv directive")?;
+    if args.is_empty() {
+        anyhow::bail!("expected NAME=VALUE");
+    }
+    let mut env = Vec::new();
+    for arg in args {
+        let Some((key, value)) = arg.split_once('=') else {
+            anyhow::bail!("expected NAME=VALUE, got {arg:?}");
+        };
+        if key.is_empty() {
+            anyhow::bail!("environment variable name is empty");
+        }
+        if env.iter().any(|var: &EnvVar| var.key == key) {
+            continue;
+        }
+        env.push(EnvVar {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        });
+    }
+    Ok(env)
 }
 
 fn parse_ssh_forward(value: &str) -> Result<SshForward> {
@@ -277,6 +306,7 @@ mod tests {
         SERVER_CONFIG_EXAMPLE, ServerConfigFile, SshForward, parse_ssh_forward,
         write_server_config_example_if_missing,
     };
+    use crate::protocol::EnvVar;
     use std::fs;
 
     #[test]
@@ -408,6 +438,61 @@ Host edge
                 target_host: "db.internal".to_owned(),
                 target_port: 5432,
             }]
+        );
+    }
+
+    #[test]
+    fn ssh_config_parses_first_set_env_directive() {
+        let cfg = super::parse_ssh_config(
+            "edge",
+            r#"
+Host *
+    SetEnv TERM=screen-256color LANG=C
+
+Host edge
+    SetEnv TERM=ignored
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.set_env,
+            vec![
+                EnvVar {
+                    key: "TERM".to_owned(),
+                    value: "screen-256color".to_owned(),
+                },
+                EnvVar {
+                    key: "LANG".to_owned(),
+                    value: "C".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_config_set_env_splits_quoted_values_and_keeps_first_duplicate() {
+        let cfg = super::parse_ssh_config(
+            "edge",
+            r#"
+Host edge
+    SetEnv TERM=xterm-256color LANG="en_US.UTF-8" TERM=ignored
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.set_env,
+            vec![
+                EnvVar {
+                    key: "TERM".to_owned(),
+                    value: "xterm-256color".to_owned(),
+                },
+                EnvVar {
+                    key: "LANG".to_owned(),
+                    value: "en_US.UTF-8".to_owned(),
+                },
+            ]
         );
     }
 }

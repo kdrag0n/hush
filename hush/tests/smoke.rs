@@ -312,6 +312,37 @@ fn selected_environment_is_propagated() {
 }
 
 #[test]
+fn ssh_config_set_env_overrides_selected_environment() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    fs::write(
+        env.home.join(".ssh/config"),
+        format!(
+            "Host edge\n    HostName 127.0.0.1\n    User {}\n    SetEnv TERM=xterm-hush LANG=C.UTF-8 HUSH_SETENV=ok\n",
+            hush_core::auth::current_username()
+        ),
+    )
+    .unwrap();
+    let out = env
+        .hush()
+        .env("LANG", "local.UTF-8")
+        .env("TERM", "vt100")
+        .arg("-t")
+        .arg("edge")
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-lc")
+        .arg("printf '%s|%s|%s' \"$TERM\" \"$LANG\" \"$HUSH_SETENV\"")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "xterm-hush|C.UTF-8|ok"
+    );
+}
+
+#[test]
 fn openssh_connection_environment_is_set() {
     let mut env = TestEnv::new();
     env.start_server();
