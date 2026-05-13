@@ -390,6 +390,9 @@ fn hcp_uploads_file_with_zstd() {
 
     assert!(out.status.success(), "{out:?}");
     assert_eq!(fs::read_to_string(destination).unwrap(), "upload-ok\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("upload local.txt"), "{out:?}");
+    assert!(stderr.contains("done"), "{out:?}");
 }
 
 #[test]
@@ -410,6 +413,9 @@ fn hcp_downloads_file_without_compression() {
 
     assert!(out.status.success(), "{out:?}");
     assert_eq!(fs::read_to_string(destination).unwrap(), "download-ok\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("download remote.txt"), "{out:?}");
+    assert!(stderr.contains("done"), "{out:?}");
 }
 
 #[cfg(unix)]

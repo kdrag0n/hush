@@ -4,11 +4,16 @@ use clap::Parser;
 use hush_core::{
     filecopy,
     protocol::{
-        FileCopyCompression, FileCopyDirection, FileCopyPlan, FileCopyRequest, StreamOpen,
-        StreamResponse, read_frame, write_frame,
+        FileCopyCompression, FileCopyDirection, FileCopyEntry, FileCopyPlan, FileCopyRequest,
+        StreamOpen, StreamResponse, read_frame, write_frame,
     },
 };
-use std::path::{Path, PathBuf};
+use std::{
+    io::{self, Write},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -123,8 +128,27 @@ async fn upload(
     .await?;
 
     let plan = expect_copy_ready(&mut recv).await?;
-    filecopy::send_archive(send, &plan.entries, compression).await?;
-    expect_ok(&mut recv).await
+    let progress = Arc::new(Mutex::new(CopyProgress::new("upload")));
+    let entry_progress = Arc::clone(&progress);
+    let byte_progress = Arc::clone(&progress);
+    let copy_result = filecopy::send_archive_with_progress(
+        send,
+        &plan.entries,
+        compression,
+        move |entry| entry_progress.lock().unwrap().start_entry(entry),
+        move |bytes| byte_progress.lock().unwrap().add_bytes(bytes),
+    )
+    .await;
+    let result = match copy_result {
+        Ok(()) => expect_ok(&mut recv).await,
+        Err(err) => Err(err),
+    };
+    if result.is_ok() {
+        progress.lock().unwrap().finish("done");
+    } else {
+        progress.lock().unwrap().finish("failed");
+    }
+    result
 }
 
 async fn download(
@@ -166,12 +190,13 @@ async fn download(
     )
     .await?;
     let (mut send, mut recv) = conn.open_bi().await?;
+    let request_entries = plan.entries.clone();
     write_frame(
         &mut send,
         &StreamOpen::FileCopy(FileCopyRequest {
             direction: FileCopyDirection::Download,
             user,
-            entries: plan.entries,
+            entries: request_entries,
             destination: String::new(),
             compression,
         }),
@@ -180,7 +205,22 @@ async fn download(
     send.finish()?;
 
     let _ = expect_copy_ready(&mut recv).await?;
-    filecopy::receive_archive(recv, Path::new(&plan.extract_dir), compression).await
+    let progress = Arc::new(Mutex::new(CopyProgress::new("download")));
+    progress.lock().unwrap().start_plan(&plan.entries);
+    let byte_progress = Arc::clone(&progress);
+    let copy_result = filecopy::receive_archive_with_progress(
+        recv,
+        Path::new(&plan.extract_dir),
+        compression,
+        move |bytes| byte_progress.lock().unwrap().add_bytes(bytes),
+    )
+    .await;
+    if copy_result.is_ok() {
+        progress.lock().unwrap().finish("done");
+    } else {
+        progress.lock().unwrap().finish("failed");
+    }
+    copy_result
 }
 
 fn split_sources_destination(paths: &[String]) -> Result<(&[String], &String)> {
@@ -240,6 +280,99 @@ async fn expect_copy_ready(recv: &mut quinn::RecvStream) -> Result<FileCopyPlan>
         StreamResponse::FileCopyReady(plan) => Ok(plan),
         StreamResponse::Error(err) => bail!("{err}"),
         other => bail!("unexpected copy response: {other:?}"),
+    }
+}
+
+#[derive(Debug)]
+struct CopyProgress {
+    verb: &'static str,
+    current: String,
+    bytes: u64,
+    last_draw: Instant,
+}
+
+impl CopyProgress {
+    fn new(verb: &'static str) -> Self {
+        Self {
+            verb,
+            current: String::new(),
+            bytes: 0,
+            last_draw: Instant::now() - Duration::from_secs(1),
+        }
+    }
+
+    fn start(&mut self, entry: &str) {
+        self.current = entry.to_owned();
+        self.draw(true, None);
+    }
+
+    fn start_entry(&mut self, entry: &FileCopyEntry) {
+        self.start(&progress_name(entry));
+    }
+
+    fn start_plan(&mut self, entries: &[FileCopyEntry]) {
+        match entries {
+            [entry] => self.start_entry(entry),
+            _ => self.start(&format!("{} files", entries.len())),
+        }
+    }
+
+    fn add_bytes(&mut self, bytes: u64) {
+        self.bytes += bytes;
+        self.draw(false, None);
+    }
+
+    fn finish(&mut self, status: &str) {
+        self.draw(true, Some(status));
+        let _ = writeln!(io::stderr());
+    }
+
+    fn draw(&mut self, force: bool, status: Option<&str>) {
+        if !force && self.last_draw.elapsed() < Duration::from_millis(50) {
+            return;
+        }
+        self.last_draw = Instant::now();
+        let status = status
+            .map(|status| format!(" {status}"))
+            .unwrap_or_default();
+        let _ = write!(
+            io::stderr(),
+            "\r\x1b[2K{} {} {}{}",
+            self.verb,
+            self.current,
+            format_bytes(self.bytes),
+            status
+        );
+        let _ = io::stderr().flush();
+    }
+}
+
+fn progress_name(entry: &FileCopyEntry) -> String {
+    let source_name = Path::new(&entry.path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| entry.path.clone());
+    if source_name == entry.archive_name {
+        source_name
+    } else {
+        format!("{source_name} -> {}", entry.archive_name)
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+
+    let bytes_f = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes_f < MIB {
+        format!("{:.1} KiB", bytes_f / KIB)
+    } else if bytes_f < GIB {
+        format!("{:.1} MiB", bytes_f / MIB)
+    } else {
+        format!("{:.1} GiB", bytes_f / GIB)
     }
 }
 

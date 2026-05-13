@@ -7,8 +7,12 @@ use async_compression::{
     tokio::{bufread::ZstdDecoder, write::ZstdEncoder},
 };
 use quinn::{RecvStream, SendStream};
-use std::{path::Path, pin::Pin};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use std::{
+    path::Path,
+    pin::Pin,
+    task::{Context as TaskContext, Poll},
+};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio_tar::{ArchiveBuilder, Builder};
 
 pub fn entry_for_path(path: &Path) -> Result<FileCopyEntry> {
@@ -68,13 +72,29 @@ pub async fn send_archive(
     entries: &[FileCopyEntry],
     compression: FileCopyCompression,
 ) -> Result<()> {
+    send_archive_with_progress(send, entries, compression, |_| {}, |_| {}).await
+}
+
+pub async fn send_archive_with_progress<EntryStarted, BytesTransferred>(
+    send: SendStream,
+    entries: &[FileCopyEntry],
+    compression: FileCopyCompression,
+    mut entry_started: EntryStarted,
+    bytes_transferred: BytesTransferred,
+) -> Result<()>
+where
+    EntryStarted: FnMut(&FileCopyEntry),
+    BytesTransferred: FnMut(u64) + Send + Unpin + 'static,
+{
     if entries.is_empty() {
         bail!("no sources to copy");
     }
 
     let writer = archive_writer(send, compression);
+    let writer = ProgressWriter::new(writer, bytes_transferred);
     let mut archive = Builder::new(writer);
     for entry in entries {
+        entry_started(entry);
         let src = Path::new(&entry.path);
         let archive_name = Path::new(&entry.archive_name);
         let metadata = tokio::fs::symlink_metadata(src)
@@ -103,7 +123,20 @@ pub async fn receive_archive(
     destination: &Path,
     compression: FileCopyCompression,
 ) -> Result<()> {
+    receive_archive_with_progress(recv, destination, compression, |_| {}).await
+}
+
+pub async fn receive_archive_with_progress<BytesTransferred>(
+    recv: RecvStream,
+    destination: &Path,
+    compression: FileCopyCompression,
+    bytes_transferred: BytesTransferred,
+) -> Result<()>
+where
+    BytesTransferred: FnMut(u64) + Unpin,
+{
     let reader = archive_reader(recv, compression);
+    let reader = ProgressReader::new(reader, bytes_transferred);
     let mut archive = ArchiveBuilder::new(reader).build();
     archive
         .unpack(destination)
@@ -161,6 +194,83 @@ fn archive_reader(
     match compression {
         FileCopyCompression::None => Box::pin(recv),
         FileCopyCompression::Zstd => Box::pin(ZstdDecoder::new(BufReader::new(recv))),
+    }
+}
+
+struct ProgressWriter<W, F> {
+    inner: W,
+    bytes_transferred: F,
+}
+
+impl<W, F> ProgressWriter<W, F> {
+    fn new(inner: W, bytes_transferred: F) -> Self {
+        Self {
+            inner,
+            bytes_transferred,
+        }
+    }
+}
+
+impl<W, F> AsyncWrite for ProgressWriter<W, F>
+where
+    W: AsyncWrite + Unpin,
+    F: FnMut(u64) + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let written = std::task::ready!(Pin::new(&mut self.inner).poll_write(cx, buf))?;
+        if written > 0 {
+            (self.bytes_transferred)(written as u64);
+        }
+        Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+struct ProgressReader<R, F> {
+    inner: R,
+    bytes_transferred: F,
+}
+
+impl<R, F> ProgressReader<R, F> {
+    fn new(inner: R, bytes_transferred: F) -> Self {
+        Self {
+            inner,
+            bytes_transferred,
+        }
+    }
+}
+
+impl<R, F> AsyncRead for ProgressReader<R, F>
+where
+    R: AsyncRead + Unpin,
+    F: FnMut(u64) + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        std::task::ready!(Pin::new(&mut self.inner).poll_read(cx, buf))?;
+        let read = buf.filled().len() - before;
+        if read > 0 {
+            (self.bytes_transferred)(read as u64);
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
