@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Write,
     net::{TcpListener, UdpSocket},
     os::unix::process::ExitStatusExt,
     path::PathBuf,
@@ -211,6 +212,42 @@ fn no_shell_preserves_argv() {
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "$HOME");
+}
+
+#[test]
+fn non_pty_stdin_carries_more_than_write_queue() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let input_len = 12 * 1024 * 1024;
+    let mut child = env
+        .hush()
+        .arg("-T")
+        .arg(env.target())
+        .arg("--")
+        .arg("/usr/bin/wc")
+        .arg("-c")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = thread::spawn(move || {
+        let chunk = vec![0x5a; 64 * 1024];
+        let mut remaining = input_len;
+        while remaining > 0 {
+            let n = remaining.min(chunk.len());
+            stdin.write_all(&chunk[..n]).unwrap();
+            remaining -= n;
+        }
+    });
+    writer.join().unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        input_len.to_string()
+    );
 }
 
 #[test]

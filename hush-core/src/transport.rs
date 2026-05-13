@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use snow::TransportState;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    fs, io,
+    fs,
+    future::poll_fn,
+    io,
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -21,6 +23,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, split},
     sync::{Mutex, mpsc},
 };
+use tokio_util::sync::PollSender;
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const KCP_MTU: u32 = 1200;
@@ -31,6 +34,7 @@ const KCP_KEEPALIVE: Duration = Duration::from_secs(10);
 const SECURE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const NOISE_MESSAGE_MAX_LEN: usize = 65_535;
 const SECURE_RECORD_MAX_LEN: usize = 2 * 1024 * 1024;
+const WRITE_RECORD_QUEUE_LEN: usize = 64;
 const STREAM_EVENT_QUEUE_LEN: usize = 1024;
 
 type RawStream = KcpStream;
@@ -41,7 +45,7 @@ pub struct Connection {
 }
 
 struct Inner {
-    write_tx: mpsc::UnboundedSender<SecureRecord>,
+    write_tx: mpsc::Sender<SecureRecord>,
     accept_bi_rx: Mutex<mpsc::Receiver<(SendStream, RecvStream)>>,
     accept_uni_rx: Mutex<mpsc::Receiver<RecvStream>>,
     streams: Mutex<HashMap<u64, mpsc::Sender<RecvEvent>>>,
@@ -58,7 +62,7 @@ pub struct Listener {
 
 pub struct SendStream {
     id: u64,
-    tx: mpsc::UnboundedSender<SecureRecord>,
+    tx: PollSender<SecureRecord>,
     finished: bool,
 }
 
@@ -155,7 +159,8 @@ impl Connection {
         let id = self.inner.next_stream_id.fetch_add(2, Ordering::Relaxed);
         let (recv, incoming_tx) = RecvStream::new();
         self.inner.streams.lock().await.insert(id, incoming_tx);
-        self.send_record(SecureRecord::Mux(MuxFrame::OpenBi { id }))?;
+        self.send_record(SecureRecord::Mux(MuxFrame::OpenBi { id }))
+            .await?;
         Ok((self.send_stream(id), recv))
     }
 
@@ -171,7 +176,8 @@ impl Connection {
 
     pub async fn open_uni(&self) -> Result<SendStream> {
         let id = self.inner.next_stream_id.fetch_add(2, Ordering::Relaxed);
-        self.send_record(SecureRecord::Mux(MuxFrame::OpenUni { id }))?;
+        self.send_record(SecureRecord::Mux(MuxFrame::OpenUni { id }))
+            .await?;
         Ok(self.send_stream(id))
     }
 
@@ -186,7 +192,10 @@ impl Connection {
     }
 
     pub fn close(&self) {
-        let _ = self.send_record(SecureRecord::Mux(MuxFrame::Close));
+        let _ = self
+            .inner
+            .write_tx
+            .try_send(SecureRecord::Mux(MuxFrame::Close));
     }
 
     pub fn remote_address(&self) -> SocketAddr {
@@ -209,7 +218,7 @@ impl Connection {
         peer_public_key: ssh_key::PublicKey,
         side: StreamIdSide,
     ) -> Self {
-        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        let (write_tx, write_rx) = mpsc::channel(WRITE_RECORD_QUEUE_LEN);
         let (accept_bi_tx, accept_bi_rx) = mpsc::channel(128);
         let (accept_uni_tx, accept_uni_rx) = mpsc::channel(128);
         let inner = Arc::new(Inner {
@@ -238,15 +247,16 @@ impl Connection {
     fn send_stream(&self, id: u64) -> SendStream {
         SendStream {
             id,
-            tx: self.inner.write_tx.clone(),
+            tx: PollSender::new(self.inner.write_tx.clone()),
             finished: false,
         }
     }
 
-    fn send_record(&self, record: SecureRecord) -> Result<()> {
+    async fn send_record(&self, record: SecureRecord) -> Result<()> {
         self.inner
             .write_tx
             .send(record)
+            .await
             .map_err(|_| anyhow::anyhow!("connection closed"))
     }
 }
@@ -300,24 +310,34 @@ impl Listener {
 
 impl SendStream {
     pub async fn finish(&mut self) -> Result<()> {
-        self.finish_sync()
+        poll_fn(|cx| self.poll_finish(cx)).await
     }
 
-    fn finish_sync(&mut self) -> Result<()> {
+    fn poll_finish(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<()>> {
         if self.finished {
-            return Ok(());
+            return Poll::Ready(Ok(()));
         }
-        self.finished = true;
-        self.tx
-            .send(SecureRecord::Mux(MuxFrame::Finish { id: self.id }))
-            .map_err(|_| anyhow::anyhow!("connection closed"))
+        match self.tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                self.finished = true;
+                match self
+                    .tx
+                    .send_item(SecureRecord::Mux(MuxFrame::Finish { id: self.id }))
+                {
+                    Ok(()) => Poll::Ready(Ok(())),
+                    Err(_) => Poll::Ready(Err(anyhow::anyhow!("connection closed"))),
+                }
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(anyhow::anyhow!("connection closed"))),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
 impl AsyncWrite for SendStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut TaskContext<'_>,
+        cx: &mut TaskContext<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if buf.is_empty() {
@@ -330,15 +350,22 @@ impl AsyncWrite for SendStream {
                 "stream is finished",
             )));
         }
-        match this.tx.send(SecureRecord::Mux(MuxFrame::Data {
-            id: this.id,
-            bytes: buf.to_vec(),
-        })) {
-            Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(_) => Poll::Ready(Err(io::Error::new(
+        match this.tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => match this.tx.send_item(SecureRecord::Mux(MuxFrame::Data {
+                id: this.id,
+                bytes: buf.to_vec(),
+            })) {
+                Ok(()) => Poll::Ready(Ok(buf.len())),
+                Err(_) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "connection closed",
+                ))),
+            },
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "connection closed",
             ))),
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -346,17 +373,26 @@ impl AsyncWrite for SendStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        match self.finish_sync() {
-            Ok(()) => Poll::Ready(Ok(())),
-            Err(err) => Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, err))),
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.poll_finish(cx) {
+            Poll::Ready(result) => Poll::Ready(match result {
+                Ok(()) => Ok(()),
+                Err(err) => Err(io::Error::new(io::ErrorKind::BrokenPipe, err)),
+            }),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl Drop for SendStream {
     fn drop(&mut self) {
-        let _ = self.finish_sync();
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(tx) = self.tx.get_ref() {
+            let _ = tx.try_send(SecureRecord::Mux(MuxFrame::Finish { id: self.id }));
+        }
     }
 }
 
@@ -529,7 +565,7 @@ async fn connect_kcp(addr: SocketAddr) -> Result<RawStream> {
 async fn write_loop<W>(
     mut writer: W,
     transport: Arc<Mutex<TransportState>>,
-    mut rx: mpsc::UnboundedReceiver<SecureRecord>,
+    mut rx: mpsc::Receiver<SecureRecord>,
 ) where
     W: AsyncWrite + Unpin,
 {
@@ -565,7 +601,7 @@ async fn read_loop<R>(
                 inner.streams.lock().await.insert(id, incoming_tx);
                 let send = SendStream {
                     id,
-                    tx: inner.write_tx.clone(),
+                    tx: PollSender::new(inner.write_tx.clone()),
                     finished: false,
                 };
                 if accept_bi_tx.send((send, recv)).await.is_err() {
@@ -707,6 +743,45 @@ fn decrypt_record(transport: &mut TransportState, ciphertext: &[u8]) -> Result<S
         .read_message(ciphertext, &mut plain)
         .context("decrypt secure record")?;
     postcard::from_bytes(&plain[..n]).context("deserialize secure record")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::poll_fn;
+    use tokio::io::AsyncWrite;
+
+    #[tokio::test]
+    async fn send_stream_waits_when_write_queue_is_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut send = SendStream {
+            id: 1,
+            tx: PollSender::new(tx),
+            finished: false,
+        };
+
+        let n = poll_fn(|cx| Pin::new(&mut send).poll_write(cx, b"first"))
+            .await
+            .unwrap();
+        assert_eq!(n, 5);
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(25),
+            poll_fn(|cx| Pin::new(&mut send).poll_write(cx, b"second")),
+        )
+        .await;
+        assert!(blocked.is_err());
+
+        let _ = rx.recv().await;
+        let n = tokio::time::timeout(
+            Duration::from_secs(1),
+            poll_fn(|cx| Pin::new(&mut send).poll_write(cx, b"second")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 6);
+    }
 }
 
 fn load_or_create_host_key(data_dir: &Path) -> Result<HostKeyFile> {

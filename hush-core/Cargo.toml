@@ -19,6 +19,7 @@ snow.workspace = true
 ssh-agent-client-rs.workspace = true
 ssh-key.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 toml.workspace = true
 tracing.workspace = true
 xdg.workspace = true

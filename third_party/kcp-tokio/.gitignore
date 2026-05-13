@@ -1,0 +1,14 @@
+# Ignore all files, then whitelist by extension
+*
+!*/
+
+!.gitignore
+!*.toml
+!*.md
+!*.yaml
+!*.proto
+!*.rs
+!.cargo
+
+# Always ignore build artifacts
+target/
