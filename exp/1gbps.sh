@@ -7,6 +7,7 @@ IFACE="${IFACE:-}"
 IFB_DEV="${IFB_DEV:-ifb0}"
 RATE="1gbit"
 DELAY="50ms"
+LIMIT="20000"
 
 usage() {
   cat <<EOF
@@ -82,7 +83,7 @@ ensure_ifb() {
 
 add_netem_root() {
   local dev="$1"
-  tc qdisc add dev "${dev}" root netem rate "${RATE}" delay "${DELAY}"
+  tc qdisc add dev "${dev}" root netem rate "${RATE}" delay "${DELAY}" limit "${LIMIT}"
 }
 
 reset_qdiscs() {
