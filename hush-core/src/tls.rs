@@ -4,7 +4,10 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use quinn::{AckFrequencyConfig, ClientConfig, ServerConfig, TransportConfig, VarInt};
-use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use quinn_proto::{
+    congestion::BbrConfig,
+    crypto::rustls::{QuicClientConfig, QuicServerConfig},
+};
 use rustls::{
     ClientConfig as RustlsClientConfig, DigitallySignedStruct, Error as RustlsError,
     ServerConfig as RustlsServerConfig, SignatureAlgorithm, SignatureScheme,
@@ -28,7 +31,7 @@ use std::{
     time::Duration,
 };
 
-const QUIC_FAST_SEND_WINDOW: u64 = 256 * 1200;
+const QUIC_FAST_SEND_WINDOW: u64 = 10_000_000;
 const QUIC_FAST_STREAM_RECV_WINDOW: u32 = 4 * 1024 * 1024;
 const QUIC_FAST_CONN_RECV_WINDOW: u32 = 16 * 1024 * 1024;
 const QUIC_FAST_PACKET_THRESHOLD: u32 = 3;
@@ -325,7 +328,7 @@ fn long_idle_transport(keep_alive_interval: Option<Duration>) -> Result<Transpor
     ack_frequency.reordering_threshold(VarInt::from_u32(QUIC_FAST_PACKET_THRESHOLD - 1));
     transport.ack_frequency_config(Some(ack_frequency));
     transport.persistent_congestion_threshold(10);
-    transport.congestion_controller_factory(Arc::new(crate::congestion::KcpConfig::fast()));
+    transport.congestion_controller_factory(Arc::new(BbrConfig::default()));
     Ok(transport)
 }
 
