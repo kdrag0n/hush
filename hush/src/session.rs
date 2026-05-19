@@ -1,5 +1,6 @@
 use crate::os;
 use anyhow::{Result, anyhow, bail};
+use hush_core::priority::{StreamPriority, set_stream_priority};
 use hush_core::protocol::{
     EnvVar, OpenSession, ProcessExit, RemoteSignal, SessionMode, StreamOpen, StreamResponse,
     read_frame, write_frame,
@@ -13,6 +14,7 @@ async fn stream_open_writer(
 ) -> Result<()> {
     while let Some(header) = rx.recv().await {
         let mut send = conn.open_uni().await?;
+        set_stream_priority(&send, StreamPriority::Shell);
         write_frame(&mut send, &header).await?;
         send.finish()?;
     }
@@ -22,6 +24,7 @@ async fn stream_open_writer(
 pub(crate) async fn run_pty(conn: quinn::Connection, session: OpenSession) -> Result<()> {
     let raw = os::RawModeGuard::enable_if_terminal()?;
     let (mut send, recv) = conn.open_bi().await?;
+    set_stream_priority(&send, StreamPriority::Shell);
     write_frame(&mut send, &StreamOpen::Session { request: session }).await?;
     let recv = expect_session_ready(recv).await?;
     let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(32);
@@ -55,6 +58,7 @@ pub(crate) async fn run_pipes(conn: quinn::Connection, session: OpenSession) -> 
     let signal_task = tokio::spawn(os::watch_signals(stream_tx, local_signal_tx));
     let mut sigterm_watchdog: Option<tokio::task::JoinHandle<()>> = None;
     let (mut send, recv) = conn.open_bi().await?;
+    set_stream_priority(&send, StreamPriority::Shell);
     write_frame(&mut send, &StreamOpen::Session { request: session }).await?;
     let recv = expect_session_ready(recv).await?;
 

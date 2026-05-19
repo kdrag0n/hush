@@ -1,3 +1,4 @@
+use crate::priority::{StreamPriority, set_stream_priority};
 use crate::protocol::{
     FileCopyCompression, FileCopyEntry, FileCopyPlan, FileCopyRequest, StreamResponse, write_frame,
 };
@@ -150,6 +151,7 @@ pub async fn handle_upload(
     recv: RecvStream,
     request: FileCopyRequest,
 ) -> Result<()> {
+    set_stream_priority(&send, StreamPriority::FileCopy);
     let plan = plan_for_destination(Path::new(&request.destination), &request.entries).await?;
     write_frame(&mut send, &StreamResponse::FileCopyReady(plan.clone())).await?;
     let result = receive_archive(recv, Path::new(&plan.extract_dir), request.compression).await;
@@ -157,6 +159,7 @@ pub async fn handle_upload(
 }
 
 pub async fn handle_download(mut send: SendStream, request: FileCopyRequest) -> Result<()> {
+    set_stream_priority(&send, StreamPriority::FileCopy);
     write_frame(
         &mut send,
         &StreamResponse::FileCopyReady(FileCopyPlan {

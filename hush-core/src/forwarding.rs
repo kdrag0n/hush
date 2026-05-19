@@ -1,5 +1,6 @@
 use crate::{
     net::{copy_quic_to_writer, copy_reader_to_quic},
+    priority::{StreamPriority, set_stream_priority},
     protocol::{StreamOpen, TcpTarget, read_frame, write_frame},
 };
 use anyhow::{Context, Result};
@@ -45,6 +46,7 @@ async fn open_local_forward_stream(
     target: TcpTarget,
 ) -> Result<()> {
     let (mut send, recv) = conn.open_bi().await?;
+    set_stream_priority(&send, StreamPriority::Forward);
     write_frame(&mut send, &StreamOpen::LocalTcpForward { target }).await?;
     bridge_tcp_quic(tcp, send, recv).await
 }
@@ -54,6 +56,7 @@ pub async fn serve_local_forward_stream(
     send: SendStream,
     recv: RecvStream,
 ) -> Result<()> {
+    set_stream_priority(&send, StreamPriority::Forward);
     let tcp = TcpStream::connect((target.host.as_str(), target.port))
         .await
         .with_context(|| format!("connect remote target {}:{}", target.host, target.port))?;
@@ -61,6 +64,7 @@ pub async fn serve_local_forward_stream(
 }
 
 pub async fn serve_remote_forward_stream(send: SendStream, mut recv: RecvStream) -> Result<()> {
+    set_stream_priority(&send, StreamPriority::Forward);
     let header: StreamOpen = read_frame(&mut recv).await?;
     let StreamOpen::RemoteTcpForward { target } = header else {
         anyhow::bail!("unexpected remote forward stream header");
@@ -103,6 +107,7 @@ async fn open_remote_forward_stream(
     target: TcpTarget,
 ) -> Result<()> {
     let (mut send, recv) = conn.open_bi().await?;
+    set_stream_priority(&send, StreamPriority::Forward);
     write_frame(&mut send, &StreamOpen::RemoteTcpForward { target }).await?;
     bridge_tcp_quic(tcp, send, recv).await
 }

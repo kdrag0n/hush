@@ -6,6 +6,7 @@ use crate::{
         AsyncPty, configure_child_pre_exec, dup_fd, open_pty, process_exit_from_status,
         send_process_group_signal, set_nonblocking, shell_for_user, tty_name,
     },
+    priority::{StreamPriority, set_stream_priority},
     protocol::{
         EnvVar, OpenSession, ProcessExit, RemoteSignal, SessionMode, StreamOpen, StreamResponse,
         TermSize, read_frame, write_frame,
@@ -58,6 +59,7 @@ pub async fn run_server_session(
     config: ServerRuntimeConfig,
     server_addr: SocketAddr,
 ) -> Result<ProcessExit> {
+    set_stream_priority(&session_send, StreamPriority::Shell);
     let connection_env = ConnectionEnv::from_connection(&conn, server_addr);
     let peer_fp = auth::public_key_fingerprint(&peer_key).unwrap_or_else(|_| "unknown".into());
     tracing::info!(user = %request.user, key = %peer_fp, "auth attempt");
@@ -186,6 +188,7 @@ pub async fn run_server_session(
         SessionMode::Pipes => {
             write_frame(&mut session_send, &StreamResponse::SessionReady).await?;
             let mut err_send = conn.open_uni().await?;
+            set_stream_priority(&err_send, StreamPriority::Shell);
             write_frame(&mut err_send, &StreamOpen::SessionStderr).await?;
             run_pipes(
                 &request.user,
@@ -228,6 +231,7 @@ async fn send_auth_failure(send: &mut SendStream) {
 
 async fn send_session_end(conn: &Connection, header: StreamOpen) -> Result<()> {
     let mut send = conn.open_uni().await?;
+    set_stream_priority(&send, StreamPriority::Shell);
     write_frame(&mut send, &header).await?;
     send.finish()?;
     let _ = send.stopped().await;

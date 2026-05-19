@@ -8,6 +8,7 @@ pub mod forwarding;
 pub mod net;
 pub mod os;
 pub mod paths;
+pub mod priority;
 pub mod protocol;
 pub mod session;
 pub mod tls;

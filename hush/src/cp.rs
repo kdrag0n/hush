@@ -3,6 +3,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use hush_core::{
     filecopy,
+    priority::{StreamPriority, set_stream_priority},
     protocol::{
         FileCopyCompression, FileCopyDirection, FileCopyEntry, FileCopyPlan, FileCopyRequest,
         StreamOpen, StreamResponse, read_frame, write_frame,
@@ -115,6 +116,7 @@ async fn upload(
     )
     .await?;
     let (mut send, mut recv) = conn.open_bi().await?;
+    set_stream_priority(&send, StreamPriority::FileCopy);
     write_frame(
         &mut send,
         &StreamOpen::FileCopy(FileCopyRequest {
@@ -190,6 +192,7 @@ async fn download(
     )
     .await?;
     let (mut send, mut recv) = conn.open_bi().await?;
+    set_stream_priority(&send, StreamPriority::FileCopy);
     let request_entries = plan.entries.clone();
     write_frame(
         &mut send,

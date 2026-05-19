@@ -11,6 +11,7 @@ use hush_core::{
     auth,
     config::{self, SshForward},
     forwarding::LocalForward,
+    priority::{StreamPriority, set_stream_priority},
     protocol::{
         OpenSession, RemoteForwardRequest, SessionMode, StreamOpen, StreamResponse, TcpTarget,
         read_frame, write_frame,
@@ -180,6 +181,7 @@ fn spawn_local_forward(conn: quinn::Connection, spec: SshForward) {
 
 async fn request_remote_forward(conn: &quinn::Connection, spec: SshForward) -> Result<()> {
     let (mut send, mut recv) = conn.open_bi().await?;
+    set_stream_priority(&send, StreamPriority::Forward);
     write_frame(
         &mut send,
         &StreamOpen::OpenRemoteForward(RemoteForwardRequest {

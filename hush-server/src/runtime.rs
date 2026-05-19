@@ -3,6 +3,7 @@ use anyhow::{Context, Result, bail};
 use hush_core::{
     auth,
     config::{self, ServerRuntimeConfig},
+    priority::{StreamPriority, set_stream_priority},
     protocol::{
         FileCopyDirection, FileCopyRequest, StreamOpen, StreamResponse, read_frame, write_frame,
     },
@@ -217,6 +218,7 @@ async fn handle_connection(
         let (mut send, mut recv) = conn.accept_bi().await?;
         match read_frame::<StreamOpen>(&mut recv).await? {
             StreamOpen::OpenRemoteForward(req) => {
+                set_stream_priority(&send, StreamPriority::Forward);
                 if !config.allow_tcp_forwarding {
                     write_frame(
                         &mut send,
@@ -253,6 +255,7 @@ async fn handle_connection(
                 send.finish()?;
             }
             StreamOpen::Session { request: session } => {
+                set_stream_priority(&send, StreamPriority::Shell);
                 if config.max_sessions_per_connection == 0 {
                     write_frame(
                         &mut send,
@@ -281,6 +284,7 @@ async fn handle_connection(
                 };
             }
             StreamOpen::FileCopy(request) => {
+                set_stream_priority(&send, StreamPriority::FileCopy);
                 if let Err(err) = authorize_file_copy(&mut send, &request, &peer_key, &config).await
                 {
                     tracing::warn!(%err, "file copy rejected");
