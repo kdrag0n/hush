@@ -24,29 +24,59 @@ pub enum IdentityKey {
     File { private_key_der: Vec<u8> },
 }
 
+/// Where to look for an ssh-agent. `Default` uses `SSH_AUTH_SOCK`; `Socket`
+/// pins an explicit path (from an `IdentityAgent` directive); `Disabled` skips
+/// the agent entirely.
+#[derive(Debug, Clone, Default)]
+pub enum AgentSocket {
+    #[default]
+    Default,
+    Socket(PathBuf),
+    Disabled,
+}
+
+impl AgentSocket {
+    fn resolve(&self) -> Option<PathBuf> {
+        match self {
+            AgentSocket::Default => env::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
+            AgentSocket::Socket(path) => Some(path.clone()),
+            AgentSocket::Disabled => None,
+        }
+    }
+}
+
 pub fn load_identity() -> Result<LoadedIdentity> {
-    if let Some(identity) = load_identity_from_agent()? {
+    load_identity_with_options(None, &AgentSocket::Default)
+}
+
+pub fn load_identity_with_file(identity_file: Option<&Path>) -> Result<LoadedIdentity> {
+    load_identity_with_options(identity_file, &AgentSocket::Default)
+}
+
+pub fn load_identity_with_options(
+    identity_file: Option<&Path>,
+    agent: &AgentSocket,
+) -> Result<LoadedIdentity> {
+    let socket = agent.resolve();
+    if let Some(path) = identity_file {
+        if let Some(socket) = &socket
+            && let Some(identity) = load_identity_from_agent_matching_file(socket, path)?
+        {
+            return Ok(identity);
+        }
+        return load_identity_from_file(path);
+    }
+    if let Some(socket) = &socket
+        && let Some(identity) = load_identity_from_agent(socket)?
+    {
         return Ok(identity);
     }
     let path = crate::paths::current_home().join(".ssh/id_ed25519");
     load_identity_from_file(&path)
 }
 
-pub fn load_identity_with_file(identity_file: Option<&Path>) -> Result<LoadedIdentity> {
-    if let Some(path) = identity_file {
-        if let Some(identity) = load_identity_from_agent_matching_file(path)? {
-            return Ok(identity);
-        }
-        return load_identity_from_file(path);
-    }
-    load_identity()
-}
-
-fn load_identity_from_agent() -> Result<Option<LoadedIdentity>> {
-    let Ok(sock) = env::var("SSH_AUTH_SOCK") else {
-        return Ok(None);
-    };
-    let socket = PathBuf::from(sock);
+fn load_identity_from_agent(socket: &Path) -> Result<Option<LoadedIdentity>> {
+    let socket = socket.to_path_buf();
     let mut client = match ssh_agent_client_rs::Client::connect(&socket) {
         Ok(client) => client,
         Err(err) => {
@@ -81,7 +111,10 @@ fn load_identity_from_agent() -> Result<Option<LoadedIdentity>> {
     Ok(None)
 }
 
-fn load_identity_from_agent_matching_file(path: &Path) -> Result<Option<LoadedIdentity>> {
+fn load_identity_from_agent_matching_file(
+    socket: &Path,
+    path: &Path,
+) -> Result<Option<LoadedIdentity>> {
     let public_path = public_key_path_for_private_key(path);
     let preferred = fs::read_to_string(&public_path)
         .ok()
@@ -89,14 +122,14 @@ fn load_identity_from_agent_matching_file(path: &Path) -> Result<Option<LoadedId
     let Some(preferred) = preferred else {
         return Ok(None);
     };
-    load_identity_from_agent_matching(&preferred)
+    load_identity_from_agent_matching(socket, &preferred)
 }
 
-fn load_identity_from_agent_matching(preferred: &PublicKey) -> Result<Option<LoadedIdentity>> {
-    let Ok(sock) = env::var("SSH_AUTH_SOCK") else {
-        return Ok(None);
-    };
-    let socket = PathBuf::from(sock);
+fn load_identity_from_agent_matching(
+    socket: &Path,
+    preferred: &PublicKey,
+) -> Result<Option<LoadedIdentity>> {
+    let socket = socket.to_path_buf();
     let mut client = match ssh_agent_client_rs::Client::connect(&socket) {
         Ok(client) => client,
         Err(err) => {

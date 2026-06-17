@@ -86,9 +86,19 @@ pub struct SshHostConfig {
     pub hostname: Option<String>,
     pub port: Option<u16>,
     pub identity_file: Option<std::path::PathBuf>,
+    pub identity_agent: Option<IdentityAgent>,
     pub set_env: Vec<EnvVar>,
     pub local_forwards: Vec<SshForward>,
     pub remote_forwards: Vec<SshForward>,
+}
+
+/// Resolved value of an `IdentityAgent` directive from ssh_config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityAgent {
+    /// `IdentityAgent none` — do not use any agent.
+    Disabled,
+    /// An explicit agent socket path.
+    Socket(std::path::PathBuf),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +144,9 @@ fn parse_ssh_config(alias: &str, data: &str) -> Result<SshHostConfig> {
             "port" if cfg.port.is_none() => cfg.port = value.parse().ok(),
             "identityfile" if cfg.identity_file.is_none() => {
                 cfg.identity_file = Some(expand_home(value))
+            }
+            "identityagent" if cfg.identity_agent.is_none() => {
+                cfg.identity_agent = parse_identity_agent(value);
             }
             "setenv" if cfg.set_env.is_empty() => {
                 cfg.set_env = parse_set_env(value).context("parse SetEnv")?;
@@ -288,6 +301,79 @@ fn expand_home(value: &str) -> std::path::PathBuf {
     } else {
         std::path::PathBuf::from(value)
     }
+}
+
+/// Parse an `IdentityAgent` directive value. Returns `None` when the directive
+/// just selects the default agent (an empty value or the literal
+/// `SSH_AUTH_SOCK`), so the standard `SSH_AUTH_SOCK` lookup is used.
+fn parse_identity_agent(value: &str) -> Option<IdentityAgent> {
+    let value = unquote(value.trim());
+    if value.is_empty() {
+        return None;
+    }
+    if value.eq_ignore_ascii_case("none") {
+        return Some(IdentityAgent::Disabled);
+    }
+    let expanded = expand_env(&value);
+    // The literal `SSH_AUTH_SOCK` (or `$SSH_AUTH_SOCK`) means "use the default
+    // agent", which is what an unset value already does.
+    if value == "SSH_AUTH_SOCK" || expanded.is_empty() {
+        return None;
+    }
+    Some(IdentityAgent::Socket(expand_home(&expanded)))
+}
+
+fn unquote(value: &str) -> String {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        value[1..value.len() - 1].to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
+/// Expand `$VAR` and `${VAR}` environment variable references. Unknown
+/// variables expand to an empty string, matching ssh's behaviour.
+fn expand_env(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            out.push(ch);
+            continue;
+        }
+        let name = if chars.peek() == Some(&'{') {
+            chars.next();
+            let mut name = String::new();
+            for c in chars.by_ref() {
+                if c == '}' {
+                    break;
+                }
+                name.push(c);
+            }
+            name
+        } else {
+            let mut name = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    name.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            name
+        };
+        if name.is_empty() {
+            out.push('$');
+        } else if let Ok(val) = std::env::var(&name) {
+            out.push_str(&val);
+        }
+    }
+    out
 }
 
 fn host_pattern_matches(pattern: &str, host: &str) -> bool {
@@ -468,6 +554,35 @@ Host edge
                 },
             ]
         );
+    }
+
+    #[test]
+    fn ssh_config_parses_quoted_identity_agent_socket() {
+        let cfg = super::parse_ssh_config(
+            "edge",
+            "Host edge\n    IdentityAgent \"~/Library/Group Containers/agent.sock\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.identity_agent,
+            Some(super::IdentityAgent::Socket(
+                crate::paths::current_home().join("Library/Group Containers/agent.sock")
+            ))
+        );
+    }
+
+    #[test]
+    fn ssh_config_identity_agent_none_disables_agent() {
+        let cfg = super::parse_ssh_config("edge", "Host edge\n    IdentityAgent none\n").unwrap();
+        assert_eq!(cfg.identity_agent, Some(super::IdentityAgent::Disabled));
+    }
+
+    #[test]
+    fn ssh_config_identity_agent_ssh_auth_sock_uses_default() {
+        let cfg =
+            super::parse_ssh_config("edge", "Host edge\n    IdentityAgent SSH_AUTH_SOCK\n").unwrap();
+        assert_eq!(cfg.identity_agent, None);
     }
 
     #[test]

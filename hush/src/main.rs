@@ -37,6 +37,7 @@ async fn main() -> Result<()> {
         hostname: config_hostname,
         port: config_port,
         identity_file: config_identity_file,
+        identity_agent: config_identity_agent,
         set_env,
         local_forwards,
         remote_forwards,
@@ -54,8 +55,9 @@ async fn main() -> Result<()> {
         .data_dir
         .unwrap_or_else(hush_core::paths::default_data_dir);
     let identity_file = args.identity_file.or(config_identity_file);
+    let agent = agent_socket(config_identity_agent);
 
-    let identity = auth::load_identity_with_file(identity_file.as_deref())?;
+    let identity = auth::load_identity_with_options(identity_file.as_deref(), &agent)?;
     let mut endpoint = Endpoint::client("[::]:0".parse::<SocketAddr>()?)?;
     endpoint.set_default_client_config(hush_core::tls::make_client_config(
         &data_dir,
@@ -126,6 +128,7 @@ pub(crate) async fn connect(
         hostname: config_hostname,
         port: config_port,
         identity_file: config_identity_file,
+        identity_agent: config_identity_agent,
         ..
     } = ssh_cfg;
     let user = target
@@ -140,8 +143,9 @@ pub(crate) async fn connect(
         .unwrap_or(hush_core::defaults::DEFAULT_PORT);
     let data_dir = data_dir.unwrap_or_else(hush_core::paths::default_data_dir);
     let identity_file = identity_file.or(config_identity_file);
+    let agent = agent_socket(config_identity_agent);
 
-    let identity = auth::load_identity_with_file(identity_file.as_deref())?;
+    let identity = auth::load_identity_with_options(identity_file.as_deref(), &agent)?;
     let mut endpoint = Endpoint::client("[::]:0".parse::<SocketAddr>()?)?;
     endpoint.set_default_client_config(hush_core::tls::make_client_config(
         &data_dir,
@@ -152,6 +156,14 @@ pub(crate) async fn connect(
 
     let conn = net::connect_any(&endpoint, &host, port).await?;
     Ok((endpoint, conn, host, port, user))
+}
+
+fn agent_socket(setting: Option<config::IdentityAgent>) -> auth::AgentSocket {
+    match setting {
+        None => auth::AgentSocket::Default,
+        Some(config::IdentityAgent::Disabled) => auth::AgentSocket::Disabled,
+        Some(config::IdentityAgent::Socket(path)) => auth::AgentSocket::Socket(path),
+    }
 }
 
 fn cli_forward_to_ssh_forward(value: cli::ForwardArg) -> SshForward {
