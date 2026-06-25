@@ -142,6 +142,32 @@ impl TestEnv {
     fn target_for_host(&self, host: &str) -> String {
         format!("{}@{host}", hush_core::auth::current_username())
     }
+
+    /// Generate an ECDSA identity of the given curve size, authorize its public
+    /// key, and return the private key path.
+    fn ecdsa_identity(&self, bits: u32) -> PathBuf {
+        let key = self.home.join(".ssh").join(format!("id_ecdsa{bits}"));
+        run(Command::new("ssh-keygen")
+            .arg("-q")
+            .arg("-t")
+            .arg("ecdsa")
+            .arg("-b")
+            .arg(bits.to_string())
+            .arg("-N")
+            .arg("")
+            .arg("-f")
+            .arg(&key)
+            .arg("-C")
+            .arg("hush-test"));
+        let pubkey = fs::read_to_string(key.with_extension("pub")).unwrap();
+        let mut authorized = fs::read_to_string(&self.authorized_keys).unwrap_or_default();
+        if !authorized.ends_with('\n') && !authorized.is_empty() {
+            authorized.push('\n');
+        }
+        authorized.push_str(&pubkey);
+        fs::write(&self.authorized_keys, authorized).unwrap();
+        key
+    }
 }
 
 impl Drop for TestEnv {
@@ -767,4 +793,94 @@ fn http_get(port: u16) -> String {
     let mut data = String::new();
     stream.read_to_string(&mut data).unwrap();
     data.split("\r\n\r\n").nth(1).unwrap_or("").to_owned()
+}
+
+#[test]
+fn ecdsa_p256_file_key_works() {
+    ecdsa_file_key_works(256, "p256-file-ok");
+}
+
+#[test]
+fn ecdsa_p384_file_key_works() {
+    ecdsa_file_key_works(384, "p384-file-ok");
+}
+
+#[test]
+fn ecdsa_p521_file_key_works() {
+    ecdsa_file_key_works(521, "p521-file-ok");
+}
+
+fn ecdsa_file_key_works(bits: u32, marker: &str) {
+    let mut env = TestEnv::new();
+    let key = env.ecdsa_identity(bits);
+    env.start_server();
+    let out = env
+        .hush()
+        .arg("-T")
+        .arg("-i")
+        .arg(&key)
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/echo")
+        .arg(marker)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), marker);
+}
+
+#[test]
+fn ecdsa_agent_key_works() {
+    let mut env = TestEnv::new();
+    let key = env.ecdsa_identity(384);
+    let sock = env.temp.path().join("agent.sock");
+
+    // Run ssh-agent bound to a known socket; skip the test if it is unavailable.
+    let Ok(mut agent) = Command::new("ssh-agent")
+        .arg("-D")
+        .arg("-a")
+        .arg(&sock)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        eprintln!("skipping ecdsa_agent_key_works: ssh-agent not available");
+        return;
+    };
+    let started = Instant::now();
+    while !sock.exists() && started.elapsed() < Duration::from_secs(2) {
+        thread::sleep(Duration::from_millis(25));
+    }
+    let added = Command::new("ssh-add")
+        .arg(&key)
+        .env("SSH_AUTH_SOCK", &sock)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !matches!(added, Ok(status) if status.success()) {
+        let _ = agent.kill();
+        let _ = agent.wait();
+        eprintln!("skipping ecdsa_agent_key_works: ssh-add failed");
+        return;
+    }
+
+    env.start_server();
+    let out = env
+        .hush()
+        .env("SSH_AUTH_SOCK", &sock)
+        .arg("-T")
+        .arg("-i")
+        .arg(&key)
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/echo")
+        .arg("p384-agent-ok")
+        .output()
+        .unwrap();
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "p384-agent-ok");
 }

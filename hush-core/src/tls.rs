@@ -21,6 +21,7 @@ use rustls::{
     sign::{CertifiedKey, Signer, SigningKey, SingleCertAndKey},
 };
 use serde::{Deserialize, Serialize};
+use ssh_key::{Algorithm, EcdsaCurve};
 use std::{
     collections::BTreeMap,
     fmt, fs,
@@ -123,18 +124,22 @@ pub fn make_client_config(
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
         .with_custom_certificate_verifier(verifier);
+    let algorithm = identity.public_key.algorithm();
     let mut cfg = match identity.key {
         IdentityKey::File { private_key_der } => {
-            let cert = self_signed_cert("hush-client", &private_key_der)?;
+            let cert = self_signed_cert("hush-client", &private_key_der, &algorithm)?;
             let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der));
             builder.with_client_auth_cert(vec![cert], key)?
         }
         IdentityKey::Agent { socket, spki_der } => {
-            let cert = self_signed_agent_cert("hush-client", &identity.public_key, &socket)?;
+            let cert = self_signed_agent_cert("hush-client", &identity.public_key)?;
+            let (scheme, signature_algorithm) = tls_signature_scheme(&algorithm)?;
             let key = AgentTlsSigningKey {
                 socket,
                 public_key: identity.public_key,
                 spki_der,
+                scheme,
+                signature_algorithm,
             };
             let certified_key = CertifiedKey::new(vec![cert], Arc::new(key));
             builder.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key)))
@@ -206,9 +211,13 @@ pub fn host_key_from_addr(host: &str, addr: SocketAddr) -> String {
     host_key(host, addr.port())
 }
 
-fn self_signed_cert(name: &str, pkcs8_der: &[u8]) -> Result<CertificateDer<'static>> {
+fn self_signed_cert(
+    name: &str,
+    pkcs8_der: &[u8],
+    algorithm: &Algorithm,
+) -> Result<CertificateDer<'static>> {
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8_der.to_vec()));
-    let key = rcgen::KeyPair::from_der_and_sign_algo(&key, &rcgen::PKCS_ED25519)?;
+    let key = rcgen::KeyPair::from_der_and_sign_algo(&key, rcgen_algorithm(algorithm)?)?;
     let cert = rcgen::CertificateParams::new(vec![name.to_owned()])?.self_signed(&key)?;
     Ok(cert.der().clone())
 }
@@ -216,44 +225,42 @@ fn self_signed_cert(name: &str, pkcs8_der: &[u8]) -> Result<CertificateDer<'stat
 fn self_signed_agent_cert(
     name: &str,
     public_key: &ssh_key::PublicKey,
-    socket: &Path,
 ) -> Result<CertificateDer<'static>> {
-    let key = AgentRcgenSigningKey {
-        socket: socket.to_owned(),
-        public_key: public_key.clone(),
-        raw_public_key: auth::ed25519_public_key_bytes(public_key)?.to_vec(),
+    // The certificate only needs to *carry* the agent's public key: the server
+    // extracts it and authenticates the live TLS handshake signature, never the
+    // certificate's own signature. So we emit the certificate with an empty
+    // signature rather than asking the agent to sign its body — that would be a
+    // second agent round-trip (and a second confirmation prompt on touch-to-sign
+    // hardware keys) for something nobody verifies.
+    let key = UnsignedAgentCertKey {
+        raw_public_key: auth::raw_public_key_bytes(public_key)?,
+        algorithm: rcgen_algorithm(&public_key.algorithm())?,
     };
     let cert = rcgen::CertificateParams::new(vec![name.to_owned()])?.self_signed(&key)?;
     Ok(cert.der().clone())
 }
 
-struct AgentRcgenSigningKey {
-    socket: PathBuf,
-    public_key: ssh_key::PublicKey,
+/// Carries the agent's public key into a certificate's SubjectPublicKeyInfo and
+/// emits an empty signature. The certificate's signature is never verified (see
+/// [`self_signed_agent_cert`]), so there is nothing to sign.
+struct UnsignedAgentCertKey {
     raw_public_key: Vec<u8>,
+    algorithm: &'static rcgen::SignatureAlgorithm,
 }
 
-impl fmt::Debug for AgentRcgenSigningKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AgentRcgenSigningKey")
-            .finish_non_exhaustive()
-    }
-}
-
-impl rcgen::PublicKeyData for AgentRcgenSigningKey {
+impl rcgen::PublicKeyData for UnsignedAgentCertKey {
     fn der_bytes(&self) -> &[u8] {
         &self.raw_public_key
     }
 
     fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
-        &rcgen::PKCS_ED25519
+        self.algorithm
     }
 }
 
-impl rcgen::SigningKey for AgentRcgenSigningKey {
-    fn sign(&self, msg: &[u8]) -> std::result::Result<Vec<u8>, rcgen::Error> {
-        auth::agent_sign(&self.socket, &self.public_key, msg)
-            .map_err(|_| rcgen::Error::RemoteKeyError)
+impl rcgen::SigningKey for UnsignedAgentCertKey {
+    fn sign(&self, _msg: &[u8]) -> std::result::Result<Vec<u8>, rcgen::Error> {
+        Ok(Vec::new())
     }
 }
 
@@ -262,6 +269,8 @@ struct AgentTlsSigningKey {
     socket: PathBuf,
     public_key: ssh_key::PublicKey,
     spki_der: Vec<u8>,
+    scheme: SignatureScheme,
+    signature_algorithm: SignatureAlgorithm,
 }
 
 impl fmt::Debug for AgentTlsSigningKey {
@@ -273,7 +282,7 @@ impl fmt::Debug for AgentTlsSigningKey {
 impl SigningKey for AgentTlsSigningKey {
     fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
         offered
-            .contains(&SignatureScheme::ED25519)
+            .contains(&self.scheme)
             .then(|| Box::new(AgentTlsSigner(self.clone())) as Box<dyn Signer>)
     }
 
@@ -282,7 +291,7 @@ impl SigningKey for AgentTlsSigningKey {
     }
 
     fn algorithm(&self) -> SignatureAlgorithm {
-        SignatureAlgorithm::ED25519
+        self.signature_algorithm
     }
 }
 
@@ -302,8 +311,55 @@ impl Signer for AgentTlsSigner {
     }
 
     fn scheme(&self) -> SignatureScheme {
-        SignatureScheme::ED25519
+        self.0.scheme
     }
+}
+
+/// The rcgen signature algorithm matching an SSH key type, used to self-sign
+/// the client certificate that carries the key's public key.
+fn rcgen_algorithm(algorithm: &Algorithm) -> Result<&'static rcgen::SignatureAlgorithm> {
+    Ok(match algorithm {
+        Algorithm::Ed25519 => &rcgen::PKCS_ED25519,
+        Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP256,
+        } => &rcgen::PKCS_ECDSA_P256_SHA256,
+        Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP384,
+        } => &rcgen::PKCS_ECDSA_P384_SHA384,
+        Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP521,
+        } => &rcgen::PKCS_ECDSA_P521_SHA512,
+        other => bail!("unsupported SSH key type {other}"),
+    })
+}
+
+/// The TLS 1.3 signature scheme (and its algorithm family) for an SSH key type,
+/// used when an ssh-agent performs the handshake signature.
+fn tls_signature_scheme(
+    algorithm: &Algorithm,
+) -> Result<(SignatureScheme, SignatureAlgorithm)> {
+    Ok(match algorithm {
+        Algorithm::Ed25519 => (SignatureScheme::ED25519, SignatureAlgorithm::ED25519),
+        Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP256,
+        } => (
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureAlgorithm::ECDSA,
+        ),
+        Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP384,
+        } => (
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureAlgorithm::ECDSA,
+        ),
+        Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP521,
+        } => (
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureAlgorithm::ECDSA,
+        ),
+        other => bail!("unsupported SSH key type {other}"),
+    })
 }
 
 fn pq_provider() -> CryptoProvider {

@@ -6,7 +6,7 @@ use std::{net::SocketAddr, path::PathBuf};
     name = "hush-server",
     version,
     about = "Server for hush, an SSH-like remote shell over QUIC",
-    long_about = "hush-server listens for QUIC connections, authenticates clients with Ed25519 SSH keys, and runs remote shell sessions.\n\nServer files live under the data directory's server/ subdirectory. The default config path is $DATA_DIR/server/config.toml, and the default host certificate and key are $DATA_DIR/server/host_cert.der and $DATA_DIR/server/host_key.der. When running as root, the default data directory is /etc/hush. Command-line flags override config file values."
+    long_about = "hush-server listens for QUIC connections, authenticates clients with Ed25519 or ECDSA (P-256/384/521) SSH keys, and runs remote shell sessions.\n\nServer files live under the data directory's server/ subdirectory. The default config path is $DATA_DIR/server/config.toml, and the default host certificate and key are $DATA_DIR/server/host_cert.der and $DATA_DIR/server/host_key.der. When running as root, the default data directory is /etc/hush. Command-line flags override config file values."
 )]
 pub(crate) struct Args {
     /// Enable verbose server logging.

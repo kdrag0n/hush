@@ -32,7 +32,7 @@ impl Cli {
     name = "hush",
     version,
     about = "SSH-like remote command client over QUIC",
-    long_about = "hush connects to a hush-server over QUIC, authenticates with an Ed25519 SSH key, and runs a remote shell or command.\n\nTarget syntax is [user@]host[:port]. IPv6 literals may be written as [::1]:22022.\n\nForward syntax for -L and -R is [listen_host:]listen_port:target_host:target_port."
+    long_about = "hush connects to a hush-server over QUIC, authenticates with an Ed25519 or ECDSA (P-256/384/521) SSH key, and runs a remote shell or command.\n\nTarget syntax is [user@]host[:port]. IPv6 literals may be written as [::1]:22022.\n\nForward syntax for -L and -R is [listen_host:]listen_port:target_host:target_port."
 )]
 pub(crate) struct Args {
     /// Enable client logging. Without this, client logging is disabled.
@@ -59,7 +59,7 @@ pub(crate) struct Args {
     #[arg(long, value_name = "DIR", help_heading = "Files")]
     pub(crate) data_dir: Option<PathBuf>,
 
-    /// SSH Ed25519 identity file. Agent use is preferred when it has this key.
+    /// SSH identity file (Ed25519 or ECDSA). Agent use is preferred when it has this key.
     #[arg(short = 'i', value_name = "PATH", help_heading = "Authentication")]
     pub(crate) identity_file: Option<PathBuf>,
 

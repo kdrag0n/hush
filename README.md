@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/kdrag0n/hush/refs/heads/main/script
 - High performance on flaky networks
     - Aggressive retransmits and congestion control, similar to KCP
 - Roaming + long connection lifetime
-- Compatible with Ed25519 SSH keys
+- Compatible with Ed25519 and ECDSA (P-256/384/521) SSH keys
     - Plaintext key files
     - Passphrase-encrypted key files
     - ssh-agent

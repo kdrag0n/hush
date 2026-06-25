@@ -44,7 +44,7 @@ pub(crate) struct CpArgs {
     #[arg(long, value_name = "DIR", help_heading = "Files")]
     pub(crate) data_dir: Option<PathBuf>,
 
-    /// SSH Ed25519 identity file. Agent use is preferred when it has this key.
+    /// SSH identity file (Ed25519 or ECDSA). Agent use is preferred when it has this key.
     #[arg(short = 'i', value_name = "PATH", help_heading = "Authentication")]
     pub(crate) identity_file: Option<PathBuf>,
 
