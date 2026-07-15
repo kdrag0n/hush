@@ -39,6 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/kdrag0n/hush/refs/heads/main/script
 - Server can run as root (multi-user mode) or as an unprivileged user (single-user mode)
 - Classic SSH features:
     - Local and remote TCP port forwarding
+    - ssh-agent forwarding (`-A`), with `session-bind@openssh.com` agent restrictions
     - File copy with `hush cp` / `hcp`
     - `~.` escape to disconnect
     - PTY and piped modes with separate stdin/stdout/stderr

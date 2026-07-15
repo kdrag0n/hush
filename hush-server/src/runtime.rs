@@ -42,7 +42,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     };
     let host_cert = args.host_cert.or(file_cfg.host_cert_path);
     let host_key = args.host_key.or(file_cfg.host_key_path);
-    let runtime_config = ServerRuntimeConfig {
+    let mut runtime_config = ServerRuntimeConfig {
         authorized_keys_path: args.authorized_keys.or(file_cfg.authorized_keys_path),
         allow_users: if args.allow_user.is_empty() {
             file_cfg.allow_users.unwrap_or_default()
@@ -54,6 +54,12 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         } else {
             file_cfg.allow_tcp_forwarding.unwrap_or(true)
         },
+        allow_agent_forwarding: if args.disable_agent_forwarding {
+            false
+        } else {
+            file_cfg.allow_agent_forwarding.unwrap_or(true)
+        },
+        agent_signer: None,
         max_connections: args
             .max_connections
             .or(file_cfg.max_connections)
@@ -72,8 +78,21 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             .unwrap_or(config::DEFAULT_MAX_FORWARD_STREAMS_PER_CONNECTION),
     };
 
-    let server_config =
-        hush_core::tls::make_server_config(&data_dir, host_cert.as_deref(), host_key.as_deref())?;
+    let (host_cert_der, host_key_der) = hush_core::tls::load_or_create_host_cert(
+        &data_dir,
+        host_cert.as_deref(),
+        host_key.as_deref(),
+    )?;
+    if runtime_config.allow_agent_forwarding {
+        match hush_core::agent::HostSigner::from_host_key(host_cert_der.as_ref(), &host_key_der) {
+            Ok(signer) => runtime_config.agent_signer = Some(Arc::new(signer)),
+            Err(err) => tracing::warn!(
+                %err,
+                "agent forwarding will run without session-bind@openssh.com"
+            ),
+        }
+    }
+    let server_config = hush_core::tls::make_server_config(host_cert_der, host_key_der)?;
     let endpoint_config = hush_core::endpoint::server_endpoint_config(&data_dir)?;
     let socket = std::net::UdpSocket::bind(listen)?;
     let runtime = default_runtime().context("no async runtime found")?;
@@ -200,6 +219,7 @@ fn empty_file_config() -> config::ServerConfigFile {
         authorized_keys_path: None,
         allow_users: None,
         allow_tcp_forwarding: None,
+        allow_agent_forwarding: None,
         max_connections: None,
         max_sessions_per_connection: None,
         max_forwards_per_connection: None,

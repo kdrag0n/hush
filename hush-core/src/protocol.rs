@@ -39,6 +39,8 @@ pub struct OpenSession {
     pub env: Vec<EnvVar>,
     #[serde(default)]
     pub set_env: Vec<EnvVar>,
+    #[serde(default)]
+    pub forward_agent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +148,11 @@ pub enum StreamOpen {
     LocalTcpForward { target: TcpTarget },
     RemoteTcpForward { target: TcpTarget },
     FileCopy(FileCopyRequest),
+    /// Server-initiated stream carrying one forwarded ssh-agent connection.
+    /// `bind_signature` is the host key's signature over the agent session
+    /// identifier (empty when unavailable, telling the client to skip the
+    /// `session-bind@openssh.com` binding).
+    AgentForward { bind_signature: Vec<u8> },
 }
 
 pub async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<()> {

@@ -63,6 +63,17 @@ pub fn shell_for_user(user: &str) -> Option<String> {
         .flatten()
 }
 
+pub fn uid_gid_for_user(user: &str) -> Result<Option<(u32, u32)>> {
+    unsafe {
+        let c_user = CString::new(user).context("username contains NUL")?;
+        let pwd = libc::getpwnam(c_user.as_ptr());
+        if pwd.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(((*pwd).pw_uid, (*pwd).pw_gid)))
+    }
+}
+
 fn passwd_string_for_user(
     user: &str,
     field: impl FnOnce(&libc::passwd) -> *mut libc::c_char,

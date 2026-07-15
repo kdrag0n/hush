@@ -23,6 +23,7 @@ pub struct ServerConfigFile {
     pub authorized_keys_path: Option<std::path::PathBuf>,
     pub allow_users: Option<Vec<String>>,
     pub allow_tcp_forwarding: Option<bool>,
+    pub allow_agent_forwarding: Option<bool>,
     pub max_connections: Option<usize>,
     pub max_sessions_per_connection: Option<usize>,
     pub max_forwards_per_connection: Option<usize>,
@@ -34,6 +35,10 @@ pub struct ServerRuntimeConfig {
     pub authorized_keys_path: Option<std::path::PathBuf>,
     pub allow_users: Vec<String>,
     pub allow_tcp_forwarding: bool,
+    pub allow_agent_forwarding: bool,
+    /// Signs agent forwarding session identifiers with the host key; `None`
+    /// disables `session-bind@openssh.com` but not forwarding itself.
+    pub agent_signer: Option<std::sync::Arc<crate::agent::HostSigner>>,
     pub max_connections: usize,
     pub max_sessions_per_connection: usize,
     pub max_forwards_per_connection: usize,
@@ -46,6 +51,8 @@ impl Default for ServerRuntimeConfig {
             authorized_keys_path: None,
             allow_users: Vec::new(),
             allow_tcp_forwarding: true,
+            allow_agent_forwarding: true,
+            agent_signer: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_sessions_per_connection: DEFAULT_MAX_SESSIONS_PER_CONNECTION,
             max_forwards_per_connection: DEFAULT_MAX_FORWARDS_PER_CONNECTION,
@@ -87,6 +94,7 @@ pub struct SshHostConfig {
     pub port: Option<u16>,
     pub identity_file: Option<std::path::PathBuf>,
     pub identity_agent: Option<IdentityAgent>,
+    pub forward_agent: Option<ForwardAgent>,
     pub set_env: Vec<EnvVar>,
     pub local_forwards: Vec<SshForward>,
     pub remote_forwards: Vec<SshForward>,
@@ -98,6 +106,17 @@ pub enum IdentityAgent {
     /// `IdentityAgent none` — do not use any agent.
     Disabled,
     /// An explicit agent socket path.
+    Socket(std::path::PathBuf),
+}
+
+/// Resolved value of a `ForwardAgent` directive from ssh_config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwardAgent {
+    /// `ForwardAgent yes` — forward the default agent (`SSH_AUTH_SOCK`).
+    Yes,
+    /// `ForwardAgent no`.
+    No,
+    /// An explicit agent socket path (or environment variable) to forward.
     Socket(std::path::PathBuf),
 }
 
@@ -147,6 +166,9 @@ fn parse_ssh_config(alias: &str, data: &str) -> Result<SshHostConfig> {
             }
             "identityagent" if cfg.identity_agent.is_none() => {
                 cfg.identity_agent = parse_identity_agent(value);
+            }
+            "forwardagent" if cfg.forward_agent.is_none() => {
+                cfg.forward_agent = parse_forward_agent(value);
             }
             "setenv" if cfg.set_env.is_empty() => {
                 cfg.set_env = parse_set_env(value).context("parse SetEnv")?;
@@ -321,6 +343,26 @@ fn parse_identity_agent(value: &str) -> Option<IdentityAgent> {
         return None;
     }
     Some(IdentityAgent::Socket(expand_home(&expanded)))
+}
+
+/// Parse a `ForwardAgent` directive value: `yes`/`no`, or an explicit agent
+/// socket path or environment variable reference, following OpenSSH.
+fn parse_forward_agent(value: &str) -> Option<ForwardAgent> {
+    let value = unquote(value.trim());
+    if value.is_empty() {
+        return None;
+    }
+    if value.eq_ignore_ascii_case("yes") || value.eq_ignore_ascii_case("true") {
+        return Some(ForwardAgent::Yes);
+    }
+    if value.eq_ignore_ascii_case("no") || value.eq_ignore_ascii_case("false") {
+        return Some(ForwardAgent::No);
+    }
+    let expanded = expand_env(&value);
+    if expanded.is_empty() {
+        return None;
+    }
+    Some(ForwardAgent::Socket(expand_home(&expanded)))
 }
 
 fn unquote(value: &str) -> String {
@@ -570,6 +612,27 @@ Host edge
                 crate::paths::current_home().join("Library/Group Containers/agent.sock")
             ))
         );
+    }
+
+    #[test]
+    fn ssh_config_parses_forward_agent_values() {
+        let cfg = super::parse_ssh_config("edge", "Host edge\n    ForwardAgent yes\n").unwrap();
+        assert_eq!(cfg.forward_agent, Some(super::ForwardAgent::Yes));
+
+        let cfg = super::parse_ssh_config("edge", "Host edge\n    ForwardAgent no\n").unwrap();
+        assert_eq!(cfg.forward_agent, Some(super::ForwardAgent::No));
+
+        let cfg =
+            super::parse_ssh_config("edge", "Host edge\n    ForwardAgent ~/agent.sock\n").unwrap();
+        assert_eq!(
+            cfg.forward_agent,
+            Some(super::ForwardAgent::Socket(
+                crate::paths::current_home().join("agent.sock")
+            ))
+        );
+
+        let cfg = super::parse_ssh_config("edge", "Host edge\n").unwrap();
+        assert_eq!(cfg.forward_agent, None);
     }
 
     #[test]

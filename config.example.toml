@@ -35,6 +35,10 @@ listen = "[::]:22022"
 # Default: true
 allow_tcp_forwarding = true
 
+# Allow ssh-agent forwarding (hush -A).
+# Default: true
+allow_agent_forwarding = true
+
 # Maximum concurrent QUIC connections accepted by the server.
 # Default: 128
 max_connections = 128

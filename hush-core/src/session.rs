@@ -28,6 +28,7 @@ use tokio::sync::Semaphore;
 struct ConnectionEnv {
     ssh_client: String,
     ssh_connection: String,
+    auth_sock: Option<String>,
 }
 
 const AUTH_FAILURE_MESSAGE: &str = "unauthorized";
@@ -46,6 +47,7 @@ impl ConnectionEnv {
                 local_ip,
                 local_port
             ),
+            auth_sock: None,
         }
     }
 }
@@ -60,7 +62,7 @@ pub async fn run_server_session(
     server_addr: SocketAddr,
 ) -> Result<ProcessExit> {
     set_stream_priority(&session_send, StreamPriority::Shell);
-    let connection_env = ConnectionEnv::from_connection(&conn, server_addr);
+    let mut connection_env = ConnectionEnv::from_connection(&conn, server_addr);
     let peer_fp = auth::public_key_fingerprint(&peer_key).unwrap_or_else(|_| "unknown".into());
     tracing::info!(user = %request.user, key = %peer_fp, "auth attempt");
     if !config.allow_users.is_empty()
@@ -108,10 +110,19 @@ pub async fn run_server_session(
         }
     };
 
+    let forward_slots = Arc::new(Semaphore::new(config.max_forward_streams_per_connection));
+    let agent_forward = if request.forward_agent {
+        start_session_agent_forward(&conn, &request.user, &config, forward_slots.clone())
+    } else {
+        None
+    };
+    connection_env.auth_sock = agent_forward
+        .as_ref()
+        .map(|guard| guard.socket_path().to_string_lossy().into_owned());
+
     let (resize_tx, resize_rx) = tokio::sync::mpsc::channel(16);
     let (signal_tx, signal_rx) = tokio::sync::mpsc::channel(16);
     let accept_bi_conn = conn.clone();
-    let forward_slots = Arc::new(Semaphore::new(config.max_forward_streams_per_connection));
     let accept_task = tokio::spawn(async move {
         while let Ok((send, mut recv)) = accept_bi_conn.accept_bi().await {
             let header = match read_frame::<StreamOpen>(&mut recv).await {
@@ -215,6 +226,42 @@ pub async fn run_server_session(
         Err(err) => {
             let _ = send_session_end(&conn, StreamOpen::SessionError(err.to_string())).await;
             Err(err)
+        }
+    }
+}
+
+/// Set up agent forwarding for an authenticated session. Failures degrade to a
+/// session without forwarding rather than aborting it, matching OpenSSH.
+fn start_session_agent_forward(
+    conn: &Connection,
+    user: &str,
+    config: &ServerRuntimeConfig,
+    slots: Arc<Semaphore>,
+) -> Option<crate::agent::AgentForwardGuard> {
+    if !config.allow_agent_forwarding {
+        tracing::info!(user = %user, "agent forwarding request denied by server config");
+        return None;
+    }
+    let owner = if crate::os::is_root() && user != auth::current_username() {
+        match crate::os::uid_gid_for_user(user) {
+            Ok(Some(ids)) => Some(ids),
+            Ok(None) => {
+                tracing::warn!(user = %user, "agent forwarding unavailable: unknown user");
+                return None;
+            }
+            Err(err) => {
+                tracing::warn!(user = %user, %err, "agent forwarding unavailable");
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    match crate::agent::start_agent_forward(conn, config.agent_signer.as_deref(), owner, slots) {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            tracing::warn!(%err, "failed to start agent forwarding");
+            None
         }
     }
 }
@@ -449,6 +496,15 @@ fn session_env(
             key: "SSH_TTY".to_owned(),
             value: ssh_tty.to_owned(),
         });
+    }
+    if let Some(auth_sock) = &connection_env.auth_sock {
+        push_or_replace_env(
+            &mut env,
+            EnvVar {
+                key: "SSH_AUTH_SOCK".to_owned(),
+                value: auth_sock.clone(),
+            },
+        );
     }
     env
 }

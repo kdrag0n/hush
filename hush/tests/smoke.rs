@@ -53,13 +53,19 @@ impl TestEnv {
     }
 
     fn start_server(&mut self) {
+        self.start_server_with(&[]);
+    }
+
+    fn start_server_with(&mut self, extra_args: &[&str]) {
         let child = Command::new(server_bin())
+            .env_remove("SSH_AUTH_SOCK")
             .arg("--data-dir")
             .arg(&self.data)
             .arg("--authorized-keys")
             .arg(&self.authorized_keys)
             .arg("-l")
             .arg(format!("127.0.0.1:{}", self.port))
+            .args(extra_args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -827,6 +833,234 @@ fn ecdsa_file_key_works(bits: u32, marker: &str) {
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), marker);
+}
+
+/// Message log of a stub ssh-agent: one entry per connection, containing the
+/// raw agent protocol messages received on it.
+type StubAgentLog = std::sync::Arc<std::sync::Mutex<Vec<Vec<Vec<u8>>>>>;
+
+/// Speaks just enough of the agent protocol for these tests: answers
+/// `SSH_AGENTC_REQUEST_IDENTITIES` with an empty list and accepts any
+/// extension, recording everything it receives.
+fn spawn_stub_agent(sock: &std::path::Path) -> StubAgentLog {
+    use std::io::{Read, Write};
+
+    fn read_agent_message(stream: &mut std::os::unix::net::UnixStream) -> std::io::Result<Vec<u8>> {
+        let mut len = [0u8; 4];
+        stream.read_exact(&mut len)?;
+        let mut msg = vec![0u8; u32::from_be_bytes(len) as usize];
+        stream.read_exact(&mut msg)?;
+        Ok(msg)
+    }
+
+    let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
+    let log = StubAgentLog::default();
+    let thread_log = log.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut messages = Vec::new();
+            loop {
+                let Ok(msg) = read_agent_message(&mut stream) else {
+                    break;
+                };
+                let reply: &[u8] = match msg.first() {
+                    Some(27) => &[6],             // SSH_AGENTC_EXTENSION -> SSH_AGENT_SUCCESS
+                    Some(11) => &[12, 0, 0, 0, 0], // REQUEST_IDENTITIES -> empty answer
+                    _ => &[5],                    // SSH_AGENT_FAILURE
+                };
+                messages.push(msg);
+                let framed = [&(reply.len() as u32).to_be_bytes()[..], reply].concat();
+                if stream.write_all(&framed).is_err() {
+                    break;
+                }
+            }
+            thread_log.lock().unwrap().push(messages);
+        }
+    });
+    log
+}
+
+fn take_ssh_string<'a>(buf: &mut &'a [u8]) -> &'a [u8] {
+    let (len, rest) = buf.split_at(4);
+    let len = u32::from_be_bytes(len.try_into().unwrap()) as usize;
+    let (data, rest) = rest.split_at(len);
+    *buf = rest;
+    data
+}
+
+#[test]
+fn agent_forwarding_relays_and_binds_session() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let sock = env.temp.path().join("stub-agent.sock");
+    let log = spawn_stub_agent(&sock);
+
+    let out = env
+        .hush()
+        .env("SSH_AUTH_SOCK", &sock)
+        .arg("-A")
+        .arg("-T")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("ssh-add -l 2>&1; printf 'sock=%s' \"$SSH_AUTH_SOCK\"")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // ssh-add on the remote side reached the stub agent through the tunnel.
+    assert!(stdout.contains("no identities"), "{out:?}");
+
+    // The remote socket is hush's own, not the local one.
+    let remote_sock = stdout.split("sock=").nth(1).unwrap_or("");
+    assert!(remote_sock.contains("hush-"), "{out:?}");
+    assert_ne!(remote_sock, sock.to_str().unwrap(), "{out:?}");
+
+    // The forwarded connection was bound with session-bind@openssh.com before
+    // any client data was relayed.
+    let start = Instant::now();
+    let bind = loop {
+        let connections = log.lock().unwrap();
+        if let Some(messages) = connections
+            .iter()
+            .find(|messages| messages.first().is_some_and(|msg| msg.first() == Some(&27)))
+        {
+            break messages[0].clone();
+        }
+        drop(connections);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "no session-bind seen; log: {:?}",
+            log.lock().unwrap()
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+
+    let mut rest = &bind[1..];
+    assert_eq!(take_ssh_string(&mut rest), b"session-bind@openssh.com");
+    let host_key = take_ssh_string(&mut rest).to_vec();
+    let session_id = take_ssh_string(&mut rest);
+    let signature = take_ssh_string(&mut rest);
+    assert_eq!(rest, [1], "is_forwarding flag should be set");
+    assert_eq!(session_id.len(), 32);
+    assert!(!signature.is_empty());
+
+    // The bound host key is the server's TLS host key in SSH form.
+    let cert = fs::read(env.data.join("server/host_cert.der")).unwrap();
+    let expected = hush_core::auth::public_key_from_cert_der(&cert)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    assert_eq!(host_key, expected);
+}
+
+#[test]
+fn agent_forwarding_works_with_real_ssh_agent() {
+    let mut env = TestEnv::new();
+    let sock = env.temp.path().join("agent.sock");
+
+    let Ok(mut agent) = Command::new("ssh-agent")
+        .arg("-D")
+        .arg("-a")
+        .arg(&sock)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        eprintln!("skipping agent_forwarding_works_with_real_ssh_agent: ssh-agent not available");
+        return;
+    };
+    let started = Instant::now();
+    while !sock.exists() && started.elapsed() < Duration::from_secs(2) {
+        thread::sleep(Duration::from_millis(25));
+    }
+    let added = Command::new("ssh-add")
+        .arg(env.home.join(".ssh/id_ed25519"))
+        .env("SSH_AUTH_SOCK", &sock)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !matches!(added, Ok(status) if status.success()) {
+        let _ = agent.kill();
+        let _ = agent.wait();
+        eprintln!("skipping agent_forwarding_works_with_real_ssh_agent: ssh-add failed");
+        return;
+    }
+
+    env.start_server();
+    let out = env
+        .hush()
+        .env("SSH_AUTH_SOCK", &sock)
+        .arg("-v")
+        .arg("-A")
+        .arg("-T")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("ssh-add -l")
+        .output()
+        .unwrap();
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+
+    assert!(out.status.success(), "{out:?}");
+    // The remote ssh-add sees the key held by the local agent.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("hush-test"),
+        "{out:?}"
+    );
+    // The real ssh-agent verified our session-bind signature.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("bound forwarded agent connection"),
+        "{out:?}"
+    );
+    assert!(!stderr.contains("refused session-bind"), "{out:?}");
+}
+
+#[test]
+fn agent_forwarding_requires_opt_in() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let out = env
+        .hush()
+        .arg("-T")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("printf '%s' \"${SSH_AUTH_SOCK-unset}\"")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "unset");
+}
+
+#[test]
+fn server_can_disable_agent_forwarding() {
+    let mut env = TestEnv::new();
+    env.start_server_with(&["--disable-agent-forwarding"]);
+    let sock = env.temp.path().join("stub-agent.sock");
+    let _log = spawn_stub_agent(&sock);
+    let out = env
+        .hush()
+        .env("SSH_AUTH_SOCK", &sock)
+        .arg("-A")
+        .arg("-T")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("printf '%s' \"${SSH_AUTH_SOCK-unset}\"")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "unset");
 }
 
 #[test]

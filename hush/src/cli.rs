@@ -67,6 +67,10 @@ pub(crate) struct Args {
     #[arg(short = 'S', long, help_heading = "Execution")]
     pub(crate) no_shell: bool,
 
+    /// Forward the local ssh-agent to the remote session.
+    #[arg(short = 'A', help_heading = "Forwarding")]
+    pub(crate) forward_agent: bool,
+
     /// Forward a local TCP port to the remote side.
     #[arg(
         short = 'L',

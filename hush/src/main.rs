@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
         port: config_port,
         identity_file: config_identity_file,
         identity_agent: config_identity_agent,
+        forward_agent: config_forward_agent,
         set_env,
         local_forwards,
         remote_forwards,
@@ -67,6 +68,7 @@ async fn main() -> Result<()> {
     )?);
 
     let conn = net::connect_any(&endpoint, &host, port).await?;
+    let agent_forward = agent_forward_context(&conn, args.forward_agent, config_forward_agent);
 
     for spec in local_forwards {
         spawn_local_forward(conn.clone(), spec);
@@ -76,13 +78,13 @@ async fn main() -> Result<()> {
     }
 
     let conn_for_remote = conn.clone();
+    let agent_forward_streams = agent_forward.clone();
     tokio::spawn(async move {
         while let Ok((send, recv)) = conn_for_remote.accept_bi().await {
+            let agent_forward = agent_forward_streams.clone();
             tokio::spawn(async move {
-                if let Err(err) =
-                    hush_core::forwarding::serve_remote_forward_stream(send, recv).await
-                {
-                    tracing::warn!(%err, "remote forwarding stream failed");
+                if let Err(err) = serve_server_stream(send, recv, agent_forward).await {
+                    tracing::warn!(%err, "server-initiated stream failed");
                 }
             });
         }
@@ -108,6 +110,7 @@ async fn main() -> Result<()> {
         mode,
         env,
         set_env,
+        forward_agent: agent_forward.is_some(),
     };
     match session.mode {
         SessionMode::Pty { .. } => session::run_pty(conn, session).await,
@@ -156,6 +159,91 @@ pub(crate) async fn connect(
 
     let conn = net::connect_any(&endpoint, &host, port).await?;
     Ok((endpoint, conn, host, port, user))
+}
+
+/// What the client needs to serve forwarded agent connections: the local agent
+/// socket, plus the host key and session identifier used to bind each
+/// connection to this session with `session-bind@openssh.com`.
+struct AgentForwardContext {
+    socket: std::path::PathBuf,
+    host_key: Option<Vec<u8>>,
+    session_id: Option<[u8; hush_core::agent::SESSION_ID_LEN]>,
+}
+
+impl AgentForwardContext {
+    fn bind(&self, signature: Vec<u8>) -> Option<hush_core::agent::SessionBind> {
+        if signature.is_empty() {
+            return None;
+        }
+        Some(hush_core::agent::SessionBind {
+            host_key: self.host_key.clone()?,
+            session_id: self.session_id?.to_vec(),
+            signature,
+        })
+    }
+}
+
+fn agent_forward_context(
+    conn: &quinn::Connection,
+    cli_forward_agent: bool,
+    config_forward_agent: Option<config::ForwardAgent>,
+) -> Option<std::sync::Arc<AgentForwardContext>> {
+    let enabled = cli_forward_agent
+        || matches!(
+            config_forward_agent,
+            Some(config::ForwardAgent::Yes | config::ForwardAgent::Socket(_))
+        );
+    if !enabled {
+        return None;
+    }
+    let socket_override = match config_forward_agent {
+        Some(config::ForwardAgent::Socket(path)) => Some(path),
+        _ => None,
+    };
+    let Some(socket) = socket_override
+        .or_else(|| std::env::var_os("SSH_AUTH_SOCK").map(std::path::PathBuf::from))
+    else {
+        eprintln!("hush: agent forwarding requested but no ssh-agent socket is available");
+        return None;
+    };
+    let host_key = match hush_core::agent::peer_host_key_blob(conn) {
+        Ok(blob) => Some(blob),
+        Err(err) => {
+            tracing::debug!(%err, "agent session binding disabled: no usable host key");
+            None
+        }
+    };
+    let session_id = hush_core::agent::session_bind_id(conn).ok();
+    Some(std::sync::Arc::new(AgentForwardContext {
+        socket,
+        host_key,
+        session_id,
+    }))
+}
+
+async fn serve_server_stream(
+    send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    agent: Option<std::sync::Arc<AgentForwardContext>>,
+) -> Result<()> {
+    match read_frame::<StreamOpen>(&mut recv).await? {
+        StreamOpen::RemoteTcpForward { target } => {
+            hush_core::forwarding::serve_remote_forward_stream(target, send, recv).await
+        }
+        StreamOpen::AgentForward { bind_signature } => {
+            let Some(agent) = agent else {
+                bail!("server opened an agent stream but agent forwarding is not enabled");
+            };
+            hush_core::agent::serve_agent_forward_stream(
+                send,
+                recv,
+                &agent.socket,
+                agent.bind(bind_signature).as_ref(),
+            )
+            .await
+        }
+        other => bail!("unexpected server-initiated stream header: {other:?}"),
+    }
 }
 
 fn agent_socket(setting: Option<config::IdentityAgent>) -> auth::AgentSocket {

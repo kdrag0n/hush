@@ -45,6 +45,10 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) disable_tcp_forwarding: bool,
 
+    /// Disable ssh-agent forwarding.
+    #[arg(long)]
+    pub(crate) disable_agent_forwarding: bool,
+
     /// Maximum concurrent QUIC connections.
     #[arg(long, value_name = "N", help_heading = "Limits")]
     pub(crate) max_connections: Option<usize>,

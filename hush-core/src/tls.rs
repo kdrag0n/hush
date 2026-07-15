@@ -154,12 +154,10 @@ pub fn make_client_config(
 }
 
 pub fn make_server_config(
-    data_dir: &Path,
-    cert_path: Option<&Path>,
-    key_path: Option<&Path>,
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
 ) -> Result<ServerConfig> {
     let provider = pq_provider();
-    let (cert, key) = load_or_create_host_cert(data_dir, cert_path, key_path)?;
     let mut cfg = RustlsServerConfig::builder_with_provider(provider.into())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(Arc::new(AuthorizedClientVerifier {
