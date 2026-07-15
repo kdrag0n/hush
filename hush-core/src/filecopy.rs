@@ -146,7 +146,7 @@ where
     Ok(())
 }
 
-pub async fn handle_upload(
+pub(crate) async fn handle_upload(
     mut send: SendStream,
     recv: RecvStream,
     request: FileCopyRequest,
@@ -158,7 +158,7 @@ pub async fn handle_upload(
     write_copy_result(send, result).await
 }
 
-pub async fn handle_download(mut send: SendStream, request: FileCopyRequest) -> Result<()> {
+pub(crate) async fn handle_download(mut send: SendStream, request: FileCopyRequest) -> Result<()> {
     set_stream_priority(&send, StreamPriority::FileCopy);
     write_frame(
         &mut send,

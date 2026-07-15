@@ -12,7 +12,7 @@ use crate::{
         TermSize, read_frame, write_frame,
     },
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use quinn::{Connection, RecvStream, SendStream};
 use std::{
     ffi::CString,
@@ -30,8 +30,6 @@ struct ConnectionEnv {
     ssh_connection: String,
     auth_sock: Option<String>,
 }
-
-const AUTH_FAILURE_MESSAGE: &str = "unauthorized";
 
 impl ConnectionEnv {
     fn from_connection(conn: &Connection, server_addr: SocketAddr) -> Self {
@@ -52,67 +50,24 @@ impl ConnectionEnv {
     }
 }
 
-pub async fn run_server_session(
-    conn: Connection,
+/// Run the session a client requested on its authenticated connection. The
+/// session acts as the connection's authenticated user; `request` cannot name
+/// one.
+pub(crate) async fn run_server_session(
+    auth: &crate::server::AuthenticatedConnection,
     mut session_send: SendStream,
     session_recv: RecvStream,
     request: OpenSession,
-    peer_key: ssh_key::PublicKey,
-    config: ServerRuntimeConfig,
-    server_addr: SocketAddr,
 ) -> Result<ProcessExit> {
+    let conn = auth.conn().clone();
+    let user = auth.user().to_owned();
+    let config = auth.config().clone();
     set_stream_priority(&session_send, StreamPriority::Shell);
-    let mut connection_env = ConnectionEnv::from_connection(&conn, server_addr);
-    let peer_fp = auth::public_key_fingerprint(&peer_key).unwrap_or_else(|_| "unknown".into());
-    tracing::info!(user = %request.user, key = %peer_fp, "auth attempt");
-    if !config.allow_users.is_empty()
-        && !config.allow_users.iter().any(|user| user == &request.user)
-    {
-        tracing::warn!(
-            user = %request.user,
-            key = %peer_fp,
-            reason = "user is not allowed by server config",
-            "auth rejected"
-        );
-        send_auth_failure(&mut session_send).await;
-        bail!(AUTH_FAILURE_MESSAGE);
-    }
-    if !auth::can_login_as(&request.user) {
-        tracing::warn!(
-            user = %request.user,
-            key = %peer_fp,
-            current_user = %auth::current_username(),
-            "auth rejected because server is not root and requested user differs"
-        );
-        send_auth_failure(&mut session_send).await;
-        bail!(AUTH_FAILURE_MESSAGE);
-    }
-    let authorized = auth::is_authorized(
-        &request.user,
-        &peer_key,
-        config.authorized_keys_path.as_deref(),
-    );
-    match authorized {
-        Ok(true) => tracing::info!(user = %request.user, key = %peer_fp, "auth accepted"),
-        Ok(false) => {
-            tracing::warn!(
-                user = %request.user,
-                key = %peer_fp,
-                "auth rejected because public key is not authorized"
-            );
-            send_auth_failure(&mut session_send).await;
-            bail!(AUTH_FAILURE_MESSAGE);
-        }
-        Err(err) => {
-            tracing::warn!(user = %request.user, key = %peer_fp, reason = %err, "auth rejected");
-            send_auth_failure(&mut session_send).await;
-            bail!(AUTH_FAILURE_MESSAGE);
-        }
-    };
+    let mut connection_env = ConnectionEnv::from_connection(&conn, auth.server_addr());
 
     let forward_slots = Arc::new(Semaphore::new(config.max_forward_streams_per_connection));
     let agent_forward = if request.forward_agent {
-        start_session_agent_forward(&conn, &request.user, &config, forward_slots.clone())
+        start_session_agent_forward(&conn, &user, &config, forward_slots.clone())
     } else {
         None
     };
@@ -181,7 +136,7 @@ pub async fn run_server_session(
         SessionMode::Pty { term, size } => {
             write_frame(&mut session_send, &StreamResponse::SessionReady).await?;
             run_pty(
-                &request.user,
+                &user,
                 &request.command,
                 term,
                 size.clone(),
@@ -202,7 +157,7 @@ pub async fn run_server_session(
             set_stream_priority(&err_send, StreamPriority::Shell);
             write_frame(&mut err_send, &StreamOpen::SessionStderr).await?;
             run_pipes(
-                &request.user,
+                &user,
                 &request.command,
                 request.use_shell,
                 session_send,
@@ -264,16 +219,6 @@ fn start_session_agent_forward(
             None
         }
     }
-}
-
-async fn send_response_error(send: &mut SendStream, msg: &str) {
-    let _ = write_frame(send, &StreamResponse::Error(msg.to_owned())).await;
-    let _ = send.finish();
-    let _ = send.stopped().await;
-}
-
-async fn send_auth_failure(send: &mut SendStream) {
-    send_response_error(send, AUTH_FAILURE_MESSAGE).await;
 }
 
 async fn send_session_end(conn: &Connection, header: StreamOpen) -> Result<()> {
@@ -563,7 +508,7 @@ fn pty_argv_strings(
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            bail!("user switching is unsupported on this platform");
+            anyhow::bail!("user switching is unsupported on this platform");
         }
     }
 

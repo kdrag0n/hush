@@ -31,43 +31,25 @@ async fn main() -> Result<()> {
     hush_core::os::raise_nofile_soft_limit_to_hard()?;
 
     let target = Target::parse(&args.target, args.port)?;
-    let ssh_cfg = config::read_ssh_config(&target.host_alias)?;
+    let ClientConnection {
+        endpoint: _endpoint,
+        conn,
+        ssh_cfg,
+    } = connect(
+        &target,
+        None,
+        args.data_dir,
+        args.identity_file,
+        args.insecure,
+    )
+    .await?;
     let config::SshHostConfig {
-        user: config_user,
-        hostname: config_hostname,
-        port: config_port,
-        identity_file: config_identity_file,
-        identity_agent: config_identity_agent,
         forward_agent: config_forward_agent,
         set_env,
         local_forwards,
         remote_forwards,
+        ..
     } = ssh_cfg;
-    let user = target
-        .user
-        .or(config_user)
-        .unwrap_or_else(auth::current_username);
-    let host = config_hostname.unwrap_or(target.host);
-    let port = target
-        .port
-        .or(config_port)
-        .unwrap_or(hush_core::defaults::DEFAULT_PORT);
-    let data_dir = args
-        .data_dir
-        .unwrap_or_else(hush_core::paths::default_data_dir);
-    let identity_file = args.identity_file.or(config_identity_file);
-    let agent = agent_socket(config_identity_agent);
-
-    let identity = auth::load_identity_with_options(identity_file.as_deref(), &agent)?;
-    let mut endpoint = Endpoint::client("[::]:0".parse::<SocketAddr>()?)?;
-    endpoint.set_default_client_config(hush_core::tls::make_client_config(
-        &data_dir,
-        hush_core::tls::host_key(&host, port),
-        identity,
-        args.insecure,
-    )?);
-
-    let conn = net::connect_any(&endpoint, &host, port).await?;
     let agent_forward = agent_forward_context(&conn, args.forward_agent, config_forward_agent);
 
     for spec in local_forwards {
@@ -104,7 +86,6 @@ async fn main() -> Result<()> {
     let mode = session::choose_mode(args.tty, args.no_tty, set_env_term);
     let env = session::session_env(&mode);
     let session = OpenSession {
-        user,
         command: args.command,
         use_shell: !args.no_shell,
         mode,
@@ -118,35 +99,40 @@ async fn main() -> Result<()> {
     }
 }
 
+/// An established, authenticated connection. `endpoint` must be kept alive for
+/// as long as `conn` is used.
+pub(crate) struct ClientConnection {
+    pub(crate) endpoint: Endpoint,
+    pub(crate) conn: quinn::Connection,
+    pub(crate) ssh_cfg: config::SshHostConfig,
+}
+
+/// Resolve the target against ssh_config, connect, and authenticate the
+/// connection before handing it out — the server serves nothing until then.
 pub(crate) async fn connect(
     target: &Target,
     port_override: Option<u16>,
     data_dir: Option<std::path::PathBuf>,
     identity_file: Option<std::path::PathBuf>,
     insecure: bool,
-) -> Result<(Endpoint, quinn::Connection, String, u16, String)> {
+) -> Result<ClientConnection> {
     let ssh_cfg = config::read_ssh_config(&target.host_alias)?;
-    let config::SshHostConfig {
-        user: config_user,
-        hostname: config_hostname,
-        port: config_port,
-        identity_file: config_identity_file,
-        identity_agent: config_identity_agent,
-        ..
-    } = ssh_cfg;
     let user = target
         .user
         .clone()
-        .or(config_user)
+        .or_else(|| ssh_cfg.user.clone())
         .unwrap_or_else(auth::current_username);
-    let host = config_hostname.unwrap_or_else(|| target.host.clone());
+    let host = ssh_cfg
+        .hostname
+        .clone()
+        .unwrap_or_else(|| target.host.clone());
     let port = port_override
         .or(target.port)
-        .or(config_port)
+        .or(ssh_cfg.port)
         .unwrap_or(hush_core::defaults::DEFAULT_PORT);
     let data_dir = data_dir.unwrap_or_else(hush_core::paths::default_data_dir);
-    let identity_file = identity_file.or(config_identity_file);
-    let agent = agent_socket(config_identity_agent);
+    let identity_file = identity_file.or_else(|| ssh_cfg.identity_file.clone());
+    let agent = agent_socket(ssh_cfg.identity_agent.clone());
 
     let identity = auth::load_identity_with_options(identity_file.as_deref(), &agent)?;
     let mut endpoint = Endpoint::client("[::]:0".parse::<SocketAddr>()?)?;
@@ -158,7 +144,12 @@ pub(crate) async fn connect(
     )?);
 
     let conn = net::connect_any(&endpoint, &host, port).await?;
-    Ok((endpoint, conn, host, port, user))
+    hush_core::client::authenticate(&conn, &user).await?;
+    Ok(ClientConnection {
+        endpoint,
+        conn,
+        ssh_cfg,
+    })
 }
 
 /// What the client needs to serve forwarded agent connections: the local agent

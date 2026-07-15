@@ -683,6 +683,99 @@ fn authorized_keys_options_are_rejected_without_detail() {
 }
 
 #[test]
+fn unauthorized_key_cannot_authenticate_or_forward() {
+    let mut env = TestEnv::new();
+    fs::write(&env.authorized_keys, "").unwrap();
+    env.start_server();
+    let remote_port = free_tcp_port();
+    let out = env
+        .hush()
+        .arg("-T")
+        .arg("-R")
+        .arg(format!("{remote_port}:127.0.0.1:1"))
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("true")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unauthorized"),
+        "{out:?}"
+    );
+    // The server must not have opened the requested remote listener.
+    assert!(std::net::TcpStream::connect(("127.0.0.1", remote_port)).is_err());
+}
+
+/// A protocol-level client that skips the Authenticate handshake and directly
+/// requests a remote forward. The server must refuse the stream and close the
+/// connection, even though the key would be authorized.
+#[tokio::test]
+async fn server_rejects_streams_before_authentication() {
+    use hush_core::protocol::{
+        RemoteForwardRequest, StreamOpen, StreamResponse, TcpTarget, read_frame, write_frame,
+    };
+
+    let mut env = TestEnv::new();
+    env.start_server();
+
+    let identity =
+        hush_core::auth::load_identity_from_file(&env.home.join(".ssh/id_ed25519")).unwrap();
+    let client_config = hush_core::tls::make_client_config(
+        &env.home.join(".hush"),
+        hush_core::tls::host_key("127.0.0.1", env.port),
+        identity,
+        true,
+    )
+    .unwrap();
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(client_config);
+    let conn = endpoint
+        .connect(
+            format!("127.0.0.1:{}", env.port).parse().unwrap(),
+            "127.0.0.1",
+        )
+        .unwrap()
+        .await
+        .unwrap();
+
+    let forward_port = free_tcp_port();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    write_frame(
+        &mut send,
+        &StreamOpen::OpenRemoteForward(RemoteForwardRequest {
+            listen_host: "127.0.0.1".to_owned(),
+            listen_port: forward_port,
+            target: TcpTarget {
+                host: "127.0.0.1".to_owned(),
+                port: 1,
+            },
+        }),
+    )
+    .await
+    .unwrap();
+    send.finish().unwrap();
+
+    match read_frame::<StreamResponse>(&mut recv).await {
+        Ok(StreamResponse::Error(err)) => assert_eq!(err, "unauthorized"),
+        Ok(other) => panic!("server served a pre-auth stream: {other:?}"),
+        Err(_) => {} // stream torn down by the connection close is also a refusal
+    }
+    drop(send);
+    drop(recv);
+
+    match conn.closed().await {
+        quinn::ConnectionError::ApplicationClosed(closed) => {
+            assert_eq!(closed.reason.as_ref(), b"unauthorized");
+        }
+        other => panic!("expected application close, got {other:?}"),
+    }
+    assert!(std::net::TcpStream::connect(("127.0.0.1", forward_port)).is_err());
+}
+
+#[test]
 fn tofu_mismatch_fails_without_insecure() {
     let mut env = TestEnv::new();
     env.start_server();

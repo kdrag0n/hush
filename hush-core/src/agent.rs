@@ -147,14 +147,14 @@ async fn bind_agent_connection(agent: &mut UnixStream, bind: &SessionBind) -> Re
 
 /// A per-session agent forwarding listener. Dropping it stops the accept loop
 /// and removes the socket directory.
-pub struct AgentForwardGuard {
+pub(crate) struct AgentForwardGuard {
     socket_path: PathBuf,
     dir: PathBuf,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl AgentForwardGuard {
-    pub fn socket_path(&self) -> &Path {
+    pub(crate) fn socket_path(&self) -> &Path {
         &self.socket_path
     }
 }
@@ -172,7 +172,7 @@ impl Drop for AgentForwardGuard {
 /// client. `owner` chowns the socket to the session user when the server runs
 /// as root; `signer` produces the `session-bind@openssh.com` signature (an
 /// empty signature tells the client to skip binding).
-pub fn start_agent_forward(
+pub(crate) fn start_agent_forward(
     conn: &Connection,
     signer: Option<&HostSigner>,
     owner: Option<(u32, u32)>,

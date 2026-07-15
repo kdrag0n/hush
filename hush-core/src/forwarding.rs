@@ -51,7 +51,7 @@ async fn open_local_forward_stream(
     bridge_tcp_quic(tcp, send, recv).await
 }
 
-pub async fn serve_local_forward_stream(
+pub(crate) async fn serve_local_forward_stream(
     target: TcpTarget,
     send: SendStream,
     recv: RecvStream,
@@ -75,7 +75,7 @@ pub async fn serve_remote_forward_stream(
     bridge_tcp_quic(tcp, send, recv).await
 }
 
-pub async fn run_remote_forward_listener(
+pub(crate) async fn run_remote_forward_listener(
     conn: Connection,
     listen_host: String,
     listen_port: u16,

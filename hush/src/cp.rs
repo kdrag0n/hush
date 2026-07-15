@@ -107,7 +107,7 @@ async fn upload(
             CopyPath::Remote(_) => bail!("upload source must be local"),
         })
         .collect::<Result<Vec<_>>>()?;
-    let (_endpoint, conn, _, _, user) = connect(
+    let connected = connect(
         &destination.target,
         args.port,
         args.data_dir.clone(),
@@ -115,13 +115,12 @@ async fn upload(
         args.insecure,
     )
     .await?;
-    let (mut send, mut recv) = conn.open_bi().await?;
+    let (mut send, mut recv) = connected.conn.open_bi().await?;
     set_stream_priority(&send, StreamPriority::FileCopy);
     write_frame(
         &mut send,
         &StreamOpen::FileCopy(FileCopyRequest {
             direction: FileCopyDirection::Upload,
-            user,
             entries,
             destination: destination.path.to_string_lossy().into_owned(),
             compression,
@@ -183,7 +182,7 @@ async fn download(
         })
         .collect::<Result<Vec<_>>>()?;
     let plan = filecopy::plan_for_destination(destination, &entries).await?;
-    let (_endpoint, conn, _, _, user) = connect(
+    let connected = connect(
         &first_remote.target,
         args.port,
         args.data_dir.clone(),
@@ -191,14 +190,13 @@ async fn download(
         args.insecure,
     )
     .await?;
-    let (mut send, mut recv) = conn.open_bi().await?;
+    let (mut send, mut recv) = connected.conn.open_bi().await?;
     set_stream_priority(&send, StreamPriority::FileCopy);
     let request_entries = plan.entries.clone();
     write_frame(
         &mut send,
         &StreamOpen::FileCopy(FileCopyRequest {
             direction: FileCopyDirection::Download,
-            user,
             entries: request_entries,
             destination: String::new(),
             compression,

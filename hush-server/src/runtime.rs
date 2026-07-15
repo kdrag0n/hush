@@ -1,15 +1,7 @@
 use crate::cli::Args;
-use anyhow::{Context, Result, bail};
-use hush_core::{
-    auth,
-    config::{self, ServerRuntimeConfig},
-    priority::{StreamPriority, set_stream_priority},
-    protocol::{
-        FileCopyDirection, FileCopyRequest, StreamOpen, StreamResponse, read_frame, write_frame,
-    },
-};
+use anyhow::{Context, Result};
+use hush_core::config::{self, ServerRuntimeConfig};
 use quinn::{Endpoint, default_runtime};
-use rustls_pki_types::CertificateDer;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{
     sync::Semaphore,
@@ -133,7 +125,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     let _permit = permit;
                     match connecting.await {
                         Ok(conn) => {
-                            if let Err(err) = handle_connection(conn, runtime_config, local_addr).await {
+                            if let Err(err) =
+                                hush_core::server::serve_connection(conn, runtime_config, local_addr)
+                                    .await
+                            {
                                 tracing::warn!(%err, "connection failed");
                             }
                         }
@@ -227,143 +222,3 @@ fn empty_file_config() -> config::ServerConfigFile {
     }
 }
 
-async fn handle_connection(
-    conn: quinn::Connection,
-    config: ServerRuntimeConfig,
-    server_addr: SocketAddr,
-) -> Result<()> {
-    let peer_key = peer_public_key(&conn)?;
-    let mut remote_forwards = 0usize;
-    loop {
-        let (mut send, mut recv) = conn.accept_bi().await?;
-        match read_frame::<StreamOpen>(&mut recv).await? {
-            StreamOpen::OpenRemoteForward(req) => {
-                set_stream_priority(&send, StreamPriority::Forward);
-                if !config.allow_tcp_forwarding {
-                    write_frame(
-                        &mut send,
-                        &StreamResponse::Error("TCP forwarding is disabled".to_owned()),
-                    )
-                    .await?;
-                    send.finish()?;
-                    continue;
-                }
-                if remote_forwards >= config.max_forwards_per_connection {
-                    write_frame(
-                        &mut send,
-                        &StreamResponse::Error("remote forward limit reached".to_owned()),
-                    )
-                    .await?;
-                    send.finish()?;
-                    continue;
-                }
-                remote_forwards += 1;
-                let conn2 = conn.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = hush_core::forwarding::run_remote_forward_listener(
-                        conn2,
-                        req.listen_host,
-                        req.listen_port,
-                        req.target,
-                    )
-                    .await
-                    {
-                        tracing::warn!(%err, "remote forward stopped");
-                    }
-                });
-                write_frame(&mut send, &StreamResponse::Ok).await?;
-                send.finish()?;
-            }
-            StreamOpen::Session { request: session } => {
-                set_stream_priority(&send, StreamPriority::Shell);
-                if config.max_sessions_per_connection == 0 {
-                    write_frame(
-                        &mut send,
-                        &StreamResponse::Error("session limit reached".to_owned()),
-                    )
-                    .await?;
-                    send.finish()?;
-                    continue;
-                }
-                return match hush_core::session::run_server_session(
-                    conn,
-                    send,
-                    recv,
-                    session,
-                    peer_key,
-                    config,
-                    server_addr,
-                )
-                .await
-                {
-                    Ok(_) => Ok(()),
-                    Err(err) => {
-                        tracing::warn!(%err, "session failed");
-                        Ok(())
-                    }
-                };
-            }
-            StreamOpen::FileCopy(request) => {
-                set_stream_priority(&send, StreamPriority::FileCopy);
-                if let Err(err) = authorize_file_copy(&mut send, &request, &peer_key, &config).await
-                {
-                    tracing::warn!(%err, "file copy rejected");
-                    continue;
-                }
-                let result = match request.direction {
-                    FileCopyDirection::Upload => {
-                        hush_core::filecopy::handle_upload(send, recv, request).await
-                    }
-                    FileCopyDirection::Download => {
-                        hush_core::filecopy::handle_download(send, request).await
-                    }
-                };
-                if let Err(err) = result {
-                    tracing::warn!(%err, "file copy failed");
-                }
-            }
-            other => {
-                tracing::warn!(?other, "unexpected pre-session stream");
-            }
-        };
-    }
-}
-
-async fn authorize_file_copy(
-    send: &mut quinn::SendStream,
-    request: &FileCopyRequest,
-    peer_key: &ssh_key::PublicKey,
-    config: &ServerRuntimeConfig,
-) -> Result<()> {
-    let peer_fp = auth::public_key_fingerprint(peer_key).unwrap_or_else(|_| "unknown".into());
-    tracing::info!(user = %request.user, key = %peer_fp, "file copy auth attempt");
-    let allowed_by_config = config.allow_users.is_empty()
-        || config.allow_users.iter().any(|user| user == &request.user);
-    let authorized = allowed_by_config
-        && auth::can_login_as(&request.user)
-        && auth::is_authorized(
-            &request.user,
-            peer_key,
-            config.authorized_keys_path.as_deref(),
-        )
-        .unwrap_or(false);
-    if authorized {
-        tracing::info!(user = %request.user, key = %peer_fp, "file copy auth accepted");
-        return Ok(());
-    }
-
-    write_frame(send, &StreamResponse::Error("unauthorized".to_owned())).await?;
-    send.finish()?;
-    bail!("unauthorized");
-}
-
-fn peer_public_key(conn: &quinn::Connection) -> Result<ssh_key::PublicKey> {
-    let identity = conn
-        .peer_identity()
-        .context("client did not present a certificate")?;
-    let certs = identity
-        .downcast::<Vec<CertificateDer<'static>>>()
-        .map_err(|_| anyhow::anyhow!("unexpected peer identity type"))?;
-    let cert = certs.first().context("client certificate chain is empty")?;
-    auth::public_key_from_cert_der(cert.as_ref())
-}
