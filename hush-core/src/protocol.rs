@@ -136,13 +136,6 @@ pub enum ProcessExit {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StreamOpen {
-    /// Must be the first stream a client opens: authenticate the connection
-    /// as `user`. The server verifies the peer's TLS key against that user's
-    /// authorized_keys and answers with [`StreamResponse::Ok`] or
-    /// [`StreamResponse::Error`]. Every other request is refused until the
-    /// connection is authenticated, and the authenticated user is the one all
-    /// later streams act as.
-    Authenticate { user: String },
     Session { request: OpenSession },
     SessionStderr,
     SessionExitStatus(ProcessExit),

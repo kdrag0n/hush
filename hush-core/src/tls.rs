@@ -111,6 +111,7 @@ pub fn make_client_config(
     data_dir: &Path,
     host_key: String,
     identity: auth::LoadedIdentity,
+    user: &str,
     insecure: bool,
 ) -> Result<ClientConfig> {
     let provider = pq_provider();
@@ -127,12 +128,12 @@ pub fn make_client_config(
     let algorithm = identity.public_key.algorithm();
     let mut cfg = match identity.key {
         IdentityKey::File { private_key_der } => {
-            let cert = self_signed_cert("hush-client", &private_key_der, &algorithm)?;
+            let cert = self_signed_cert("hush-client", user, &private_key_der, &algorithm)?;
             let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der));
             builder.with_client_auth_cert(vec![cert], key)?
         }
         IdentityKey::Agent { socket, spki_der } => {
-            let cert = self_signed_agent_cert("hush-client", &identity.public_key)?;
+            let cert = self_signed_agent_cert("hush-client", user, &identity.public_key)?;
             let (scheme, signature_algorithm) = tls_signature_scheme(&algorithm)?;
             let key = AgentTlsSigningKey {
                 socket,
@@ -209,19 +210,37 @@ pub fn host_key_from_addr(host: &str, addr: SocketAddr) -> String {
     host_key(host, addr.port())
 }
 
+/// Parameters for a synthetic client certificate: the key travels in the
+/// SubjectPublicKeyInfo and the username in a private extension. Both are
+/// covered by the client's live handshake signature, so the server can
+/// authenticate the connection from the TLS handshake alone, with no
+/// application-level round trip.
+fn client_cert_params(name: &str, user: &str) -> Result<rcgen::CertificateParams> {
+    let mut params = rcgen::CertificateParams::new(vec![name.to_owned()])?;
+    params
+        .custom_extensions
+        .push(rcgen::CustomExtension::from_oid_content(
+            auth::HUSH_USERNAME_OID,
+            auth::encode_username_extension(user)?,
+        ));
+    Ok(params)
+}
+
 fn self_signed_cert(
     name: &str,
+    user: &str,
     pkcs8_der: &[u8],
     algorithm: &Algorithm,
 ) -> Result<CertificateDer<'static>> {
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8_der.to_vec()));
     let key = rcgen::KeyPair::from_der_and_sign_algo(&key, rcgen_algorithm(algorithm)?)?;
-    let cert = rcgen::CertificateParams::new(vec![name.to_owned()])?.self_signed(&key)?;
+    let cert = client_cert_params(name, user)?.self_signed(&key)?;
     Ok(cert.der().clone())
 }
 
 fn self_signed_agent_cert(
     name: &str,
+    user: &str,
     public_key: &ssh_key::PublicKey,
 ) -> Result<CertificateDer<'static>> {
     // The certificate only needs to *carry* the agent's public key: the server
@@ -234,7 +253,7 @@ fn self_signed_agent_cert(
         raw_public_key: auth::raw_public_key_bytes(public_key)?,
         algorithm: rcgen_algorithm(&public_key.algorithm())?,
     };
-    let cert = rcgen::CertificateParams::new(vec![name.to_owned()])?.self_signed(&key)?;
+    let cert = client_cert_params(name, user)?.self_signed(&key)?;
     Ok(cert.der().clone())
 }
 

@@ -107,8 +107,9 @@ pub(crate) struct ClientConnection {
     pub(crate) ssh_cfg: config::SshHostConfig,
 }
 
-/// Resolve the target against ssh_config, connect, and authenticate the
-/// connection before handing it out — the server serves nothing until then.
+/// Resolve the target against ssh_config and connect. The username rides in
+/// the client certificate, so the connection is authenticated as part of the
+/// TLS handshake itself — the server serves nothing otherwise.
 pub(crate) async fn connect(
     target: &Target,
     port_override: Option<u16>,
@@ -140,11 +141,11 @@ pub(crate) async fn connect(
         &data_dir,
         hush_core::tls::host_key(&host, port),
         identity,
+        &user,
         insecure,
     )?);
 
     let conn = net::connect_any(&endpoint, &host, port).await?;
-    hush_core::client::authenticate(&conn, &user).await?;
     Ok(ClientConnection {
         endpoint,
         conn,

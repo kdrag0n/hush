@@ -709,11 +709,12 @@ fn unauthorized_key_cannot_authenticate_or_forward() {
     assert!(std::net::TcpStream::connect(("127.0.0.1", remote_port)).is_err());
 }
 
-/// A protocol-level client that skips the Authenticate handshake and directly
-/// requests a remote forward. The server must refuse the stream and close the
-/// connection, even though the key would be authorized.
+/// A protocol-level client whose certificate claims a user its key is not
+/// authorized for, racing a remote forward request against the rejection. The
+/// server must close the connection without serving any stream, even though
+/// the key would be authorized for the real user.
 #[tokio::test]
-async fn server_rejects_streams_before_authentication() {
+async fn server_rejects_certificate_claiming_wrong_user() {
     use hush_core::protocol::{
         RemoteForwardRequest, StreamOpen, StreamResponse, TcpTarget, read_frame, write_frame,
     };
@@ -727,6 +728,7 @@ async fn server_rejects_streams_before_authentication() {
         &env.home.join(".hush"),
         hush_core::tls::host_key("127.0.0.1", env.port),
         identity,
+        "hush-wrong-user",
         true,
     )
     .unwrap();
@@ -742,29 +744,24 @@ async fn server_rejects_streams_before_authentication() {
         .unwrap();
 
     let forward_port = free_tcp_port();
-    let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    write_frame(
-        &mut send,
-        &StreamOpen::OpenRemoteForward(RemoteForwardRequest {
-            listen_host: "127.0.0.1".to_owned(),
-            listen_port: forward_port,
-            target: TcpTarget {
-                host: "127.0.0.1".to_owned(),
-                port: 1,
-            },
-        }),
-    )
-    .await
-    .unwrap();
-    send.finish().unwrap();
-
-    match read_frame::<StreamResponse>(&mut recv).await {
-        Ok(StreamResponse::Error(err)) => assert_eq!(err, "unauthorized"),
-        Ok(other) => panic!("server served a pre-auth stream: {other:?}"),
-        Err(_) => {} // stream torn down by the connection close is also a refusal
+    if let Ok((mut send, mut recv)) = conn.open_bi().await {
+        let _ = write_frame(
+            &mut send,
+            &StreamOpen::OpenRemoteForward(RemoteForwardRequest {
+                listen_host: "127.0.0.1".to_owned(),
+                listen_port: forward_port,
+                target: TcpTarget {
+                    host: "127.0.0.1".to_owned(),
+                    port: 1,
+                },
+            }),
+        )
+        .await;
+        let _ = send.finish();
+        if let Ok(StreamResponse::Ok) = read_frame::<StreamResponse>(&mut recv).await {
+            panic!("server served a stream for an unauthorized user");
+        }
     }
-    drop(send);
-    drop(recv);
 
     match conn.closed().await {
         quinn::ConnectionError::ApplicationClosed(closed) => {

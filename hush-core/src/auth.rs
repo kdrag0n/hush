@@ -20,6 +20,11 @@ const DEFAULT_IDENTITY_FILES: &[&str] = &["id_ed25519", "id_ecdsa"];
 const OID_ED25519: &str = "1.3.101.112";
 const OID_EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
 
+/// Private-use OID of the certificate extension carrying the username the
+/// client wants to act as. Unregistered: these synthetic certificates are only
+/// ever parsed by hush itself.
+pub const HUSH_USERNAME_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 57155, 1];
+
 /// SSH key algorithms hush can authenticate with: Ed25519 and the NIST ECDSA
 /// curves (P-256/384/521).
 fn is_supported_algorithm(algorithm: &Algorithm) -> bool {
@@ -296,6 +301,48 @@ pub fn public_key_from_cert_der(cert_der: &[u8]) -> Result<PublicKey> {
         other => bail!("unsupported peer certificate key type (OID {other})"),
     };
     Ok(PublicKey::new(key_data, "hush-client"))
+}
+
+/// The username DER-encoded as a UTF8String: the payload of the
+/// [`HUSH_USERNAME_OID`] certificate extension.
+pub fn encode_username_extension(user: &str) -> Result<Vec<u8>> {
+    let bytes = user.as_bytes();
+    if bytes.len() >= 128 {
+        bail!("username is too long to encode in a certificate");
+    }
+    let mut der = Vec::with_capacity(bytes.len() + 2);
+    der.push(0x0C); // UTF8String
+    der.push(bytes.len() as u8);
+    der.extend_from_slice(bytes);
+    Ok(der)
+}
+
+/// The username the client claims, from the [`HUSH_USERNAME_OID`] extension of
+/// its certificate. The claim still has to be checked against authorized_keys;
+/// what the extension guarantees is that it was covered by the peer's live
+/// handshake signature.
+pub fn username_from_cert_der(cert_der: &[u8]) -> Result<String> {
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(cert_der)
+        .context("parse peer certificate")?;
+    let oid = HUSH_USERNAME_OID
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    let ext = cert
+        .extensions()
+        .iter()
+        .find(|ext| ext.oid.to_id_string() == oid)
+        .context("client certificate carries no username")?;
+    let [0x0C, len, user @ ..] = ext.value else {
+        bail!("malformed username extension");
+    };
+    if usize::from(*len) != user.len() {
+        bail!("malformed username extension");
+    }
+    Ok(std::str::from_utf8(user)
+        .context("username is not UTF-8")?
+        .to_owned())
 }
 
 pub fn cert_fingerprint(cert_der: &[u8]) -> String {

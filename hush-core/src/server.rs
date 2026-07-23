@@ -8,6 +8,11 @@
 //! be constructed. Serving a request on an unauthenticated connection is
 //! therefore not a code path that can be written outside this module, rather
 //! than a rule each handler must remember to enforce.
+//!
+//! Authentication itself costs no round trip: the client's certificate carries
+//! both its key and the username it claims (covered by the live handshake
+//! signature), so everything needed to authorize the connection arrived with
+//! the TLS handshake.
 
 use crate::{
     auth,
@@ -23,11 +28,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use quinn::{Connection, SendStream};
 use rustls_pki_types::CertificateDer;
 use std::net::SocketAddr;
-use tokio::time::Duration;
-
-/// How long a connection may stay unauthenticated before it is closed, like
-/// sshd's LoginGraceTime.
-const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The only detail a rejected peer learns about why it was rejected.
 const AUTH_FAILURE_MESSAGE: &str = "unauthorized";
@@ -40,17 +40,18 @@ pub async fn serve_connection(
     server_addr: SocketAddr,
 ) -> Result<()> {
     PendingConnection::new(conn, config, server_addr)?
-        .authenticate()
-        .await?
+        .authenticate()?
         .serve()
         .await
 }
 
-/// A connection whose peer has presented a TLS key but has not yet proven it
-/// may act as any user. It can do exactly one thing: authenticate.
+/// A connection whose peer has presented a TLS key and claimed a user, but has
+/// not yet been checked against authorized_keys. It can do exactly one thing:
+/// authenticate.
 pub struct PendingConnection {
     conn: Connection,
     peer_key: ssh_key::PublicKey,
+    claimed_user: String,
     config: ServerRuntimeConfig,
     server_addr: SocketAddr,
 }
@@ -61,60 +62,43 @@ impl PendingConnection {
         config: ServerRuntimeConfig,
         server_addr: SocketAddr,
     ) -> Result<Self> {
-        let peer_key = peer_public_key(&conn)?;
+        let (peer_key, claimed_user) = match peer_identity(&conn) {
+            Ok(identity) => identity,
+            Err(err) => {
+                conn.close(0u32.into(), AUTH_FAILURE_MESSAGE.as_bytes());
+                return Err(err);
+            }
+        };
         Ok(Self {
             conn,
             peer_key,
+            claimed_user,
             config,
             server_addr,
         })
     }
 
-    /// Wait for the client's `Authenticate` stream and verify its requested
-    /// user against the peer key. On success this consumes the pending state
-    /// and returns the only handle that can serve streams; on failure the
-    /// connection is closed.
-    pub async fn authenticate(self) -> Result<AuthenticatedConnection> {
-        let user = match tokio::time::timeout(AUTH_TIMEOUT, self.verify_first_stream()).await {
-            Ok(Ok(user)) => user,
-            Ok(Err(err)) => {
-                self.conn
-                    .close(0u32.into(), AUTH_FAILURE_MESSAGE.as_bytes());
-                return Err(err);
-            }
-            Err(_) => {
-                self.conn.close(0u32.into(), b"authentication timed out");
-                bail!("authentication timed out");
-            }
-        };
+    /// Verify the certificate's claimed user against the peer key. Both
+    /// arrived with the TLS handshake, so this involves no peer interaction.
+    /// On success this consumes the pending state and returns the only handle
+    /// that can serve streams; on failure the connection is closed.
+    pub fn authenticate(self) -> Result<AuthenticatedConnection> {
+        let peer_fp =
+            auth::public_key_fingerprint(&self.peer_key).unwrap_or_else(|_| "unknown".into());
+        tracing::info!(user = %self.claimed_user, key = %peer_fp, "auth attempt");
+        if let Err(reason) = self.check_authorization(&self.claimed_user) {
+            tracing::warn!(user = %self.claimed_user, key = %peer_fp, %reason, "auth rejected");
+            self.conn
+                .close(0u32.into(), AUTH_FAILURE_MESSAGE.as_bytes());
+            bail!(AUTH_FAILURE_MESSAGE);
+        }
+        tracing::info!(user = %self.claimed_user, key = %peer_fp, "auth accepted");
         Ok(AuthenticatedConnection {
             conn: self.conn,
-            user,
+            user: self.claimed_user,
             config: self.config,
             server_addr: self.server_addr,
         })
-    }
-
-    async fn verify_first_stream(&self) -> Result<String> {
-        let (mut send, mut recv) = self.conn.accept_bi().await?;
-        set_stream_priority(&send, StreamPriority::Shell);
-        let header = read_frame::<StreamOpen>(&mut recv).await?;
-        let StreamOpen::Authenticate { user } = header else {
-            send_response_error(&mut send, AUTH_FAILURE_MESSAGE).await;
-            bail!("peer sent {header:?} before authenticating");
-        };
-        let peer_fp =
-            auth::public_key_fingerprint(&self.peer_key).unwrap_or_else(|_| "unknown".into());
-        tracing::info!(user = %user, key = %peer_fp, "auth attempt");
-        if let Err(reason) = self.check_authorization(&user) {
-            tracing::warn!(user = %user, key = %peer_fp, %reason, "auth rejected");
-            send_response_error(&mut send, AUTH_FAILURE_MESSAGE).await;
-            bail!(AUTH_FAILURE_MESSAGE);
-        }
-        tracing::info!(user = %user, key = %peer_fp, "auth accepted");
-        write_frame(&mut send, &StreamResponse::Ok).await?;
-        send.finish()?;
-        Ok(user)
     }
 
     /// Whether the peer key may act as `user`. The reason is logged but never
@@ -266,7 +250,7 @@ async fn send_response_error(send: &mut SendStream, msg: &str) {
     let _ = send.stopped().await;
 }
 
-fn peer_public_key(conn: &Connection) -> Result<ssh_key::PublicKey> {
+fn peer_identity(conn: &Connection) -> Result<(ssh_key::PublicKey, String)> {
     let identity = conn
         .peer_identity()
         .context("client did not present a certificate")?;
@@ -274,5 +258,8 @@ fn peer_public_key(conn: &Connection) -> Result<ssh_key::PublicKey> {
         .downcast::<Vec<CertificateDer<'static>>>()
         .map_err(|_| anyhow!("unexpected peer identity type"))?;
     let cert = certs.first().context("client certificate chain is empty")?;
-    auth::public_key_from_cert_der(cert.as_ref())
+    Ok((
+        auth::public_key_from_cert_der(cert.as_ref())?,
+        auth::username_from_cert_der(cert.as_ref())?,
+    ))
 }

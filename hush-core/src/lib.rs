@@ -1,6 +1,5 @@
 pub mod agent;
 pub mod auth;
-pub mod client;
 pub mod config;
 pub mod defaults;
 pub mod endpoint;
@@ -15,6 +14,7 @@ pub mod server;
 pub(crate) mod session;
 pub mod tls;
 
-// hush/2: connections must authenticate with a `StreamOpen::Authenticate`
-// handshake before any other stream, and requests no longer carry a user.
-pub const ALPN: &[u8] = b"hush/2";
+// hush/3: the client certificate carries the username it claims, the server
+// authenticates the connection from the TLS handshake alone (no Authenticate
+// stream), and requests do not carry a user.
+pub const ALPN: &[u8] = b"hush/3";
