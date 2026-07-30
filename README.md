@@ -10,17 +10,28 @@ Client:
 brew install kdrag0n/tap/hush
 ```
 
-Copy files:
-
-```sh
-hush cp ./build.tar user@example.com:/tmp/build.tar
-hcp user@example.com:/var/log/app.log ./app.log
-```
-
 Server:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/kdrag0n/hush/refs/heads/main/scripts/install-server.sh | sh
+```
+
+## Usage
+
+Same syntax as `ssh`, just replace `ssh` with `hush` and `scp` with `hcp`.
+
+Connect to server:
+
+```sh
+hush root@192.168.1.1
+```
+
+Copy files:
+
+```sh
+hush cp ./build.tar root@192.168.1.1:/tmp/build.tar
+# or
+hcp root@192.168.1.1:/var/log/app.log ./app.log
 ```
 
 ## Features
