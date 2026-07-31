@@ -118,6 +118,10 @@ fn load_identity_from_agent(socket: &Path) -> Result<Option<LoadedIdentity>> {
         .list_all_identities()
         .context("list ssh-agent identities")?;
     let preferred = preferred_public_key();
+    // Prefer the agent key matching a default identity file, but fall back to
+    // any supported agent key: an agent-only setup (e.g. Secretive holding a
+    // hardware-backed ECDSA key) has no on-disk counterpart to match.
+    let mut fallback: Option<PublicKey> = None;
     for identity in identities {
         let ssh_agent_client_rs::Identity::PublicKey(public_key) = identity else {
             continue;
@@ -126,11 +130,23 @@ fn load_identity_from_agent(socket: &Path) -> Result<Option<LoadedIdentity>> {
         if !is_supported_algorithm(&public_key.algorithm()) {
             continue;
         }
-        if let Some(preferred) = &preferred {
-            if !same_public_key(&public_key, preferred)? {
-                continue;
-            }
+        let matches_preferred = match &preferred {
+            Some(preferred) => same_public_key(&public_key, preferred)?,
+            None => true,
+        };
+        if matches_preferred {
+            let spki_der = public_key_to_spki(&public_key)?;
+            tracing::debug!(algorithm = %public_key.algorithm(), "using identity from ssh-agent");
+            return Ok(Some(LoadedIdentity {
+                public_key,
+                key: IdentityKey::Agent { socket, spki_der },
+            }));
         }
+        if fallback.is_none() {
+            fallback = Some(public_key);
+        }
+    }
+    if let Some(public_key) = fallback {
         let spki_der = public_key_to_spki(&public_key)?;
         tracing::debug!(algorithm = %public_key.algorithm(), "using identity from ssh-agent");
         return Ok(Some(LoadedIdentity {
