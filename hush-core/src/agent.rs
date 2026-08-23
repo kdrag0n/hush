@@ -322,15 +322,9 @@ impl HostSigner {
             }
             Algorithm::Ecdsa { curve } => {
                 let signing = match curve {
-                    EcdsaCurve::NistP256 => {
-                        &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED_SIGNING
-                    }
-                    EcdsaCurve::NistP384 => {
-                        &aws_lc_rs::signature::ECDSA_P384_SHA384_FIXED_SIGNING
-                    }
-                    EcdsaCurve::NistP521 => {
-                        &aws_lc_rs::signature::ECDSA_P521_SHA512_FIXED_SIGNING
-                    }
+                    EcdsaCurve::NistP256 => &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+                    EcdsaCurve::NistP384 => &aws_lc_rs::signature::ECDSA_P384_SHA384_FIXED_SIGNING,
+                    EcdsaCurve::NistP521 => &aws_lc_rs::signature::ECDSA_P521_SHA512_FIXED_SIGNING,
                 };
                 let keypair = aws_lc_rs::signature::EcdsaKeyPair::from_pkcs8(signing, der)
                     .map_err(|_| anyhow::anyhow!("parse ECDSA host key"))?;

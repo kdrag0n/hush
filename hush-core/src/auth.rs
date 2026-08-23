@@ -461,7 +461,10 @@ pub fn ed25519_public_key_to_spki(public_key: &PublicKey) -> Result<Vec<u8>> {
 pub fn ed25519_public_key_bytes(public_key: &PublicKey) -> Result<&[u8; 32]> {
     match public_key.key_data() {
         KeyData::Ed25519(key) => Ok(key.as_ref()),
-        _ => bail!("expected an Ed25519 public key, got {}", public_key.algorithm()),
+        _ => bail!(
+            "expected an Ed25519 public key, got {}",
+            public_key.algorithm()
+        ),
     }
 }
 

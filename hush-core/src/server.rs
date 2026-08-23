@@ -105,7 +105,11 @@ impl PendingConnection {
     /// sent to the peer.
     fn check_authorization(&self, user: &str) -> Result<()> {
         if !self.config.allow_users.is_empty()
-            && !self.config.allow_users.iter().any(|allowed| allowed == user)
+            && !self
+                .config
+                .allow_users
+                .iter()
+                .any(|allowed| allowed == user)
         {
             bail!("user is not allowed by server config");
         }
@@ -115,8 +119,11 @@ impl PendingConnection {
                 auth::current_username()
             );
         }
-        match auth::is_authorized(user, &self.peer_key, self.config.authorized_keys_path.as_deref())
-        {
+        match auth::is_authorized(
+            user,
+            &self.peer_key,
+            self.config.authorized_keys_path.as_deref(),
+        ) {
             Ok(true) => Ok(()),
             Ok(false) => bail!("public key is not authorized"),
             Err(err) => Err(err),
@@ -186,7 +193,9 @@ impl AuthenticatedConnection {
                         FileCopyDirection::Upload => {
                             filecopy::handle_upload(send, recv, request).await
                         }
-                        FileCopyDirection::Download => filecopy::handle_download(send, request).await,
+                        FileCopyDirection::Download => {
+                            filecopy::handle_download(send, request).await
+                        }
                     };
                     if let Err(err) = result {
                         tracing::warn!(%err, "file copy failed");

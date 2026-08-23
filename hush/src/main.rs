@@ -192,8 +192,8 @@ fn agent_forward_context(
         Some(config::ForwardAgent::Socket(path)) => Some(path),
         _ => None,
     };
-    let Some(socket) = socket_override
-        .or_else(|| std::env::var_os("SSH_AUTH_SOCK").map(std::path::PathBuf::from))
+    let Some(socket) =
+        socket_override.or_else(|| std::env::var_os("SSH_AUTH_SOCK").map(std::path::PathBuf::from))
     else {
         eprintln!("hush: agent forwarding requested but no ssh-agent socket is available");
         return None;

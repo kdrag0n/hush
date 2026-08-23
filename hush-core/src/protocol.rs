@@ -136,21 +136,29 @@ pub enum ProcessExit {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StreamOpen {
-    Session { request: OpenSession },
+    Session {
+        request: OpenSession,
+    },
     SessionStderr,
     SessionExitStatus(ProcessExit),
     SessionError(String),
     Resize(TermSize),
     Signal(RemoteSignal),
     OpenRemoteForward(RemoteForwardRequest),
-    LocalTcpForward { target: TcpTarget },
-    RemoteTcpForward { target: TcpTarget },
+    LocalTcpForward {
+        target: TcpTarget,
+    },
+    RemoteTcpForward {
+        target: TcpTarget,
+    },
     FileCopy(FileCopyRequest),
     /// Server-initiated stream carrying one forwarded ssh-agent connection.
     /// `bind_signature` is the host key's signature over the agent session
     /// identifier (empty when unavailable, telling the client to skip the
     /// `session-bind@openssh.com` binding).
-    AgentForward { bind_signature: Vec<u8> },
+    AgentForward {
+        bind_signature: Vec<u8>,
+    },
 }
 
 pub async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<()> {

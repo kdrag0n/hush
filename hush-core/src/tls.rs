@@ -352,9 +352,7 @@ fn rcgen_algorithm(algorithm: &Algorithm) -> Result<&'static rcgen::SignatureAlg
 
 /// The TLS 1.3 signature scheme (and its algorithm family) for an SSH key type,
 /// used when an ssh-agent performs the handshake signature.
-fn tls_signature_scheme(
-    algorithm: &Algorithm,
-) -> Result<(SignatureScheme, SignatureAlgorithm)> {
+fn tls_signature_scheme(algorithm: &Algorithm) -> Result<(SignatureScheme, SignatureAlgorithm)> {
     Ok(match algorithm {
         Algorithm::Ed25519 => (SignatureScheme::ED25519, SignatureAlgorithm::ED25519),
         Algorithm::Ecdsa {

@@ -955,9 +955,9 @@ fn spawn_stub_agent(sock: &std::path::Path) -> StubAgentLog {
                     break;
                 };
                 let reply: &[u8] = match msg.first() {
-                    Some(27) => &[6],             // SSH_AGENTC_EXTENSION -> SSH_AGENT_SUCCESS
+                    Some(27) => &[6],              // SSH_AGENTC_EXTENSION -> SSH_AGENT_SUCCESS
                     Some(11) => &[12, 0, 0, 0, 0], // REQUEST_IDENTITIES -> empty answer
-                    _ => &[5],                    // SSH_AGENT_FAILURE
+                    _ => &[5],                     // SSH_AGENT_FAILURE
                 };
                 messages.push(msg);
                 let framed = [&(reply.len() as u32).to_be_bytes()[..], reply].concat();

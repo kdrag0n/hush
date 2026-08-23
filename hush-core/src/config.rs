@@ -643,8 +643,8 @@ Host edge
 
     #[test]
     fn ssh_config_identity_agent_ssh_auth_sock_uses_default() {
-        let cfg =
-            super::parse_ssh_config("edge", "Host edge\n    IdentityAgent SSH_AUTH_SOCK\n").unwrap();
+        let cfg = super::parse_ssh_config("edge", "Host edge\n    IdentityAgent SSH_AUTH_SOCK\n")
+            .unwrap();
         assert_eq!(cfg.identity_agent, None);
     }
 

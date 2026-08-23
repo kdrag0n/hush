@@ -221,4 +221,3 @@ fn empty_file_config() -> config::ServerConfigFile {
         max_forward_streams_per_connection: None,
     }
 }
-
