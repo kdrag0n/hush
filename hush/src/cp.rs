@@ -1,6 +1,5 @@
 use crate::{cli::Target, connect, expect_ok, logging};
 use anyhow::{Context, Result, bail};
-use clap::Parser;
 use hush_core::{
     filecopy,
     priority::{StreamPriority, set_stream_priority},
@@ -16,40 +15,42 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "hcp",
+#[derive(Debug, usage::Cli)]
+#[usage(
+    bin = "hcp",
     version,
+    unknown_flags = "error",
+    args_override_self = false,
     about = "Copy files over hush",
     long_about = "Copy files over hush using a streaming tar archive over QUIC.\n\nRemote syntax is [user@]host[:port]:path. Compression is zstd level 1 by default; -C disables compression."
 )]
 pub(crate) struct CpArgs {
     /// Enable client logging. Without this, client logging is disabled.
-    #[arg(short = 'v', long)]
+    #[usage(short = 'v', long)]
     pub(crate) verbose: bool,
 
     /// Skip TOFU host certificate verification for this connection.
-    #[arg(short = 'k', long, help_heading = "Host Trust")]
+    #[usage(short = 'k', long, help_heading = "Host Trust")]
     pub(crate) insecure: bool,
 
     /// Connect to this remote port, overriding target and ssh_config ports.
-    #[arg(short = 'p', value_name = "PORT")]
+    #[usage(short = 'p', value_name = "PORT")]
     pub(crate) port: Option<u16>,
 
     /// Disable compression. By default, hcp uses zstd level 1.
-    #[arg(short = 'C')]
+    #[usage(short = 'C')]
     pub(crate) no_compression: bool,
 
     /// Data directory for known_hosts and client state.
-    #[arg(long, value_name = "DIR", help_heading = "Files")]
+    #[usage(long, value_name = "DIR", help_heading = "Files")]
     pub(crate) data_dir: Option<PathBuf>,
 
     /// SSH identity file (Ed25519 or ECDSA). Agent use is preferred when it has this key.
-    #[arg(short = 'i', value_name = "PATH", help_heading = "Authentication")]
+    #[usage(short = 'i', value_name = "PATH", help_heading = "Authentication")]
     pub(crate) identity_file: Option<PathBuf>,
 
     /// Source paths followed by one destination.
-    #[arg(value_name = "SRC... DEST", required = true, num_args = 2..)]
+    #[usage(arg, required, var_min = 2, value_name = "SRC... DEST")]
     pub(crate) paths: Vec<String>,
 }
 

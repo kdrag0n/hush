@@ -1,6 +1,32 @@
 use anyhow::{Result, bail};
-use clap::Parser;
-use std::path::PathBuf;
+use std::{ffi::OsStr, path::PathBuf, str::FromStr};
+
+/// Parse `words` (argv without the program name) with `$ty`, handling help, version, and
+/// failures the way `parse()` does: help/version to stdout with exit 0, failures to stderr
+/// with exit 2.
+macro_rules! parse_or_exit {
+    ($ty:ty, $words:expr) => {{
+        let words: &[&::std::ffi::OsStr] = $words;
+        match <$ty>::parse_from(words) {
+            Ok(cli) => cli,
+            Err(usage::Error::Help { cmd, long }) => {
+                if let Some(page) = <$ty>::render_help(cmd, long) {
+                    print!("{page}");
+                }
+                ::std::process::exit(0);
+            }
+            Err(usage::Error::Version { .. }) => {
+                let bin = <$ty>::spec().bin.unwrap_or(env!("CARGO_PKG_NAME"));
+                println!("{bin} {}", env!("CARGO_PKG_VERSION"));
+                ::std::process::exit(0);
+            }
+            Err(err) => {
+                eprint!("{}", <$ty>::render_failure(words, &err));
+                ::std::process::exit(2);
+            }
+        }
+    }};
+}
 
 #[derive(Debug)]
 pub(crate) enum Cli {
@@ -17,84 +43,87 @@ impl Cli {
             .and_then(|arg| arg.to_str())
             .unwrap_or("hush");
         if argv0 == "hcp" {
-            return Ok(Self::Copy(crate::cp::CpArgs::parse_from(args)));
+            let words: Vec<&OsStr> = args.iter().skip(1).map(OsStr::new).collect();
+            return Ok(Self::Copy(parse_or_exit!(crate::cp::CpArgs, &words)));
         }
         if args.get(1).and_then(|arg| arg.to_str()) == Some("cp") {
             args.remove(1);
-            return Ok(Self::Copy(crate::cp::CpArgs::parse_from(args)));
+            let words: Vec<&OsStr> = args.iter().skip(1).map(OsStr::new).collect();
+            return Ok(Self::Copy(parse_or_exit!(crate::cp::CpArgs, &words)));
         }
-        Ok(Self::Session(Args::parse_from(args)))
+        let words: Vec<&OsStr> = args.iter().skip(1).map(OsStr::new).collect();
+        Ok(Self::Session(parse_or_exit!(Args, &words)))
     }
 }
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "hush",
+#[derive(Debug, usage::Cli)]
+#[usage(
+    bin = "hush",
     version,
+    unknown_flags = "error",
+    args_override_self = false,
     about = "SSH-like remote command client over QUIC",
     long_about = "hush connects to a hush-server over QUIC, authenticates with an Ed25519 or ECDSA (P-256/384/521) SSH key, and runs a remote shell or command.\n\nTarget syntax is [user@]host[:port]. IPv6 literals may be written as [::1]:22022.\n\nForward syntax for -L and -R is [listen_host:]listen_port:target_host:target_port."
 )]
 pub(crate) struct Args {
     /// Enable client logging. Without this, client logging is disabled.
-    #[arg(short = 'v', long)]
+    #[usage(short = 'v', long)]
     pub(crate) verbose: bool,
 
     /// Skip TOFU host certificate verification for this connection.
-    #[arg(short = 'k', long, help_heading = "Host Trust")]
+    #[usage(short = 'k', long, help_heading = "Host Trust")]
     pub(crate) insecure: bool,
 
     /// Connect to this remote port, overriding target and ssh_config ports.
-    #[arg(short = 'p', value_name = "PORT")]
+    #[usage(short = 'p', value_name = "PORT")]
     pub(crate) port: Option<u16>,
 
     /// Force PTY allocation.
-    #[arg(short = 't')]
+    #[usage(short = 't')]
     pub(crate) tty: bool,
 
     /// Disable PTY allocation and use stdin/stdout/stderr pipes.
-    #[arg(short = 'T')]
+    #[usage(short = 'T')]
     pub(crate) no_tty: bool,
 
     /// Data directory for known_hosts and client state.
-    #[arg(long, value_name = "DIR", help_heading = "Files")]
+    #[usage(long, value_name = "DIR", help_heading = "Files")]
     pub(crate) data_dir: Option<PathBuf>,
 
     /// SSH identity file (Ed25519 or ECDSA). Agent use is preferred when it has this key.
-    #[arg(short = 'i', value_name = "PATH", help_heading = "Authentication")]
+    #[usage(short = 'i', value_name = "PATH", help_heading = "Authentication")]
     pub(crate) identity_file: Option<PathBuf>,
 
     /// Execute the command directly instead of through the user's shell.
-    #[arg(short = 'S', long, help_heading = "Execution")]
+    #[usage(short = 'S', long, help_heading = "Execution")]
     pub(crate) no_shell: bool,
 
     /// Forward the local ssh-agent to the remote session.
-    #[arg(short = 'A', help_heading = "Forwarding")]
+    #[usage(short = 'A', help_heading = "Forwarding")]
     pub(crate) forward_agent: bool,
 
     /// Forward a local TCP port to the remote side.
-    #[arg(
+    #[usage(
         short = 'L',
         value_name = "[BIND:]PORT:TARGET_HOST:TARGET_PORT",
-        help_heading = "Forwarding",
-        value_parser = parse_forward
+        help_heading = "Forwarding"
     )]
     pub(crate) local_forward: Vec<ForwardArg>,
 
     /// Forward a remote TCP port back to the client side.
-    #[arg(
+    #[usage(
         short = 'R',
         value_name = "[BIND:]PORT:TARGET_HOST:TARGET_PORT",
-        help_heading = "Forwarding",
-        value_parser = parse_forward
+        help_heading = "Forwarding"
     )]
     pub(crate) remote_forward: Vec<ForwardArg>,
 
     /// Remote target as [user@]host[:port].
-    #[arg(value_name = "[USER@]HOST[:PORT]")]
+    #[usage(value_name = "[USER@]HOST[:PORT]")]
     pub(crate) target: String,
 
     /// Remote command and arguments. Defaults to a login shell.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    #[usage(value_name = "COMMAND", double_dash = "automatic")]
     pub(crate) command: Vec<String>,
 }
 
@@ -127,6 +156,14 @@ impl Target {
             host,
             port: port_override.or(port),
         })
+    }
+}
+
+impl FromStr for ForwardArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        parse_forward(s)
     }
 }
 
@@ -205,7 +242,6 @@ fn unbracket_host(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::{Parser, error::ErrorKind};
 
     #[test]
     fn target_accepts_domain_names() {
@@ -235,8 +271,19 @@ mod tests {
     }
 
     #[test]
+    fn remote_command_keeps_hyphenated_words() {
+        let words = ["-L", "8080:app:443", "box", "ls", "-la", "--color"].map(OsStr::new);
+        let args = Args::parse_from(&words).unwrap();
+        assert_eq!(args.target, "box");
+        assert_eq!(args.command, ["ls", "-la", "--color"]);
+        assert_eq!(args.local_forward.len(), 1);
+        assert_eq!(args.local_forward[0].target_port, 443);
+    }
+
+    #[test]
     fn tty_short_flag_cannot_be_repeated() {
-        let err = Args::try_parse_from(["hush", "-tt", "example.test"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        let words = ["-tt", "example.test"].map(OsStr::new);
+        let err = Args::parse_from(&words).unwrap_err();
+        assert!(matches!(err, usage::Error::DuplicateFlag { .. }), "{err:?}");
     }
 }

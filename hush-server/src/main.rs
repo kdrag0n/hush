@@ -3,7 +3,6 @@ mod logging;
 mod runtime;
 
 use anyhow::Result;
-use clap::Parser;
 use cli::Args;
 
 #[tokio::main]
