@@ -1,5 +1,5 @@
 use crate::{cli::Target, connect, expect_ok, logging};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use hush_core::{
     filecopy,
     priority::{StreamPriority, set_stream_priority},
@@ -278,7 +278,15 @@ fn sources_are_remote(sources: &[CopyPath]) -> Result<bool> {
 }
 
 async fn expect_copy_ready(recv: &mut quinn::RecvStream) -> Result<FileCopyPlan> {
-    match read_frame::<StreamResponse>(recv).await? {
+    let response = read_frame::<StreamResponse>(recv).await.map_err(|err| {
+        match err.downcast_ref::<io::Error>() {
+            Some(io_err) if io_err.kind() == io::ErrorKind::UnexpectedEof => {
+                anyhow!("server closed the copy stream without a response")
+            }
+            _ => err,
+        }
+    })?;
+    match response {
         StreamResponse::FileCopyReady(plan) => Ok(plan),
         StreamResponse::Error(err) => bail!("{err}"),
         other => bail!("unexpected copy response: {other:?}"),

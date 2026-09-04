@@ -191,10 +191,10 @@ impl AuthenticatedConnection {
                     tracing::info!(user = %self.user, direction = ?request.direction, "file copy");
                     let result = match request.direction {
                         FileCopyDirection::Upload => {
-                            filecopy::handle_upload(send, recv, request).await
+                            filecopy::handle_upload(send, recv, &self.user, request).await
                         }
                         FileCopyDirection::Download => {
-                            filecopy::handle_download(send, request).await
+                            filecopy::handle_download(send, &self.user, request).await
                         }
                     };
                     if let Err(err) = result {

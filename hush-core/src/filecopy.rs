@@ -9,7 +9,7 @@ use async_compression::{
 };
 use quinn::{RecvStream, SendStream};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     pin::Pin,
     task::{Context as TaskContext, Poll},
 };
@@ -146,29 +146,89 @@ where
     Ok(())
 }
 
+/// Resolve a client-supplied remote path the way scp does: absolute paths are
+/// used as-is, `~` and `~/…` expand to the user's home, and anything else is
+/// relative to the user's home directory, where sshd starts the remote scp.
+/// An empty path names the home directory itself.
+pub(crate) fn resolve_remote_path(user: &str, path: &str) -> PathBuf {
+    if path.starts_with('/') {
+        return PathBuf::from(path);
+    }
+    let home = home_dir_for_user(user);
+    match path.strip_prefix('~') {
+        Some("") => home.join(""),
+        Some(rest) if rest.starts_with('/') => home.join(&rest[1..]),
+        // `~other` is left relative, as scp's SFTP mode does.
+        _ => home.join(path),
+    }
+}
+
+/// The directory relative remote paths resolve against. When the server is
+/// not switching users, sessions inherit the server's `HOME`, so honor it for
+/// consistency with what `~` means in a shell there; otherwise use passwd.
+/// Like sshd, fall back to `/` when the user has no usable home.
+fn home_dir_for_user(user: &str) -> PathBuf {
+    let switching_user = crate::os::is_root() && user != crate::auth::current_username();
+    if !switching_user && let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty())
+    {
+        return PathBuf::from(home);
+    }
+    match crate::os::home_for_user(user) {
+        Ok(Some(home)) => home,
+        Ok(None) => {
+            tracing::warn!(user = %user, "no home directory; resolving copy paths against /");
+            PathBuf::from("/")
+        }
+        Err(err) => {
+            tracing::warn!(user = %user, %err, "home lookup failed; resolving copy paths against /");
+            PathBuf::from("/")
+        }
+    }
+}
+
 pub(crate) async fn handle_upload(
     mut send: SendStream,
     recv: RecvStream,
+    user: &str,
     request: FileCopyRequest,
 ) -> Result<()> {
     set_stream_priority(&send, StreamPriority::FileCopy);
-    let plan = plan_for_destination(Path::new(&request.destination), &request.entries).await?;
+    let destination = resolve_remote_path(user, &request.destination);
+    let plan = match plan_for_destination(&destination, &request.entries).await {
+        Ok(plan) => plan,
+        Err(err) => return write_copy_result(send, Err(err)).await,
+    };
     write_frame(&mut send, &StreamResponse::FileCopyReady(plan.clone())).await?;
     let result = receive_archive(recv, Path::new(&plan.extract_dir), request.compression).await;
     write_copy_result(send, result).await
 }
 
-pub(crate) async fn handle_download(mut send: SendStream, request: FileCopyRequest) -> Result<()> {
+pub(crate) async fn handle_download(
+    mut send: SendStream,
+    user: &str,
+    request: FileCopyRequest,
+) -> Result<()> {
     set_stream_priority(&send, StreamPriority::FileCopy);
+    let mut entries = request.entries.clone();
+    for entry in &mut entries {
+        let path = resolve_remote_path(user, &entry.path);
+        // Check sources up front so a missing file is reported as an error
+        // frame rather than a truncated archive.
+        if let Err(err) = tokio::fs::symlink_metadata(&path).await {
+            let err = anyhow::Error::new(err).context(format!("stat source `{}`", path.display()));
+            return write_copy_result(send, Err(err)).await;
+        }
+        entry.path = path.to_string_lossy().into_owned();
+    }
     write_frame(
         &mut send,
         &StreamResponse::FileCopyReady(FileCopyPlan {
             extract_dir: String::new(),
-            entries: request.entries.clone(),
+            entries: entries.clone(),
         }),
     )
     .await?;
-    send_archive(send, &request.entries, request.compression).await
+    send_archive(send, &entries, request.compression).await
 }
 
 async fn write_copy_result(mut send: SendStream, result: Result<()>) -> Result<()> {
@@ -298,6 +358,22 @@ mod tests {
             .unwrap();
         assert_eq!(plan.extract_dir, ".");
         assert_eq!(plan.entries[0].archive_name, "dest.txt");
+    }
+
+    #[test]
+    fn resolves_remote_paths_like_scp() {
+        let user = crate::auth::current_username();
+        let home = home_dir_for_user(&user);
+        assert_eq!(
+            resolve_remote_path(&user, "/tmp/x"),
+            PathBuf::from("/tmp/x")
+        );
+        assert_eq!(resolve_remote_path(&user, ""), home.join(""));
+        assert_eq!(resolve_remote_path(&user, "~"), home.join(""));
+        assert_eq!(resolve_remote_path(&user, "~/a/b"), home.join("a/b"));
+        assert_eq!(resolve_remote_path(&user, "a/b"), home.join("a/b"));
+        assert_eq!(resolve_remote_path(&user, "dir/"), home.join("dir/"));
+        assert!(destination_looks_like_dir(&resolve_remote_path(&user, "")));
     }
 
     #[tokio::test]

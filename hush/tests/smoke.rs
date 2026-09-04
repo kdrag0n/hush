@@ -57,8 +57,11 @@ impl TestEnv {
     }
 
     fn start_server_with(&mut self, extra_args: &[&str]) {
+        let server_home = self.temp.path().join("server-home");
+        fs::create_dir_all(&server_home).unwrap();
         let child = Command::new(server_bin())
             .env_remove("SSH_AUTH_SOCK")
+            .env("HOME", &server_home)
             .arg("--data-dir")
             .arg(&self.data)
             .arg("--authorized-keys")
@@ -425,6 +428,69 @@ fn hcp_uploads_file_with_zstd() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("upload local.txt"), "{out:?}");
     assert!(stderr.contains("done"), "{out:?}");
+}
+
+#[test]
+fn hcp_resolves_remote_paths_relative_to_home() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let server_home = env.temp.path().join("server-home");
+    fs::create_dir_all(server_home.join("sub")).unwrap();
+    let source = env.temp.path().join("local.txt");
+    fs::write(&source, "home-ok\n").unwrap();
+
+    // `host:` means the home directory, like scp.
+    let out = env
+        .hcp()
+        .arg(&source)
+        .arg(format!("{}:", env.target()))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        fs::read_to_string(server_home.join("local.txt")).unwrap(),
+        "home-ok\n"
+    );
+
+    // Relative paths resolve against home, with rename semantics.
+    let out = env
+        .hcp()
+        .arg(&source)
+        .arg(format!("{}:sub/renamed.txt", env.target()))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        fs::read_to_string(server_home.join("sub/renamed.txt")).unwrap(),
+        "home-ok\n"
+    );
+
+    // `~/` works too, and downloads resolve the same way.
+    let destination = env.temp.path().join("downloaded.txt");
+    let out = env
+        .hcp()
+        .arg(format!("{}:~/sub/renamed.txt", env.target()))
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(fs::read_to_string(destination).unwrap(), "home-ok\n");
+}
+
+#[test]
+fn hcp_reports_missing_remote_source() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let out = env
+        .hcp()
+        .arg(format!("{}:does-not-exist.txt", env.target()))
+        .arg(env.temp.path().join("out.txt"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does-not-exist.txt"), "{out:?}");
+    assert!(!stderr.contains("unexpected end of file"), "{out:?}");
 }
 
 #[test]
