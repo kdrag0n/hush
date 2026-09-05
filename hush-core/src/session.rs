@@ -316,6 +316,10 @@ async fn run_pty(
             Some(signal) = signal_rx.recv() => send_process_group_signal(child_pid, signal)?,
         }
     };
+    // Command retains the parent's slave handles for subsequent spawns. Close
+    // them before draining output so the master can reach EOF. Keep them until
+    // child exit because login may close and reopen the slave during startup.
+    drop(cmd);
     resize_task.abort();
     in_task.abort();
     let _ = in_task.await;

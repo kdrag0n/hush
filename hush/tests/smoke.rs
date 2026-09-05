@@ -249,6 +249,31 @@ fn forced_pty_works() {
 }
 
 #[test]
+fn pty_exit_drains_output_without_timeout() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let start = Instant::now();
+    let out = env
+        .hush()
+        .arg("-t")
+        .arg("-S")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("i=0; while [ $i -lt 4096 ]; do printf 'logout-output\\n'; i=$((i + 1)); done; exit 7")
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(out.status.code(), Some(7), "{out:?}");
+    assert_eq!(out.stdout, b"logout-output\r\n".repeat(4096));
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "PTY exit took {elapsed:?}; output should drain without the two-second timeout"
+    );
+}
+
+#[test]
 fn domain_name_target_works() {
     let mut env = TestEnv::new();
     env.start_server();
