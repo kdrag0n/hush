@@ -13,7 +13,7 @@ brew install kdrag0n/tap/hush
 Server:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kdrag0n/hush/refs/heads/main/scripts/install-server.sh | sh
+curl -fsSL https://kdrag0n.dev/install-hush | sh
 ```
 
 ## Usage
