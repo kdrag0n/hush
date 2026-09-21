@@ -262,7 +262,10 @@ async fn run_pipes(
             Some(signal) = signal_rx.recv() => send_process_group_signal(child_pid, signal)?,
         }
     };
-    in_task.await.ok();
+    // The client's stdin may never reach EOF (e.g. an idle terminal), and the
+    // child can no longer read it anyway.
+    in_task.abort();
+    let _ = in_task.await;
     out_task.await.ok();
     err_task.await.ok();
     Ok(process_exit_from_status(status))

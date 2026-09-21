@@ -210,6 +210,36 @@ fn propagates_exit_status() {
 }
 
 #[test]
+fn non_pty_exit_does_not_wait_for_stdin_eof() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let mut child = env
+        .hush()
+        .arg("-T")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("echo open-stdin-ok; exit 7")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Hold stdin open, like a terminal that never sends EOF.
+    let stdin = child.stdin.take().unwrap();
+    let status = wait_for_child_exit(&mut child, Duration::from_secs(5));
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert!(status.is_some(), "hush hung waiting for stdin EOF: {out:?}");
+    assert_eq!(out.status.code(), Some(7), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "open-stdin-ok");
+}
+
+#[test]
 fn server_uses_server_subdir_for_config_and_host_key() {
     let mut env = TestEnv::new();
     env.start_server_from_config();
