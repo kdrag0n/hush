@@ -27,7 +27,8 @@ pristine upstream source, so `git log -- vendor/<crate>` shows the patches.
 ## quinn-proto 0.11.14
 
 - `Connection::set_congestion_controller` replaces the path's controller at
-  runtime.
+  runtime, and paths created afterwards (by a migration) use the same
+  factory rather than the config's.
 - `Connection::set_ack_frequency_config` changes the requested peer ACK
   behavior at runtime and forces a new ACK_FREQUENCY frame.
 - `Connection::set_remote_address` lets a client follow a server that moves a

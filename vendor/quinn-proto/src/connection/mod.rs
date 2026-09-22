@@ -135,6 +135,9 @@ pub struct Connection {
     config: Arc<TransportConfig>,
     /// Requested peer ACK behavior; starts as the config's and may be changed at runtime
     ack_frequency_config: Option<AckFrequencyConfig>,
+    /// Builds the congestion controller for new paths; starts as the config's and may be
+    /// changed at runtime
+    congestion_controller_factory: Arc<dyn ControllerFactory + Send + Sync>,
     rng: StdRng,
     crypto: Box<dyn crypto::Session>,
     /// The CID we initially chose, for use during the handshake
@@ -337,6 +340,7 @@ impl Connection {
                 &TransportParameters::default(),
             )),
             ack_frequency_config: config.ack_frequency_config.clone(),
+            congestion_controller_factory: config.congestion_controller_factory.clone(),
 
             pto_count: 0,
 
@@ -1439,7 +1443,9 @@ impl Connection {
         factory: Arc<dyn ControllerFactory + Send + Sync>,
         now: Instant,
     ) {
-        self.path.congestion = factory.build(now, self.path.current_mtu());
+        self.path.congestion = factory.clone().build(now, self.path.current_mtu());
+        // Paths created later, e.g. by a migration, must use it too
+        self.congestion_controller_factory = factory;
     }
 
     /// Change how often the peer is asked to acknowledge our packets.
@@ -3107,6 +3113,17 @@ impl Connection {
                 &self.config,
             )
         };
+        if !Arc::ptr_eq(
+            &self.congestion_controller_factory,
+            &self.config.congestion_controller_factory,
+        ) && !(remote.is_ipv4() && remote.ip() == self.path.remote.ip())
+        {
+            // `PathData::new` built a controller from the config; honor a runtime override
+            new_path.congestion = self
+                .congestion_controller_factory
+                .clone()
+                .build(now, new_path.current_mtu());
+        }
         new_path.challenge = Some(self.rng.random());
         new_path.challenge_pending = true;
         let prev_pto = self.pto(SpaceId::Data);
