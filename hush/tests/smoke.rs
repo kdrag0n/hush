@@ -486,6 +486,33 @@ fn hcp_uploads_file_with_zstd() {
 }
 
 #[test]
+fn hcp_moves_copy_to_private_port() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let source = env.temp.path().join("local.txt");
+    let destination = env.temp.path().join("remote.txt");
+    fs::write(&source, "private-port-ok\n").unwrap();
+
+    // A copy this small finishes before anything else reaches the shared
+    // socket, so the server must notice the private socket on its own.
+    let out = env
+        .hcp()
+        .arg("-v")
+        .arg(&source)
+        .arg(format!("{}:{}", env.target(), destination.display()))
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        fs::read_to_string(destination).unwrap(),
+        "private-port-ok\n"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("moved copy to private port"), "{out:?}");
+}
+
+#[test]
 fn hcp_resolves_remote_paths_relative_to_home() {
     let mut env = TestEnv::new();
     env.start_server();
@@ -851,6 +878,7 @@ async fn server_rejects_certificate_claiming_wrong_user() {
         identity,
         "hush-wrong-user",
         true,
+        hush_core::tls::TransportProfile::Interactive,
     )
     .unwrap();
     let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();

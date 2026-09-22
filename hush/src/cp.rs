@@ -7,9 +7,11 @@ use hush_core::{
         FileCopyCompression, FileCopyDirection, FileCopyEntry, FileCopyPlan, FileCopyRequest,
         StreamOpen, StreamResponse, read_frame, write_frame,
     },
+    tls::TransportProfile,
 };
 use std::{
     io::{self, Write},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -114,6 +116,7 @@ async fn upload(
         args.data_dir.clone(),
         args.identity_file.clone(),
         args.insecure,
+        TransportProfile::Bulk,
     )
     .await?;
     let (mut send, mut recv) = connected.conn.open_bi().await?;
@@ -130,6 +133,7 @@ async fn upload(
     .await?;
 
     let plan = expect_copy_ready(&mut recv).await?;
+    move_to_private_port(&connected, plan.private_port);
     let progress = Arc::new(Mutex::new(CopyProgress::new("upload")));
     let entry_progress = Arc::clone(&progress);
     let byte_progress = Arc::clone(&progress);
@@ -145,6 +149,7 @@ async fn upload(
         Ok(()) => expect_ok(&mut recv).await,
         Err(err) => Err(err),
     };
+    tracing::debug!(stats = ?connected.conn.stats(), "upload finished");
     if result.is_ok() {
         progress.lock().unwrap().finish("done");
     } else {
@@ -189,6 +194,7 @@ async fn download(
         args.data_dir.clone(),
         args.identity_file.clone(),
         args.insecure,
+        TransportProfile::Bulk,
     )
     .await?;
     let (mut send, mut recv) = connected.conn.open_bi().await?;
@@ -206,7 +212,8 @@ async fn download(
     .await?;
     send.finish()?;
 
-    let _ = expect_copy_ready(&mut recv).await?;
+    let ready = expect_copy_ready(&mut recv).await?;
+    move_to_private_port(&connected, ready.private_port);
     let progress = Arc::new(Mutex::new(CopyProgress::new("download")));
     progress.lock().unwrap().start_plan(&plan.entries);
     let byte_progress = Arc::clone(&progress);
@@ -217,12 +224,39 @@ async fn download(
         move |bytes| byte_progress.lock().unwrap().add_bytes(bytes),
     )
     .await;
+    tracing::debug!(stats = ?connected.conn.stats(), "download finished");
     if copy_result.is_ok() {
         progress.lock().unwrap().finish("done");
     } else {
         progress.lock().unwrap().finish("failed");
     }
     copy_result
+}
+
+/// Continue the connection on a server socket dedicated to it, from a fresh
+/// local socket connected to that port. Both ends then send without a
+/// per-packet route lookup. Failure just leaves the copy on the shared port.
+fn move_to_private_port(connected: &crate::ClientConnection, port: Option<u16>) {
+    let Some(port) = port else {
+        return;
+    };
+    let remote = SocketAddr::new(connected.conn.remote_address().ip(), port);
+    let socket = match crate::net::connected_socket(remote) {
+        Ok(socket) => socket,
+        Err(err) => {
+            tracing::debug!(%remote, %err, "not moving to private port");
+            return;
+        }
+    };
+    connected.conn.set_remote_address(remote);
+    if let Err(err) = connected.endpoint.rebind(socket) {
+        tracing::debug!(%remote, %err, "rebind to private port failed");
+        connected.conn.set_remote_address(SocketAddr::new(
+            remote.ip(),
+            connected.conn.remote_address().port(),
+        ));
+    }
+    tracing::debug!(%remote, "moved copy to private port");
 }
 
 fn split_sources_destination(paths: &[String]) -> Result<(&[String], &String)> {

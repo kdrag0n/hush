@@ -91,6 +91,10 @@ pub struct FileCopyRequest {
 pub struct FileCopyPlan {
     pub extract_dir: String,
     pub entries: Vec<FileCopyEntry>,
+    /// A server UDP port dedicated to this connection. The client should move
+    /// the connection there so both ends can use connected sockets, which
+    /// send far more cheaply on some platforms.
+    pub private_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

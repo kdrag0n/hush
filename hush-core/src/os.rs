@@ -432,3 +432,36 @@ pub fn send_process_group_signal(pid: i32, signal: RemoteSignal) -> Result<()> {
     }
     Ok(())
 }
+
+/// Socket receive buffer for QUIC endpoints. Senders batch datagrams and
+/// links burst, so leave room for a good fraction of a second at line rate
+/// rather than the kernel default of well under a megabyte.
+pub const UDP_RECV_BUFFER: usize = 8 << 20;
+
+/// Bind a UDP socket for a QUIC endpoint with a large receive buffer.
+pub fn bind_udp_socket(addr: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(false)?;
+    }
+    set_recv_buffer(&socket);
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
+/// Ask for a large receive buffer, settling for whatever the kernel allows.
+pub fn set_recv_buffer(socket: &socket2::Socket) {
+    let mut size = UDP_RECV_BUFFER;
+    while size > 256 << 10 {
+        if socket.set_recv_buffer_size(size).is_ok() {
+            return;
+        }
+        size /= 2;
+    }
+}

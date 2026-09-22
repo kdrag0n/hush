@@ -7,6 +7,7 @@ mod session;
 
 use anyhow::{Result, bail};
 use cli::{Cli, Target};
+use hush_core::tls::TransportProfile;
 use hush_core::{
     auth,
     config::{self, SshForward},
@@ -18,7 +19,6 @@ use hush_core::{
     },
 };
 use quinn::Endpoint;
-use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -41,6 +41,7 @@ async fn main() -> Result<()> {
         args.data_dir,
         args.identity_file,
         args.insecure,
+        TransportProfile::Interactive,
     )
     .await?;
     let config::SshHostConfig {
@@ -116,6 +117,7 @@ pub(crate) async fn connect(
     data_dir: Option<std::path::PathBuf>,
     identity_file: Option<std::path::PathBuf>,
     insecure: bool,
+    profile: TransportProfile,
 ) -> Result<ClientConnection> {
     let ssh_cfg = config::read_ssh_config(&target.host_alias)?;
     let user = target
@@ -136,16 +138,15 @@ pub(crate) async fn connect(
     let agent = agent_socket(ssh_cfg.identity_agent.clone());
 
     let identity = auth::load_identity_with_options(identity_file.as_deref(), &agent)?;
-    let mut endpoint = Endpoint::client("[::]:0".parse::<SocketAddr>()?)?;
-    endpoint.set_default_client_config(hush_core::tls::make_client_config(
+    let client_config = hush_core::tls::make_client_config(
         &data_dir,
         hush_core::tls::host_key(&host, port),
         identity,
         &user,
         insecure,
-    )?);
-
-    let conn = net::connect_any(&endpoint, &host, port).await?;
+        profile,
+    )?;
+    let (endpoint, conn) = net::connect_any(client_config, &host, port).await?;
     Ok(ClientConnection {
         endpoint,
         conn,

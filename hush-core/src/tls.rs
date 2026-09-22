@@ -3,9 +3,11 @@ use crate::{
     auth::{self, IdentityKey},
 };
 use anyhow::{Result, bail};
-use quinn::{AckFrequencyConfig, ClientConfig, ServerConfig, TransportConfig, VarInt};
+use quinn::{
+    AckFrequencyConfig, ClientConfig, MtuDiscoveryConfig, ServerConfig, TransportConfig, VarInt,
+};
 use quinn_proto::{
-    congestion::BbrConfig,
+    congestion::{BbrConfig, ControllerFactory, CubicConfig},
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
 use rustls::{
@@ -40,6 +42,28 @@ const QUIC_FAST_TIME_THRESHOLD: f32 = 1.0;
 const QUIC_FAST_INITIAL_RTT: Duration = Duration::from_millis(100);
 const QUIC_FAST_ACK_DELAY: Duration = Duration::from_millis(1);
 const QUIC_CLIENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
+const QUIC_MTU_BLACK_HOLE_COOLDOWN: Duration = Duration::from_secs(1);
+const QUIC_MTU_UPPER_BOUND: u16 = 1500 - 20 - 8;
+/// Bulk transfers ask the peer to acknowledge at most every 51 packets or
+/// 20ms. Every ACK is a frame the receiver must send back over the link, and
+/// on half-duplex media such as Wi-Fi that reverse traffic costs airtime that
+/// would otherwise carry payload; it also lets the receiver batch work.
+const QUIC_BULK_ACK_ELICITING_THRESHOLD: u32 = 50;
+const QUIC_BULK_ACK_DELAY: Duration = Duration::from_millis(20);
+const QUIC_BULK_TIME_THRESHOLD: f32 = 9.0 / 8.0;
+const QUIC_BULK_PACKET_THRESHOLD: u32 = 10;
+
+/// How a connection's transport should be tuned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportProfile {
+    /// Interactive sessions and port forwards: ACK eagerly and use BBR, which
+    /// keeps latency low and holds up on lossy mobile links.
+    Interactive,
+    /// A single large transfer: use CUBIC and sparse ACKs. BBR's bandwidth
+    /// probing overshoots badly on links that drop rather than queue excess
+    /// packets (Wi-Fi in particular), and every ACK is reverse traffic.
+    Bulk,
+}
 
 #[derive(Debug, Clone)]
 struct KnownHosts {
@@ -113,6 +137,7 @@ pub fn make_client_config(
     identity: auth::LoadedIdentity,
     user: &str,
     insecure: bool,
+    profile: TransportProfile,
 ) -> Result<ClientConfig> {
     let provider = pq_provider();
     let verifier = Arc::new(TofuServerVerifier {
@@ -148,9 +173,10 @@ pub fn make_client_config(
     };
     cfg.alpn_protocols = vec![ALPN.to_vec()];
     let mut quic_cfg = ClientConfig::new(Arc::new(QuicClientConfig::try_from(cfg)?));
-    quic_cfg.transport_config(Arc::new(long_idle_transport(Some(
-        QUIC_CLIENT_KEEP_ALIVE_INTERVAL,
-    ))?));
+    quic_cfg.transport_config(Arc::new(long_idle_transport(
+        Some(QUIC_CLIENT_KEEP_ALIVE_INTERVAL),
+        profile,
+    )?));
     Ok(quic_cfg)
 }
 
@@ -167,7 +193,7 @@ pub fn make_server_config(
         .with_single_cert(vec![cert], key)?;
     cfg.alpn_protocols = vec![ALPN.to_vec()];
     let mut quic_cfg = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(cfg)?));
-    quic_cfg.transport = Arc::new(long_idle_transport(None)?);
+    quic_cfg.transport = Arc::new(long_idle_transport(None, TransportProfile::Interactive)?);
     Ok(quic_cfg)
 }
 
@@ -383,24 +409,78 @@ fn pq_provider() -> CryptoProvider {
     provider
 }
 
-fn long_idle_transport(keep_alive_interval: Option<Duration>) -> Result<TransportConfig> {
+fn long_idle_transport(
+    keep_alive_interval: Option<Duration>,
+    profile: TransportProfile,
+) -> Result<TransportConfig> {
     let mut transport = TransportConfig::default();
     transport.max_idle_timeout(Some(Duration::from_secs(7 * 24 * 60 * 60).try_into()?));
     transport.keep_alive_interval(keep_alive_interval);
     transport.send_window(QUIC_FAST_SEND_WINDOW);
     transport.stream_receive_window(VarInt::from_u32(QUIC_FAST_STREAM_RECV_WINDOW));
     transport.receive_window(VarInt::from_u32(QUIC_FAST_CONN_RECV_WINDOW));
-    transport.packet_threshold(QUIC_FAST_PACKET_THRESHOLD);
-    transport.time_threshold(QUIC_FAST_TIME_THRESHOLD);
+    transport.packet_threshold(match profile {
+        TransportProfile::Interactive => QUIC_FAST_PACKET_THRESHOLD,
+        // Wi-Fi block acknowledgement reorders packets routinely; leave real
+        // loss to the time threshold rather than reacting to reordering.
+        TransportProfile::Bulk => QUIC_BULK_PACKET_THRESHOLD,
+    });
+    transport.time_threshold(match profile {
+        TransportProfile::Interactive => QUIC_FAST_TIME_THRESHOLD,
+        // Declaring a packet lost costs a bulk flow a congestion window cut
+        // and seconds of regrowth, so use the RFC 9002 margin over links that
+        // jitter, such as Wi-Fi with frame aggregation.
+        TransportProfile::Bulk => QUIC_BULK_TIME_THRESHOLD,
+    });
     transport.initial_rtt(QUIC_FAST_INITIAL_RTT);
-    let mut ack_frequency = AckFrequencyConfig::default();
-    ack_frequency.ack_eliciting_threshold(VarInt::from_u32(0));
-    ack_frequency.max_ack_delay(Some(QUIC_FAST_ACK_DELAY));
-    ack_frequency.reordering_threshold(VarInt::from_u32(QUIC_FAST_PACKET_THRESHOLD - 1));
-    transport.ack_frequency_config(Some(ack_frequency));
+    transport.ack_frequency_config(Some(ack_frequency_config(profile)));
     transport.persistent_congestion_threshold(10);
-    transport.congestion_controller_factory(Arc::new(BbrConfig::default()));
+    let mut mtu_discovery = MtuDiscoveryConfig::default();
+    // Lossy links (Wi-Fi, mobile) drop full-size packets in bursts that look
+    // exactly like an MTU black hole, and quinn then pins the MTU at the
+    // 1200-byte floor until the cooldown passes. Probing is nearly free, so
+    // recover quickly instead of paying 20% more packets per byte for a minute.
+    mtu_discovery.black_hole_cooldown(QUIC_MTU_BLACK_HOLE_COOLDOWN);
+    // Ethernet MTU minus IPv4 and UDP headers. IPv6 paths settle at 1452.
+    mtu_discovery.upper_bound(QUIC_MTU_UPPER_BOUND);
+    transport.mtu_discovery_config(Some(mtu_discovery));
+    transport.congestion_controller_factory(congestion_controller(profile));
     Ok(transport)
+}
+
+fn ack_frequency_config(profile: TransportProfile) -> AckFrequencyConfig {
+    let mut ack_frequency = AckFrequencyConfig::default();
+    match profile {
+        TransportProfile::Interactive => {
+            ack_frequency.ack_eliciting_threshold(VarInt::from_u32(0));
+            ack_frequency.max_ack_delay(Some(QUIC_FAST_ACK_DELAY));
+        }
+        TransportProfile::Bulk => {
+            ack_frequency
+                .ack_eliciting_threshold(VarInt::from_u32(QUIC_BULK_ACK_ELICITING_THRESHOLD));
+            ack_frequency.max_ack_delay(Some(QUIC_BULK_ACK_DELAY));
+        }
+    }
+    ack_frequency.reordering_threshold(VarInt::from_u32(match profile {
+        TransportProfile::Interactive => QUIC_FAST_PACKET_THRESHOLD - 1,
+        TransportProfile::Bulk => QUIC_BULK_PACKET_THRESHOLD - 1,
+    }));
+    ack_frequency
+}
+
+fn congestion_controller(profile: TransportProfile) -> Arc<dyn ControllerFactory + Send + Sync> {
+    match profile {
+        TransportProfile::Interactive => Arc::new(BbrConfig::default()),
+        TransportProfile::Bulk => Arc::new(CubicConfig::default()),
+    }
+}
+
+/// Retune an established connection for a bulk transfer. Servers accept every
+/// connection with the interactive profile because they learn what a
+/// connection is for only once the client opens its first stream.
+pub fn switch_to_bulk(conn: &quinn::Connection) {
+    conn.set_congestion_controller(congestion_controller(TransportProfile::Bulk));
+    conn.set_ack_frequency_config(Some(ack_frequency_config(TransportProfile::Bulk)));
 }
 
 fn ensure_private_dir(path: &Path) -> Result<()> {

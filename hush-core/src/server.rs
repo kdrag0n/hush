@@ -17,6 +17,7 @@
 use crate::{
     auth,
     config::ServerRuntimeConfig,
+    fastsock::{MultiSocket, PrivateSocketGuard},
     filecopy,
     priority::{StreamPriority, set_stream_priority},
     protocol::{
@@ -27,7 +28,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail};
 use quinn::{Connection, SendStream};
 use rustls_pki_types::CertificateDer;
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 /// The only detail a rejected peer learns about why it was rejected.
 const AUTH_FAILURE_MESSAGE: &str = "unauthorized";
@@ -38,10 +39,11 @@ pub async fn serve_connection(
     conn: Connection,
     config: ServerRuntimeConfig,
     server_addr: SocketAddr,
+    sockets: Option<Arc<MultiSocket>>,
 ) -> Result<()> {
     PendingConnection::new(conn, config, server_addr)?
         .authenticate()?
-        .serve()
+        .serve(sockets)
         .await
 }
 
@@ -161,8 +163,11 @@ impl AuthenticatedConnection {
     }
 
     /// Serve streams until the connection closes or a session finishes.
-    pub async fn serve(self) -> Result<()> {
+    pub async fn serve(self, sockets: Option<Arc<MultiSocket>>) -> Result<()> {
         let mut remote_forwards = 0usize;
+        // Lives as long as the connection: once the peer has moved to it, every
+        // packet of the connection, including its close, goes through it.
+        let mut private_socket: Option<PrivateSocketGuard> = None;
         loop {
             let (mut send, mut recv) = self.conn.accept_bi().await?;
             match read_frame::<StreamOpen>(&mut recv).await? {
@@ -189,14 +194,28 @@ impl AuthenticatedConnection {
                 StreamOpen::FileCopy(request) => {
                     set_stream_priority(&send, StreamPriority::FileCopy);
                     tracing::info!(user = %self.user, direction = ?request.direction, "file copy");
+                    crate::tls::switch_to_bulk(&self.conn);
+                    if private_socket.is_none() {
+                        private_socket = sockets.as_ref().and_then(|sockets| {
+                            sockets
+                                .open_private()
+                                .inspect_err(
+                                    |err| tracing::warn!(%err, "open private socket failed"),
+                                )
+                                .ok()
+                        });
+                    }
+                    let private_port = private_socket.as_ref().map(|guard| guard.port());
                     let result = match request.direction {
                         FileCopyDirection::Upload => {
-                            filecopy::handle_upload(send, recv, &self.user, request).await
+                            filecopy::handle_upload(send, recv, &self.user, request, private_port)
+                                .await
                         }
                         FileCopyDirection::Download => {
-                            filecopy::handle_download(send, &self.user, request).await
+                            filecopy::handle_download(send, &self.user, request, private_port).await
                         }
                     };
+                    tracing::debug!(stats = ?self.conn.stats(), "file copy finished");
                     if let Err(err) = result {
                         tracing::warn!(%err, "file copy failed");
                     }
