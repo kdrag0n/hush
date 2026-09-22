@@ -10,6 +10,7 @@ usage.workspace = true
 hush-core = { path = "../hush-core" }
 libc.workspace = true
 quinn.workspace = true
+socket2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

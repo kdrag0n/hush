@@ -24,6 +24,7 @@ quinn = { version = "0.11.9", default-features = false, features = [
     "runtime-tokio",
     "rustls-aws-lc-rs",
 ] }
+quinn-udp = { version = "0.5.14", features = ["fast-apple-datapath"] }
 quinn-proto = { version = "0.11.14", default-features = false, features = [
     "bloom",
     "log",
@@ -39,6 +40,7 @@ rustls = { version = "0.23.40", features = ["aws-lc-rs"] }
 rustls-pki-types = "1.13.2"
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.10.9"
+socket2 = "0.6.3"
 shell-words = "1.1.0"
 ssh-agent-client-rs = "1.1.2"
 ssh-key = { version = "0.6.7", features = [
@@ -57,3 +59,8 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 x509-parser = "0.18.0"
 xdg = "3.0.0"
+
+[patch.crates-io]
+quinn = { path = "vendor/quinn" }
+quinn-proto = { path = "vendor/quinn-proto" }
+quinn-udp = { path = "vendor/quinn-udp" }

@@ -80,6 +80,8 @@ pub struct UdpSocketState {
     /// In particular, we do not use IP_TOS cmsg_type in this case,
     /// which is not supported on Linux <3.13 and results in not sending the UDP packet at all.
     sendmsg_einval: AtomicBool,
+    /// True if the socket is connected; sends then omit the destination address.
+    connected: AtomicBool,
 }
 
 impl UdpSocketState {
@@ -187,6 +189,7 @@ impl UdpSocketState {
         Ok(Self {
             last_send_error: Mutex::new(now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now)),
             max_gso_segments: AtomicUsize::new(gso::max_gso_segments()),
+            connected: AtomicBool::new(io.peer_addr().is_ok()),
             gro_segments: gro::gro_segments(),
             may_fragment,
             sendmsg_einval: AtomicBool::new(false),
@@ -241,6 +244,19 @@ impl UdpSocketState {
     #[inline]
     pub fn max_gso_segments(&self) -> usize {
         self.max_gso_segments.load(Ordering::Relaxed)
+    }
+
+    /// Whether sends omit the destination because the socket is connected.
+    ///
+    /// Detected at construction; call [`Self::set_connected`] after
+    /// `connect()`ing a socket that was already wrapped.
+    pub fn connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
+    }
+
+    /// Record that the socket has been `connect()`ed (or disconnected).
+    pub fn set_connected(&self, connected: bool) {
+        self.connected.store(connected, Ordering::Relaxed);
     }
 
     /// The number of segments to read when GRO is enabled. Used as a factor to
@@ -412,6 +428,10 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
             state.sendmsg_einval(),
         );
         hdrs[i].msg_datalen = chunk.len();
+        if state.connected() {
+            hdrs[i].msg_name = std::ptr::null_mut();
+            hdrs[i].msg_namelen = 0;
+        }
         cnt += 1;
     }
     loop {
@@ -494,6 +514,10 @@ fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> 
         match e.kind() {
             // Retry receiving
             io::ErrorKind::Interrupted => continue,
+            // A connected socket reports ICMP errors for the peer here. They
+            // are transient path conditions, not socket failures, so drop them
+            // and let QUIC's own loss recovery decide.
+            _ if is_icmp_error(&e) => continue,
             _ => return Err(e),
         }
     };
@@ -529,6 +553,10 @@ fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> 
         match e.kind() {
             // Retry receiving
             io::ErrorKind::Interrupted => continue,
+            // A connected socket reports ICMP errors for the peer here. They
+            // are transient path conditions, not socket failures, so drop them
+            // and let QUIC's own loss recovery decide.
+            _ if is_icmp_error(&e) => continue,
             _ => return Err(e),
         }
     };
@@ -559,6 +587,7 @@ fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> 
         match e.kind() {
             // Retry receiving
             io::ErrorKind::Interrupted => continue,
+            _ if is_icmp_error(&e) => continue,
             _ => return Err(e),
         }
     };
@@ -567,6 +596,21 @@ fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> 
 }
 
 const CMSG_LEN: usize = 88;
+
+
+/// Errors a connected datagram socket surfaces when ICMP reports trouble
+/// reaching the peer.
+fn is_icmp_error(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ECONNREFUSED)
+            | Some(libc::EHOSTUNREACH)
+            | Some(libc::ENETUNREACH)
+            | Some(libc::EHOSTDOWN)
+            | Some(libc::ENETDOWN)
+            | Some(libc::EMSGSIZE)
+    )
+}
 
 fn prepare_msg(
     transmit: &Transmit<'_>,

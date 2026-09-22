@@ -634,6 +634,37 @@ impl Connection {
         conn.wake();
     }
 
+    /// Replace the congestion controller on the current path.
+    ///
+    /// See [`proto::Connection::set_congestion_controller()`].
+    pub fn set_congestion_controller(
+        &self,
+        factory: Arc<dyn proto::congestion::ControllerFactory + Send + Sync>,
+    ) {
+        let mut conn = self.0.state.lock("set_congestion_controller");
+        let now = conn.runtime.now();
+        conn.inner.set_congestion_controller(factory, now);
+        conn.wake();
+    }
+
+    /// Change how often the peer is asked to acknowledge our packets.
+    ///
+    /// See [`proto::Connection::set_ack_frequency_config()`].
+    pub fn set_ack_frequency_config(&self, config: Option<proto::AckFrequencyConfig>) {
+        let mut conn = self.0.state.lock("set_ack_frequency_config");
+        conn.inner.set_ack_frequency_config(config);
+        conn.wake();
+    }
+
+    /// Redirect the connection to a different peer address.
+    ///
+    /// See [`proto::Connection::set_remote_address()`].
+    pub fn set_remote_address(&self, remote: SocketAddr) {
+        let mut conn = self.0.state.lock("set_remote_address");
+        conn.inner.set_remote_address(remote);
+        conn.wake();
+    }
+
     /// See [`proto::TransportConfig::receive_window()`]
     pub fn set_receive_window(&self, receive_window: VarInt) {
         let mut conn = self.0.state.lock("set_receive_window");
@@ -907,6 +938,7 @@ impl ConnectionRef {
                 runtime,
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
+                send_retry: None,
             }),
             shared: Shared::default(),
         }))
@@ -989,6 +1021,9 @@ pub(crate) struct State {
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
     buffered_transmit: Option<proto::Transmit>,
+    /// Timer armed after the kernel refused a send with ENOBUFS; the buffered
+    /// transmit is retried when it fires.
+    send_retry: Option<Pin<Box<dyn AsyncTimer>>>,
 }
 
 impl State {
@@ -1000,6 +1035,13 @@ impl State {
             .socket
             .max_transmit_segments()
             .min(MAX_TRANSMIT_SEGMENTS);
+
+        if let Some(timer) = &mut self.send_retry {
+            if timer.as_mut().poll(cx).is_pending() {
+                return Ok(false);
+            }
+            self.send_retry = None;
+        }
 
         loop {
             // Retry the last transmit, or get a new one.
@@ -1037,6 +1079,19 @@ impl State {
             {
                 Ok(()) => false,
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
+                Err(ref e) if e.raw_os_error() == Some(ENOBUFS) => {
+                    // The interface queue is full. Platforms such as macOS
+                    // neither block a non-blocking sender nor signal
+                    // writability when the queue drains, so hold the transmit
+                    // and retry shortly instead of dropping it: a drop here
+                    // looks like path loss to the congestion controller and,
+                    // in bursts, like an MTU black hole.
+                    self.buffered_transmit = Some(t);
+                    let mut timer = self.runtime.new_timer(now + SEND_RETRY_DELAY);
+                    let _ = timer.as_mut().poll(cx);
+                    self.send_retry = Some(timer);
+                    return Ok(false);
+                }
                 Err(e) => return Err(e),
             };
             if retry {
@@ -1325,3 +1380,8 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 20;
 /// memory allocations when calling `poll_transmit()`. Benchmarks have shown
 /// that numbers around 10 are a good compromise.
 const MAX_TRANSMIT_SEGMENTS: usize = 10;
+
+/// How long to wait before retrying a send the kernel refused with ENOBUFS
+const SEND_RETRY_DELAY: Duration = Duration::from_millis(1);
+
+const ENOBUFS: i32 = udp::ENOBUFS;

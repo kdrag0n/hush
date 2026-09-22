@@ -12,6 +12,8 @@ pub(super) struct AckFrequencyState {
     in_flight_ack_frequency_frame: Option<(u64, Duration)>,
     next_outgoing_sequence_number: VarInt,
     pub(super) peer_max_ack_delay: Duration,
+    /// Send a frame at the next opportunity regardless of the current error
+    force_resend: bool,
 
     //
     // Receiving ACK_FREQUENCY frames
@@ -26,6 +28,7 @@ impl AckFrequencyState {
             in_flight_ack_frequency_frame: None,
             next_outgoing_sequence_number: VarInt(0),
             peer_max_ack_delay: default_max_ack_delay,
+            force_resend: false,
 
             last_ack_frequency_frame: None,
             max_ack_delay: default_max_ack_delay,
@@ -79,8 +82,8 @@ impl AckFrequencyState {
         config: &AckFrequencyConfig,
         peer_params: &TransportParameters,
     ) -> bool {
-        if self.next_outgoing_sequence_number.0 == 0 {
-            // Always send at startup
+        if self.next_outgoing_sequence_number.0 == 0 || self.force_resend {
+            // Always send at startup, or after the requested behavior changed
             return true;
         }
         let current = self
@@ -94,6 +97,13 @@ impl AckFrequencyState {
     /// Notifies the [`AckFrequencyState`] that a packet containing an ACK_FREQUENCY frame was sent
     pub(super) fn ack_frequency_sent(&mut self, pn: u64, requested_max_ack_delay: Duration) {
         self.in_flight_ack_frequency_frame = Some((pn, requested_max_ack_delay));
+        self.force_resend = false;
+    }
+
+    /// Request that the next ACK_FREQUENCY frame be sent even if the computed
+    /// max ACK delay has not changed, because other parameters have.
+    pub(super) fn force_resend(&mut self) {
+        self.force_resend = true;
     }
 
     /// Notifies the [`AckFrequencyState`] that a packet has been ACKed

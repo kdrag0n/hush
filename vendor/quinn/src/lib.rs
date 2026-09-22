@@ -87,7 +87,9 @@ pub use crate::runtime::AsyncStdRuntime;
 pub use crate::runtime::SmolRuntime;
 #[cfg(feature = "runtime-tokio")]
 pub use crate::runtime::TokioRuntime;
-pub use crate::runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller, default_runtime};
+pub use crate::runtime::{
+    AsyncTimer, AsyncUdpSocket, Runtime, UdpPollHelper, UdpPoller, default_runtime,
+};
 pub use crate::send_stream::{SendStream, StoppedError, WriteError};
 
 #[cfg(test)]
