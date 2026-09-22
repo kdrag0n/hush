@@ -64,14 +64,12 @@ pub async fn plan_for_destination(
         return Ok(FileCopyPlan {
             extract_dir,
             entries: vec![entry],
-            private_port: None,
         });
     }
 
     Ok(FileCopyPlan {
         extract_dir: destination.to_string_lossy().into_owned(),
         entries: entries.to_vec(),
-        private_port: None,
     })
 }
 
@@ -198,15 +196,13 @@ pub(crate) async fn handle_upload(
     recv: RecvStream,
     user: &str,
     request: FileCopyRequest,
-    private_port: Option<u16>,
 ) -> Result<()> {
     set_stream_priority(&send, StreamPriority::FileCopy);
     let destination = resolve_remote_path(user, &request.destination);
-    let mut plan = match plan_for_destination(&destination, &request.entries).await {
+    let plan = match plan_for_destination(&destination, &request.entries).await {
         Ok(plan) => plan,
         Err(err) => return write_copy_result(send, Err(err)).await,
     };
-    plan.private_port = private_port;
     write_frame(&mut send, &StreamResponse::FileCopyReady(plan.clone())).await?;
     let result = receive_archive(recv, Path::new(&plan.extract_dir), request.compression).await;
     write_copy_result(send, result).await
@@ -216,7 +212,6 @@ pub(crate) async fn handle_download(
     mut send: SendStream,
     user: &str,
     request: FileCopyRequest,
-    private_port: Option<u16>,
 ) -> Result<()> {
     set_stream_priority(&send, StreamPriority::FileCopy);
     let mut entries = request.entries.clone();
@@ -235,7 +230,6 @@ pub(crate) async fn handle_download(
         &StreamResponse::FileCopyReady(FileCopyPlan {
             extract_dir: String::new(),
             entries: entries.clone(),
-            private_port,
         }),
     )
     .await?;

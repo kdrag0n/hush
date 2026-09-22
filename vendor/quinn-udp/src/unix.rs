@@ -211,6 +211,12 @@ impl UdpSocketState {
         match send(self, socket.0, transmit) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
+            // The caller can retry (ENOBUFS: interface queue full) or switch
+            // sockets (EPIPE: the kernel has shut this socket down), so these
+            // are reported rather than dropped.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOBUFS) | Some(libc::EPIPE)) => {
+                Err(e)
+            }
             // - EMSGSIZE is expected for MTU probes. Future work might be able to avoid
             //   these by automatically clamping the MTUD upper bound to the interface MTU.
             Err(e) if e.raw_os_error() == Some(libc::EMSGSIZE) => Ok(()),

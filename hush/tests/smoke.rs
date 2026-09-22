@@ -486,18 +486,18 @@ fn hcp_uploads_file_with_zstd() {
 }
 
 #[test]
-fn hcp_moves_copy_to_private_port() {
+fn hcp_copies_tiny_file() {
     let mut env = TestEnv::new();
     env.start_server();
     let source = env.temp.path().join("local.txt");
     let destination = env.temp.path().join("remote.txt");
-    fs::write(&source, "private-port-ok\n").unwrap();
+    fs::write(&source, "private-socket-ok\n").unwrap();
 
-    // A copy this small finishes before anything else reaches the shared
-    // socket, so the server must notice the private socket on its own.
+    // A copy this small is over before anything else reaches the listening
+    // socket, so the server's private per-connection socket must be polled
+    // on its own.
     let out = env
         .hcp()
-        .arg("-v")
         .arg(&source)
         .arg(format!("{}:{}", env.target(), destination.display()))
         .output()
@@ -506,10 +506,8 @@ fn hcp_moves_copy_to_private_port() {
     assert!(out.status.success(), "{out:?}");
     assert_eq!(
         fs::read_to_string(destination).unwrap(),
-        "private-port-ok\n"
+        "private-socket-ok\n"
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("moved copy to private port"), "{out:?}");
 }
 
 #[test]

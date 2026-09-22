@@ -450,6 +450,9 @@ pub fn bind_udp_socket(addr: std::net::SocketAddr) -> std::io::Result<std::net::
     if addr.is_ipv6() {
         socket.set_only_v6(false)?;
     }
+    // Lets per-connection sockets share this port (see `fastsock`). Another
+    // user still cannot bind alongside it on macOS or Linux.
+    socket.set_reuse_address(true)?;
     set_recv_buffer(&socket);
     socket.bind(&addr.into())?;
     Ok(socket.into())
@@ -464,4 +467,49 @@ pub fn set_recv_buffer(socket: &socket2::Socket) {
         }
         size /= 2;
     }
+}
+
+/// The index of the network interface that owns `ip`, if any.
+pub fn interface_index_for_ip(ip: std::net::IpAddr) -> Option<u32> {
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills a linked list we free with freeifaddrs below.
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return None;
+    }
+    let mut found = None;
+    let mut cur = list;
+    while !cur.is_null() {
+        // SAFETY: cur is a valid node of the list returned by getifaddrs.
+        let entry = unsafe { &*cur };
+        cur = entry.ifa_next;
+        if entry.ifa_addr.is_null() {
+            continue;
+        }
+        // SAFETY: ifa_addr is a valid sockaddr for this node.
+        let family = unsafe { (*entry.ifa_addr).sa_family } as i32;
+        let addr = match (family, ip) {
+            (libc::AF_INET, std::net::IpAddr::V4(_)) => {
+                // SAFETY: family says this is a sockaddr_in.
+                let sin = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in) };
+                std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)))
+            }
+            (libc::AF_INET6, std::net::IpAddr::V6(_)) => {
+                // SAFETY: family says this is a sockaddr_in6.
+                let sin6 = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in6) };
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr))
+            }
+            _ => continue,
+        };
+        if addr == ip {
+            // SAFETY: ifa_name is a NUL-terminated string.
+            let index = unsafe { libc::if_nametoindex(entry.ifa_name) };
+            if index != 0 {
+                found = Some(index);
+                break;
+            }
+        }
+    }
+    // SAFETY: list came from getifaddrs and is not used afterwards.
+    unsafe { libc::freeifaddrs(list) };
+    found
 }

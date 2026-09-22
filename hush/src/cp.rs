@@ -11,7 +11,6 @@ use hush_core::{
 };
 use std::{
     io::{self, Write},
-    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -133,7 +132,6 @@ async fn upload(
     .await?;
 
     let plan = expect_copy_ready(&mut recv).await?;
-    move_to_private_port(&connected, plan.private_port);
     let progress = Arc::new(Mutex::new(CopyProgress::new("upload")));
     let entry_progress = Arc::clone(&progress);
     let byte_progress = Arc::clone(&progress);
@@ -212,8 +210,7 @@ async fn download(
     .await?;
     send.finish()?;
 
-    let ready = expect_copy_ready(&mut recv).await?;
-    move_to_private_port(&connected, ready.private_port);
+    let _ = expect_copy_ready(&mut recv).await?;
     let progress = Arc::new(Mutex::new(CopyProgress::new("download")));
     progress.lock().unwrap().start_plan(&plan.entries);
     let byte_progress = Arc::clone(&progress);
@@ -231,32 +228,6 @@ async fn download(
         progress.lock().unwrap().finish("failed");
     }
     copy_result
-}
-
-/// Continue the connection on a server socket dedicated to it, from a fresh
-/// local socket connected to that port. Both ends then send without a
-/// per-packet route lookup. Failure just leaves the copy on the shared port.
-fn move_to_private_port(connected: &crate::ClientConnection, port: Option<u16>) {
-    let Some(port) = port else {
-        return;
-    };
-    let remote = SocketAddr::new(connected.conn.remote_address().ip(), port);
-    let socket = match crate::net::connected_socket(remote) {
-        Ok(socket) => socket,
-        Err(err) => {
-            tracing::debug!(%remote, %err, "not moving to private port");
-            return;
-        }
-    };
-    connected.conn.set_remote_address(remote);
-    if let Err(err) = connected.endpoint.rebind(socket) {
-        tracing::debug!(%remote, %err, "rebind to private port failed");
-        connected.conn.set_remote_address(SocketAddr::new(
-            remote.ip(),
-            connected.conn.remote_address().port(),
-        ));
-    }
-    tracing::debug!(%remote, "moved copy to private port");
 }
 
 fn split_sources_destination(paths: &[String]) -> Result<(&[String], &String)> {

@@ -37,7 +37,7 @@ pub(crate) async fn connect_any(
 
 /// A UDP socket of `addr`'s family, bound to an ephemeral port and connected
 /// to `addr`.
-pub(crate) fn connected_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+fn connected_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     let (domain, local): (Domain, SocketAddr) = match addr {
         SocketAddr::V4(_) => (Domain::IPV4, (Ipv4Addr::UNSPECIFIED, 0).into()),
         SocketAddr::V6(_) => (Domain::IPV6, (Ipv6Addr::UNSPECIFIED, 0).into()),
