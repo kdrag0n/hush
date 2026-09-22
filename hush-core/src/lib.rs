@@ -7,6 +7,8 @@ pub mod fastsock;
 pub mod filecopy;
 pub mod forwarding;
 pub mod net;
+#[cfg(target_os = "macos")]
+pub mod nwsock;
 pub mod os;
 pub mod paths;
 pub mod priority;

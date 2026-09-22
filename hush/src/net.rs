@@ -50,6 +50,19 @@ fn connected_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
 }
 
 fn connected_endpoint(addr: SocketAddr, client_config: ClientConfig) -> Result<Endpoint> {
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("HUSH_NW").is_some() {
+        let socket = hush_core::nwsock::NwSocket::connect(addr)
+            .with_context(|| format!("open Network.framework flow to {addr}"))?;
+        let mut endpoint = Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            None,
+            Arc::new(socket),
+            Arc::new(TokioRuntime),
+        )?;
+        endpoint.set_default_client_config(client_config);
+        return Ok(endpoint);
+    }
     let socket = connected_socket(addr).with_context(|| format!("open UDP socket to {addr}"))?;
     let mut endpoint = Endpoint::new(
         EndpointConfig::default(),

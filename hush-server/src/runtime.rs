@@ -86,15 +86,39 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     }
     let server_config = hush_core::tls::make_server_config(host_cert_der, host_key_der)?;
     let endpoint_config = hush_core::endpoint::server_endpoint_config(&data_dir)?;
-    let socket = hush_core::os::bind_udp_socket(listen)?;
-    let sockets = hush_core::fastsock::MultiSocket::new(socket)?;
     let runtime = default_runtime().context("no async runtime found")?;
-    let endpoint = Endpoint::new_with_abstract_socket(
-        endpoint_config,
-        Some(server_config),
-        Arc::clone(&sockets) as Arc<dyn quinn::AsyncUdpSocket>,
-        runtime,
-    )?;
+    // On macOS, Network.framework's user-space datapath sends to each peer
+    // far more cheaply than a shared BSD socket can, which is what lets file
+    // copies run at line rate; HUSH_BSD_UDP=1 opts out.
+    #[cfg(target_os = "macos")]
+    let use_nw = std::env::var_os("HUSH_BSD_UDP").is_none();
+    #[cfg(not(target_os = "macos"))]
+    let use_nw = false;
+    let (endpoint, sockets) = if use_nw {
+        #[cfg(target_os = "macos")]
+        {
+            let socket = hush_core::nwsock::NwSocket::listen(listen)?;
+            let endpoint = Endpoint::new_with_abstract_socket(
+                endpoint_config,
+                Some(server_config),
+                Arc::new(socket) as Arc<dyn quinn::AsyncUdpSocket>,
+                runtime,
+            )?;
+            (endpoint, None)
+        }
+        #[cfg(not(target_os = "macos"))]
+        unreachable!()
+    } else {
+        let socket = hush_core::os::bind_udp_socket(listen)?;
+        let sockets = hush_core::fastsock::MultiSocket::new(socket)?;
+        let endpoint = Endpoint::new_with_abstract_socket(
+            endpoint_config,
+            Some(server_config),
+            Arc::clone(&sockets) as Arc<dyn quinn::AsyncUdpSocket>,
+            runtime,
+        )?;
+        (endpoint, Some(sockets))
+    };
     let local_addr = endpoint.local_addr()?;
     tracing::info!(
         addr = %local_addr,
@@ -127,7 +151,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     }
                 };
                 let runtime_config = runtime_config.clone();
-                let sockets = Arc::clone(&sockets);
+                let sockets = sockets.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     match connecting.await {
@@ -136,7 +160,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                                 conn,
                                 runtime_config,
                                 local_addr,
-                                Some(sockets),
+                                sockets,
                             )
                             .await
                             {

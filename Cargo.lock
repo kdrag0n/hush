@@ -801,6 +801,7 @@ dependencies = [
  "async-compression",
  "aws-lc-rs",
  "base64",
+ "cc",
  "hex",
  "libc",
  "p256",
