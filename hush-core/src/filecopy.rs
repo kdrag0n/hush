@@ -16,6 +16,11 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio_tar::{ArchiveBuilder, Builder};
 
+/// Bytes buffered between the tar layer and the QUIC stream in each direction.
+/// The tar layer moves data in small chunks, and every stream read or write
+/// takes the connection lock the QUIC driver needs.
+const STREAM_BUFFER: usize = 1 << 20;
+
 pub fn entry_for_path(path: &Path) -> Result<FileCopyEntry> {
     let archive_name = path
         .file_name()
@@ -250,7 +255,7 @@ fn archive_writer(
     send: SendStream,
     compression: FileCopyCompression,
 ) -> Pin<Box<dyn AsyncWrite + Send>> {
-    let send = tokio::io::BufWriter::with_capacity(1 << 20, send);
+    let send = tokio::io::BufWriter::with_capacity(STREAM_BUFFER, send);
     match compression {
         FileCopyCompression::None => Box::pin(send),
         FileCopyCompression::Zstd => Box::pin(ZstdEncoder::with_quality(send, Level::Precise(1))),
@@ -261,9 +266,12 @@ fn archive_reader(
     recv: RecvStream,
     compression: FileCopyCompression,
 ) -> Pin<Box<dyn AsyncRead + Send>> {
+    // Large reads keep the tar reader from taking the connection lock for
+    // every few KiB, which would stall the QUIC driver.
+    let recv = BufReader::with_capacity(STREAM_BUFFER, recv);
     match compression {
         FileCopyCompression::None => Box::pin(recv),
-        FileCopyCompression::Zstd => Box::pin(ZstdDecoder::new(BufReader::new(recv))),
+        FileCopyCompression::Zstd => Box::pin(ZstdDecoder::new(recv)),
     }
 }
 
