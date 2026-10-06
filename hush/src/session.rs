@@ -212,19 +212,50 @@ async fn stdio_to_quic(mut send: quinn::SendStream) -> Result<StdinPumpExit> {
     Ok(StdinPumpExit::Eof)
 }
 
+/// Detects the `<Enter>~.` disconnect escape in terminal input, both as plain
+/// bytes and as kitty keyboard protocol (`CSI … u`) key events, which remote
+/// apps can enable so that every key arrives as an escape sequence.
 #[derive(Debug)]
 struct EscapeFilter {
     enabled: bool,
     at_line_start: bool,
-    pending_tilde: bool,
+    /// Input held back since a `~` at line start, until the next key press
+    /// decides whether it is an escape. Empty when no `~` is pending.
+    held: Vec<u8>,
+    /// Incomplete CSI sequence carried over from the previous read.
+    partial: Vec<u8>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeKey {
+    Enter,
+    Tilde,
+    Dot,
+    Other,
+    /// Not a key press: releases, modifier keys alone, focus and mouse reports.
+    Ignore,
+}
+
+/// Longest incomplete CSI sequence to carry across reads before passing it through.
+const MAX_PARTIAL_CSI_LEN: usize = 256;
+
+const KITTY_MOD_SHIFT: u32 = 1;
+const KITTY_MOD_CAPS_LOCK: u32 = 64;
+const KITTY_MOD_NUM_LOCK: u32 = 128;
+const KITTY_EVENT_RELEASE: u32 = 3;
+const KITTY_KEY_CAPS_LOCK: u32 = 57358;
+const KITTY_KEY_NUM_LOCK: u32 = 57360;
+const KITTY_KEY_KP_ENTER: u32 = 57414;
+const KITTY_KEY_LEFT_SHIFT: u32 = 57441;
+const KITTY_KEY_ISO_LEVEL5_SHIFT: u32 = 57454;
 
 impl EscapeFilter {
     fn new(enabled: bool) -> Self {
         Self {
             enabled,
             at_line_start: true,
-            pending_tilde: false,
+            held: Vec::new(),
+            partial: Vec::new(),
         }
     }
 
@@ -234,33 +265,141 @@ impl EscapeFilter {
             return false;
         }
 
-        for &byte in input {
-            if self.pending_tilde {
-                self.pending_tilde = false;
-                if byte == b'.' {
-                    return true;
+        let joined;
+        let input = if self.partial.is_empty() {
+            input
+        } else {
+            let mut buf = std::mem::take(&mut self.partial);
+            buf.extend_from_slice(input);
+            joined = buf;
+            &joined[..]
+        };
+
+        let mut pos = 0;
+        while pos < input.len() {
+            let Some((len, key)) = next_escape_key(&input[pos..]) else {
+                self.partial.extend_from_slice(&input[pos..]);
+                break;
+            };
+            if self.handle(key, &input[pos..pos + len], output) {
+                return true;
+            }
+            pos += len;
+        }
+        false
+    }
+
+    fn handle(&mut self, key: EscapeKey, bytes: &[u8], output: &mut Vec<u8>) -> bool {
+        if !self.held.is_empty() {
+            match key {
+                EscapeKey::Dot => return true,
+                EscapeKey::Ignore => {
+                    self.held.extend_from_slice(bytes);
+                    return false;
                 }
-                output.push(b'~');
-                self.at_line_start = false;
+                _ => {
+                    output.append(&mut self.held);
+                    self.at_line_start = false;
+                }
             }
+        }
 
-            if self.at_line_start && byte == b'~' {
-                self.pending_tilde = true;
-                continue;
+        match key {
+            EscapeKey::Tilde if self.at_line_start => self.held.extend_from_slice(bytes),
+            EscapeKey::Ignore => output.extend_from_slice(bytes),
+            _ => {
+                output.extend_from_slice(bytes);
+                self.at_line_start = key == EscapeKey::Enter;
             }
-
-            output.push(byte);
-            self.at_line_start = byte == b'\n' || byte == b'\r';
         }
         false
     }
 
     fn finish(&mut self, output: &mut Vec<u8>) {
-        if self.pending_tilde {
-            self.pending_tilde = false;
-            output.push(b'~');
+        output.append(&mut self.held);
+        output.append(&mut self.partial);
+    }
+}
+
+/// Splits the next key off `input`, returning its length, or `None` if it is
+/// an incomplete CSI sequence. A lone ESC is returned as is rather than held,
+/// since terminals write each sequence whole and the Escape key must not stall.
+fn next_escape_key(input: &[u8]) -> Option<(usize, EscapeKey)> {
+    match input {
+        [0x1b, b'[', rest @ ..] => {
+            for (i, &byte) in rest.iter().enumerate() {
+                match byte {
+                    0x20..=0x3f => {}
+                    0x40..=0x7e => return Some((i + 3, classify_csi(&rest[..i], byte))),
+                    // Malformed: pass the bytes so far through and restart at this byte.
+                    _ => return Some((i + 2, EscapeKey::Other)),
+                }
+            }
+            (input.len() > MAX_PARTIAL_CSI_LEN).then_some((input.len(), EscapeKey::Other))
+        }
+        [b'\r' | b'\n', ..] => Some((1, EscapeKey::Enter)),
+        [b'~', ..] => Some((1, EscapeKey::Tilde)),
+        [b'.', ..] => Some((1, EscapeKey::Dot)),
+        _ => Some((1, EscapeKey::Other)),
+    }
+}
+
+fn classify_csi(params: &[u8], final_byte: u8) -> EscapeKey {
+    match (params.first(), final_byte) {
+        // Focus reports, and private-prefixed reports such as SGR mouse events
+        // and mode query replies.
+        (None, b'I' | b'O') | (Some(b'<' | b'=' | b'>' | b'?'), _) => EscapeKey::Ignore,
+        (_, b'u') => classify_kitty_key(params).unwrap_or(EscapeKey::Other),
+        _ => EscapeKey::Other,
+    }
+}
+
+/// Classifies a kitty keyboard protocol key event:
+/// `CSI key[:shifted[:base]] [; modifiers[:event] [; text]] u`.
+fn classify_kitty_key(params: &[u8]) -> Option<EscapeKey> {
+    fn number(field: Option<&str>, default: u32) -> Option<u32> {
+        match field {
+            None | Some("") => Some(default),
+            Some(field) => field.parse().ok(),
         }
     }
+
+    let mut fields = std::str::from_utf8(params).ok()?.split(';');
+    let mut keys = fields.next()?.split(':');
+    let key = number(keys.next(), 0)?;
+    let shifted = keys.next().and_then(|field| field.parse::<u32>().ok());
+    let mut modifiers = fields.next().unwrap_or("").split(':');
+    let mods = number(modifiers.next(), 1)?.saturating_sub(1)
+        & !(KITTY_MOD_CAPS_LOCK | KITTY_MOD_NUM_LOCK);
+    let event = number(modifiers.next(), 1)?;
+    let text = fields.next();
+
+    if event == KITTY_EVENT_RELEASE
+        || (KITTY_KEY_CAPS_LOCK..=KITTY_KEY_NUM_LOCK).contains(&key)
+        || (KITTY_KEY_LEFT_SHIFT..=KITTY_KEY_ISO_LEVEL5_SHIFT).contains(&key)
+    {
+        return Some(EscapeKey::Ignore);
+    }
+    if key == u32::from(b'\r') || key == KITTY_KEY_KP_ENTER {
+        return Some(EscapeKey::Enter);
+    }
+
+    let ch = match text {
+        Some(text) if !text.contains(':') => text.parse().ok(),
+        Some(_) => None,
+        None if mods & !KITTY_MOD_SHIFT != 0 => None,
+        // Without the alternate keys flag only the unshifted key is reported,
+        // so assume a US layout where `~` is Shift+`.
+        None if mods & KITTY_MOD_SHIFT != 0 => {
+            shifted.or((key == u32::from(b'`')).then_some(u32::from(b'~')))
+        }
+        None => Some(key),
+    };
+    Some(match ch {
+        Some(ch) if ch == u32::from(b'~') => EscapeKey::Tilde,
+        Some(ch) if ch == u32::from(b'.') => EscapeKey::Dot,
+        _ => EscapeKey::Other,
+    })
 }
 
 async fn quic_to_stdio(mut recv: quinn::RecvStream, fd: i32) -> Result<()> {
@@ -339,6 +478,64 @@ mod tests {
         let (escaped, output) = run_escape_filter(false, &[b"~.\n"]);
         assert!(!escaped);
         assert_eq!(output, b"~.\n");
+    }
+
+    #[test]
+    fn escape_filter_detects_kitty_report_all_keys() {
+        // Enter, Shift down, ` with Shift, Shift up, then `.`.
+        let (escaped, output) = run_escape_filter(
+            true,
+            &[b"hi\x1b[13u\x1b[57441;2u\x1b[96;2u\x1b[57441;1:3u\x1b[46u"],
+        );
+        assert!(escaped);
+        assert_eq!(output, b"hi\x1b[13u\x1b[57441;2u");
+    }
+
+    #[test]
+    fn escape_filter_detects_kitty_with_release_events() {
+        let (escaped, _) = run_escape_filter(
+            true,
+            &[b"\x1b[13u\x1b[13;1:3u\x1b[96;2u\x1b[96;2:3u\x1b[46;65u"],
+        );
+        assert!(escaped);
+    }
+
+    #[test]
+    fn escape_filter_detects_kitty_alternate_keys_and_text() {
+        let (escaped, _) = run_escape_filter(true, &[b"\x1b[13u\x1b[96:126;2;126u\x1b[46;;46u"]);
+        assert!(escaped);
+    }
+
+    #[test]
+    fn escape_filter_carries_kitty_sequences_across_reads() {
+        let (escaped, output) =
+            run_escape_filter(true, &[b"\x1b[13", b"u\x1b[96", b";2u", b"\x1b[46u"]);
+        assert!(escaped);
+        assert_eq!(output, b"\x1b[13u");
+    }
+
+    #[test]
+    fn escape_filter_passes_held_kitty_keys_through_in_order() {
+        let input: &[u8] = b"\x1b[13u\x1b[96;2u\x1b[57441;1:3u\x1b[46;2u\x1b[120u";
+        let (escaped, output) = run_escape_filter(true, &[input]);
+        assert!(!escaped);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn escape_filter_ignores_focus_reports() {
+        let (escaped, _) = run_escape_filter(true, &[b"\r\x1b[I~\x1b[O."]);
+        assert!(escaped);
+    }
+
+    #[test]
+    fn escape_filter_does_not_hold_lone_escape() {
+        let mut filter = EscapeFilter::new(true);
+        let mut output = Vec::new();
+        assert!(!filter.push(b"\x1b", &mut output));
+        assert_eq!(output, b"\x1b");
+        assert!(!filter.push(b"[~.", &mut output));
+        assert_eq!(output, b"\x1b[~.");
     }
 
     fn run_escape_filter(enabled: bool, chunks: &[&[u8]]) -> (bool, Vec<u8>) {
