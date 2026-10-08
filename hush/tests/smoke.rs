@@ -596,6 +596,69 @@ fn hcp_downloads_file_without_compression() {
     assert!(stderr.contains("done"), "{out:?}");
 }
 
+#[test]
+fn hcp_copies_between_remotes() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let server_home = env.temp.path().join("server-home");
+    let source = server_home.join("private/tree");
+    fs::create_dir_all(source.join("nested")).unwrap();
+    fs::write(source.join("a.txt"), "relay-a\n").unwrap();
+    fs::write(source.join("nested/b.txt"), "relay-b\n").unwrap();
+    let destination = env.temp.path().join("relayed");
+    fs::create_dir_all(&destination).unwrap();
+
+    let out = env
+        .hcp()
+        .arg(format!("{}:private/tree", env.target()))
+        .arg(format!("{}:{}", env.target(), destination.display()))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        fs::read_to_string(destination.join("tree/a.txt")).unwrap(),
+        "relay-a\n"
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("tree/nested/b.txt")).unwrap(),
+        "relay-b\n"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("copy tree"), "{out:?}");
+    assert!(stderr.contains("done"), "{out:?}");
+
+    // A single file is renamed to a destination that is not a directory.
+    let out = env
+        .hcp()
+        .arg("-C")
+        .arg(format!("{}:private/tree/a.txt", env.target()))
+        .arg(format!("{}:renamed.txt", env.target()))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        fs::read_to_string(server_home.join("renamed.txt")).unwrap(),
+        "relay-a\n"
+    );
+}
+
+#[test]
+fn hcp_reports_missing_source_between_remotes() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let destination = env.temp.path().join("relayed.txt");
+    let out = env
+        .hcp()
+        .arg(format!("{}:does-not-exist.txt", env.target()))
+        .arg(format!("{}:{}", env.target(), destination.display()))
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does-not-exist.txt"), "{out:?}");
+    assert!(!destination.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn hcp_dispatches_from_argv0() {

@@ -91,7 +91,9 @@ pub(crate) async fn run(args: CpArgs) -> Result<()> {
         (true, CopyPath::Local(local_destination)) => {
             download(&args, compression, &parsed_sources, local_destination).await
         }
-        (true, CopyPath::Remote(_)) => bail!("remote-to-remote copies are not supported yet"),
+        (true, CopyPath::Remote(remote_destination)) => {
+            relay(&args, compression, &parsed_sources, remote_destination).await
+        }
         (false, CopyPath::Local(_)) => bail!("one side of the copy must be remote"),
     }
 }
@@ -162,29 +164,7 @@ async fn download(
     sources: &[CopyPath],
     destination: &Path,
 ) -> Result<()> {
-    let first_remote = match &sources[0] {
-        CopyPath::Remote(remote) => remote,
-        CopyPath::Local(_) => bail!("download source must be remote"),
-    };
-    for source in sources {
-        let CopyPath::Remote(remote) = source else {
-            bail!("cannot mix local and remote sources");
-        };
-        if remote.target.host_alias != first_remote.target.host_alias
-            || remote.target.user != first_remote.target.user
-            || remote.target.port != first_remote.target.port
-        {
-            bail!("all remote sources must use the same target");
-        }
-    }
-
-    let entries = sources
-        .iter()
-        .map(|source| match source {
-            CopyPath::Remote(remote) => filecopy::entry_for_path(&remote.path),
-            CopyPath::Local(_) => bail!("download source must be remote"),
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let (first_remote, entries) = remote_source_entries(sources)?;
     let plan = filecopy::plan_for_destination(destination, &entries).await?;
     let connected = connect(
         &first_remote.target,
@@ -228,6 +208,161 @@ async fn download(
         progress.lock().unwrap().finish("failed");
     }
     copy_result
+}
+
+/// Copy between two remotes by relaying through this client, like `scp -3`.
+/// The destination plans the copy first so the source can name archive
+/// entries the way the destination expects; the archive is then forwarded
+/// as-is, still compressed, without being unpacked here.
+async fn relay(
+    args: &CpArgs,
+    compression: FileCopyCompression,
+    sources: &[CopyPath],
+    destination: &RemotePath,
+) -> Result<()> {
+    let (source, entries) = remote_source_entries(sources)?;
+    let destination_conn = connect(
+        &destination.target,
+        args.port,
+        args.data_dir.clone(),
+        args.identity_file.clone(),
+        args.insecure,
+        TransportProfile::Bulk,
+    )
+    .await?;
+    let source_conn = connect(
+        &source.target,
+        args.port,
+        args.data_dir.clone(),
+        args.identity_file.clone(),
+        args.insecure,
+        TransportProfile::Bulk,
+    )
+    .await?;
+
+    let (mut destination_send, mut destination_recv) = destination_conn.conn.open_bi().await?;
+    set_stream_priority(&destination_send, StreamPriority::FileCopy);
+    write_frame(
+        &mut destination_send,
+        &StreamOpen::FileCopy(FileCopyRequest {
+            direction: FileCopyDirection::Upload,
+            entries,
+            destination: destination.path.to_string_lossy().into_owned(),
+            compression,
+        }),
+    )
+    .await?;
+    let plan = expect_copy_ready(&mut destination_recv).await?;
+
+    let source_result = async {
+        let (mut send, mut recv) = source_conn.conn.open_bi().await?;
+        set_stream_priority(&send, StreamPriority::FileCopy);
+        write_frame(
+            &mut send,
+            &StreamOpen::FileCopy(FileCopyRequest {
+                direction: FileCopyDirection::Download,
+                entries: plan.entries.clone(),
+                destination: String::new(),
+                compression,
+            }),
+        )
+        .await?;
+        send.finish()?;
+        expect_copy_ready(&mut recv).await?;
+        Ok(recv)
+    }
+    .await;
+    let source_recv = match source_result {
+        Ok(recv) => recv,
+        Err(err) => {
+            // The destination is already waiting for an archive; abort it so
+            // it does not extract an empty one.
+            let _ = destination_send.reset(0u32.into());
+            return Err(err);
+        }
+    };
+
+    let progress = Arc::new(Mutex::new(CopyProgress::new("copy")));
+    progress.lock().unwrap().start_plan(&plan.entries);
+    let byte_progress = Arc::clone(&progress);
+    let result = relay_archive(
+        source_recv,
+        destination_send,
+        &mut destination_recv,
+        move |bytes| byte_progress.lock().unwrap().add_bytes(bytes),
+    )
+    .await;
+    tracing::debug!(
+        source_stats = ?source_conn.conn.stats(),
+        destination_stats = ?destination_conn.conn.stats(),
+        "remote copy finished"
+    );
+    if result.is_ok() {
+        progress.lock().unwrap().finish("done");
+    } else {
+        progress.lock().unwrap().finish("failed");
+    }
+    result
+}
+
+/// Forward the source's archive stream to the destination chunk by chunk and
+/// wait for the destination to finish extracting it.
+async fn relay_archive(
+    mut source: quinn::RecvStream,
+    mut destination: quinn::SendStream,
+    destination_recv: &mut quinn::RecvStream,
+    mut bytes_transferred: impl FnMut(u64),
+) -> Result<()> {
+    // Moving several chunks per call takes each connection's lock once per
+    // batch rather than once per packet.
+    let mut chunks: [_; 32] = Default::default();
+    loop {
+        let count = match source.read_chunks(&mut chunks).await {
+            Ok(Some(count)) => count,
+            Ok(None) => break,
+            Err(err) => {
+                // Reset rather than finish so the destination does not take
+                // a truncated archive for a complete one.
+                let _ = destination.reset(0u32.into());
+                return Err(err).context("read archive from source");
+            }
+        };
+        let bytes = chunks[..count].iter().map(|chunk| chunk.len() as u64).sum();
+        if let Err(err) = destination.write_all_chunks(&mut chunks[..count]).await {
+            let _ = source.stop(0u32.into());
+            // The destination stops reading when extraction fails, and its
+            // response says why.
+            return match expect_ok(destination_recv).await {
+                Err(destination_err) => Err(destination_err),
+                Ok(()) => Err(err).context("write archive to destination"),
+            };
+        }
+        bytes_transferred(bytes);
+    }
+    destination.finish()?;
+    expect_ok(destination_recv).await
+}
+
+/// Check that every source names the same remote and build its copy entries.
+fn remote_source_entries(sources: &[CopyPath]) -> Result<(&RemotePath, Vec<FileCopyEntry>)> {
+    let first_remote = match &sources[0] {
+        CopyPath::Remote(remote) => remote,
+        CopyPath::Local(_) => bail!("copy source must be remote"),
+    };
+    let mut entries = Vec::with_capacity(sources.len());
+    for source in sources {
+        let CopyPath::Remote(remote) = source else {
+            bail!("cannot mix local and remote sources");
+        };
+        if remote.target.host_alias != first_remote.target.host_alias
+            || remote.target.user != first_remote.target.user
+            || remote.target.port != first_remote.target.port
+        {
+            bail!("all remote sources must use the same target");
+        }
+        entries.push(filecopy::entry_for_path(&remote.path)?);
+    }
+    Ok((first_remote, entries))
 }
 
 fn split_sources_destination(paths: &[String]) -> Result<(&[String], &String)> {
