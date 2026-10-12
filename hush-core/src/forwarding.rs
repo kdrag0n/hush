@@ -5,7 +5,11 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use quinn::{Connection, RecvStream, SendStream};
-use tokio::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::Semaphore,
+};
 
 #[derive(Debug, Clone)]
 pub struct LocalForward {
@@ -77,24 +81,27 @@ pub async fn serve_remote_forward_stream(
 
 pub(crate) async fn run_remote_forward_listener(
     conn: Connection,
-    listen_host: String,
-    listen_port: u16,
-    target: TcpTarget,
+    listener: TcpListener,
+    forward_id: u64,
+    stream_limit: Arc<Semaphore>,
 ) -> Result<()> {
-    let listener = TcpListener::bind((listen_host.as_str(), listen_port))
-        .await
-        .with_context(|| format!("bind remote forward {listen_host}:{listen_port}"))?;
     tracing::info!(
         listen = %listener.local_addr()?,
-        target = %format!("{}:{}", target.host, target.port),
         "remote forward listening"
     );
     loop {
-        let (tcp, _) = listener.accept().await?;
+        let permit = tokio::select! {
+            _ = conn.closed() => return Ok(()),
+            permit = stream_limit.clone().acquire_owned() => permit?,
+        };
+        let (tcp, _) = tokio::select! {
+            _ = conn.closed() => return Ok(()),
+            accepted = listener.accept() => accepted?,
+        };
         let conn = conn.clone();
-        let target = target.clone();
         tokio::spawn(async move {
-            if let Err(err) = open_remote_forward_stream(conn, tcp, target).await {
+            let _permit = permit;
+            if let Err(err) = open_remote_forward_stream(conn, tcp, forward_id).await {
                 tracing::warn!(%err, "remote forward connection failed");
             }
         });
@@ -104,11 +111,11 @@ pub(crate) async fn run_remote_forward_listener(
 async fn open_remote_forward_stream(
     conn: Connection,
     tcp: TcpStream,
-    target: TcpTarget,
+    forward_id: u64,
 ) -> Result<()> {
     let (mut send, recv) = conn.open_bi().await?;
     set_stream_priority(&send, StreamPriority::Forward);
-    write_frame(&mut send, &StreamOpen::RemoteTcpForward { target }).await?;
+    write_frame(&mut send, &StreamOpen::RemoteTcpForward { forward_id }).await?;
     bridge_tcp_quic(tcp, send, recv).await
 }
 

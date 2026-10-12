@@ -889,6 +889,7 @@ fn remote_forwarding_carries_tcp() {
     let _ = client.wait();
     let _ = web_thread.join();
     assert_eq!(body, "remote-forward-ok");
+    wait_for_tcp_closed(remote_port);
 }
 
 #[test]
@@ -947,7 +948,7 @@ fn unauthorized_key_cannot_authenticate_or_forward() {
 #[tokio::test]
 async fn server_rejects_certificate_claiming_wrong_user() {
     use hush_core::protocol::{
-        RemoteForwardRequest, StreamOpen, StreamResponse, TcpTarget, read_frame, write_frame,
+        RemoteForwardRequest, StreamOpen, StreamResponse, read_frame, write_frame,
     };
 
     let mut env = TestEnv::new();
@@ -980,12 +981,9 @@ async fn server_rejects_certificate_claiming_wrong_user() {
         let _ = write_frame(
             &mut send,
             &StreamOpen::OpenRemoteForward(RemoteForwardRequest {
+                forward_id: 1,
                 listen_host: "127.0.0.1".to_owned(),
                 listen_port: forward_port,
-                target: TcpTarget {
-                    host: "127.0.0.1".to_owned(),
-                    port: 1,
-                },
             }),
         )
         .await;
@@ -1157,6 +1155,17 @@ fn wait_for_tcp(port: u16) {
         thread::sleep(Duration::from_millis(50));
     }
     panic!("tcp port {port} did not open");
+}
+
+fn wait_for_tcp_closed(port: u16) {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("tcp port {port} remained open after the connection closed");
 }
 
 fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {

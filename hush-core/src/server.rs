@@ -28,7 +28,11 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail};
 use quinn::{Connection, SendStream};
 use rustls_pki_types::CertificateDer;
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
+use tokio::{net::TcpListener, sync::Semaphore};
 
 /// The only detail a rejected peer learns about why it was rejected.
 const AUTH_FAILURE_MESSAGE: &str = "unauthorized";
@@ -165,6 +169,10 @@ impl AuthenticatedConnection {
     /// Serve streams until the connection closes or a session finishes.
     pub async fn serve(self, sockets: Option<Arc<MultiSocket>>) -> Result<()> {
         let mut remote_forwards = 0usize;
+        let mut remote_forward_tasks = RemoteForwardTasks::default();
+        let remote_forward_streams = Arc::new(Semaphore::new(
+            self.config.max_forward_streams_per_connection,
+        ));
         // Give the connection a private socket once it has settled, and keep
         // the guard alive as long as the connection: every packet of it,
         // including its close, then goes through that socket.
@@ -176,8 +184,14 @@ impl AuthenticatedConnection {
             let (mut send, mut recv) = self.conn.accept_bi().await?;
             match read_frame::<StreamOpen>(&mut recv).await? {
                 StreamOpen::OpenRemoteForward(request) => {
-                    self.open_remote_forward(&mut send, request, &mut remote_forwards)
-                        .await?;
+                    self.open_remote_forward(
+                        &mut send,
+                        request,
+                        &mut remote_forwards,
+                        &mut remote_forward_tasks,
+                        remote_forward_streams.clone(),
+                    )
+                    .await?;
                 }
                 StreamOpen::Session { request } => {
                     set_stream_priority(&send, StreamPriority::Shell);
@@ -224,6 +238,8 @@ impl AuthenticatedConnection {
         send: &mut SendStream,
         request: RemoteForwardRequest,
         remote_forwards: &mut usize,
+        remote_forward_tasks: &mut RemoteForwardTasks,
+        remote_forward_streams: Arc<Semaphore>,
     ) -> Result<()> {
         set_stream_priority(send, StreamPriority::Forward);
         if !self.config.allow_tcp_forwarding {
@@ -244,23 +260,65 @@ impl AuthenticatedConnection {
             send.finish()?;
             return Ok(());
         }
+        let listen_ip = if request.listen_host == "localhost" {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        } else {
+            match request.listen_host.parse::<IpAddr>() {
+                Ok(ip) if ip.is_loopback() => ip,
+                _ => {
+                    send_response_error(send, "remote forwards must listen on a loopback address")
+                        .await;
+                    return Ok(());
+                }
+            }
+        };
+        if request.listen_port != 0
+            && request.listen_port < 1024
+            && crate::os::is_root()
+            && self.user != auth::current_username()
+        {
+            send_response_error(send, "remote forwards may not use privileged ports").await;
+            return Ok(());
+        }
+        let listener =
+            match TcpListener::bind(SocketAddr::new(listen_ip, request.listen_port)).await {
+                Ok(listener) => listener,
+                Err(err) => {
+                    tracing::warn!(%err, "remote forward bind failed");
+                    send_response_error(send, "remote forward bind failed").await;
+                    return Ok(());
+                }
+            };
         *remote_forwards += 1;
         let conn = self.conn.clone();
-        tokio::spawn(async move {
+        let forward_id = request.forward_id;
+        let task = tokio::spawn(async move {
             if let Err(err) = crate::forwarding::run_remote_forward_listener(
                 conn,
-                request.listen_host,
-                request.listen_port,
-                request.target,
+                listener,
+                forward_id,
+                remote_forward_streams,
             )
             .await
             {
                 tracing::warn!(%err, "remote forward stopped");
             }
         });
+        remote_forward_tasks.0.push(task);
         write_frame(send, &StreamResponse::Ok).await?;
         send.finish()?;
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RemoteForwardTasks(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for RemoteForwardTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
     }
 }
 

@@ -20,6 +20,7 @@ use hush_core::{
     },
 };
 use quinn::Endpoint;
+use std::{collections::HashMap, sync::Arc};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -59,6 +60,31 @@ async fn main() -> Result<()> {
         ..
     } = ssh_cfg;
     let agent_forward = agent_forward_context(&conn, args.forward_agent, config_forward_agent);
+    let remote_forwards = remote_forwards
+        .into_iter()
+        .chain(
+            args.remote_forward
+                .iter()
+                .cloned()
+                .map(cli_forward_to_ssh_forward),
+        )
+        .enumerate()
+        .map(|(index, spec)| ((index as u64) + 1, spec))
+        .collect::<Vec<_>>();
+    let remote_targets = Arc::new(
+        remote_forwards
+            .iter()
+            .map(|(forward_id, spec)| {
+                (
+                    *forward_id,
+                    TcpTarget {
+                        host: spec.target_host.clone(),
+                        port: spec.target_port,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>(),
+    );
 
     for spec in local_forwards {
         spawn_local_forward(conn.clone(), spec);
@@ -69,22 +95,23 @@ async fn main() -> Result<()> {
 
     let conn_for_remote = conn.clone();
     let agent_forward_streams = agent_forward.clone();
+    let remote_forward_targets = remote_targets.clone();
     tokio::spawn(async move {
         while let Ok((send, recv)) = conn_for_remote.accept_bi().await {
             let agent_forward = agent_forward_streams.clone();
+            let remote_targets = remote_forward_targets.clone();
             tokio::spawn(async move {
-                if let Err(err) = serve_server_stream(send, recv, agent_forward).await {
+                if let Err(err) =
+                    serve_server_stream(send, recv, agent_forward, remote_targets).await
+                {
                     tracing::warn!(%err, "server-initiated stream failed");
                 }
             });
         }
     });
 
-    for spec in remote_forwards {
-        request_remote_forward(&conn, spec).await?;
-    }
-    for spec in args.remote_forward.iter().cloned() {
-        request_remote_forward(&conn, cli_forward_to_ssh_forward(spec)).await?;
+    for (forward_id, spec) in remote_forwards {
+        request_remote_forward(&conn, forward_id, spec).await?;
     }
 
     let set_env_term = set_env
@@ -234,9 +261,14 @@ async fn serve_server_stream(
     send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     agent: Option<std::sync::Arc<AgentForwardContext>>,
+    remote_targets: Arc<HashMap<u64, TcpTarget>>,
 ) -> Result<()> {
     match read_frame::<StreamOpen>(&mut recv).await? {
-        StreamOpen::RemoteTcpForward { target } => {
+        StreamOpen::RemoteTcpForward { forward_id } => {
+            let target = remote_targets
+                .get(&forward_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("server opened an unknown remote forward"))?;
             hush_core::forwarding::serve_remote_forward_stream(target, send, recv).await
         }
         StreamOpen::AgentForward { bind_signature } => {
@@ -288,18 +320,19 @@ fn spawn_local_forward(conn: quinn::Connection, spec: SshForward) {
     });
 }
 
-async fn request_remote_forward(conn: &quinn::Connection, spec: SshForward) -> Result<()> {
+async fn request_remote_forward(
+    conn: &quinn::Connection,
+    forward_id: u64,
+    spec: SshForward,
+) -> Result<()> {
     let (mut send, mut recv) = conn.open_bi().await?;
     set_stream_priority(&send, StreamPriority::Forward);
     write_frame(
         &mut send,
         &StreamOpen::OpenRemoteForward(RemoteForwardRequest {
+            forward_id,
             listen_host: spec.listen_host,
             listen_port: spec.listen_port,
-            target: TcpTarget {
-                host: spec.target_host,
-                port: spec.target_port,
-            },
         }),
     )
     .await?;

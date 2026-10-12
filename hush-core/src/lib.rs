@@ -20,4 +20,4 @@ pub mod tls;
 // hush/3: the client certificate carries the username it claims, the server
 // authenticates the connection from the TLS handshake alone (no Authenticate
 // stream), and requests do not carry a user.
-pub const ALPN: &[u8] = b"hush/3";
+pub const ALPN: &[u8] = b"hush/4";

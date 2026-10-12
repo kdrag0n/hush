@@ -56,9 +56,11 @@ pub struct TcpTarget {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteForwardRequest {
+    /// Opaque connection-local identifier chosen by the client. The server
+    /// echoes it when an accepted TCP connection needs to be delivered.
+    pub forward_id: u64,
     pub listen_host: String,
     pub listen_port: u16,
-    pub target: TcpTarget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,7 +151,7 @@ pub enum StreamOpen {
         target: TcpTarget,
     },
     RemoteTcpForward {
-        target: TcpTarget,
+        forward_id: u64,
     },
     FileCopy(FileCopyRequest),
     /// Server-initiated stream carrying one forwarded ssh-agent connection.
