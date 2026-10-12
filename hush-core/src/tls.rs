@@ -26,9 +26,12 @@ use serde::{Deserialize, Serialize};
 use ssh_key::{Algorithm, EcdsaCurve};
 use std::{
     collections::BTreeMap,
-    fmt, fs,
+    fmt, fs, io,
     net::SocketAddr,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -86,30 +89,43 @@ struct KnownHosts {
 impl KnownHosts {
     fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let Ok(data) = fs::read_to_string(&path) else {
-            return Ok(Self {
-                path,
-                entries: BTreeMap::new(),
-            });
+        let entries = Self::read_entries(&path)?;
+        Ok(Self { path, entries })
+    }
+
+    fn read_entries(path: &Path) -> Result<BTreeMap<String, String>> {
+        let data = match fs::read_to_string(path) {
+            Ok(data) => data,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(err) => return Err(err.into()),
         };
         if data.trim().is_empty() {
-            return Ok(Self {
-                path,
-                entries: BTreeMap::new(),
-            });
+            return Ok(BTreeMap::new());
         }
         let file = toml::from_str::<KnownHostsFile>(&data)
             .map_err(|err| anyhow::anyhow!("parse {}: {err}", path.display()))?;
-        Ok(Self {
-            path,
-            entries: file.hosts,
-        })
+        Ok(file.hosts)
     }
 
     fn check_or_insert(&mut self, host: &str, fingerprint: &str, trust: HostTrust) -> Result<()> {
         if trust == HostTrust::Insecure {
             return Ok(());
         }
+        if trust == HostTrust::KnownOnly {
+            self.entries = Self::read_entries(&self.path)?;
+            return self.check_existing(host, fingerprint, false);
+        }
+        if let Some(parent) = self.path.parent() {
+            ensure_private_dir(parent)?;
+        }
+        let _lock = ExclusiveFileLock::acquire(&lock_path_for(&self.path))?;
+        // Another client may have pinned a host after this process loaded its
+        // initial snapshot. Always merge from disk while holding the lock.
+        self.entries = Self::read_entries(&self.path)?;
+        self.check_existing(host, fingerprint, true)
+    }
+
+    fn check_existing(&mut self, host: &str, fingerprint: &str, insert: bool) -> Result<()> {
         match self.entries.get(host) {
             Some(old) if old == fingerprint => Ok(()),
             Some(old) => {
@@ -117,7 +133,7 @@ impl KnownHosts {
                     "host certificate mismatch for {host}: known {old}, got {fingerprint}; use -k to bypass"
                 )
             }
-            None if trust == HostTrust::KnownOnly => bail!("unknown host {host}"),
+            None if !insert => bail!("unknown host {host}"),
             None => {
                 self.entries.insert(host.to_owned(), fingerprint.to_owned());
                 self.save()?;
@@ -506,24 +522,81 @@ fn write_private_file_atomic(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)?;
     }
-    let tmp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension().and_then(|s| s.to_str()).unwrap_or("hush")
-    ));
-    {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("hush");
+    for _ in 0..32 {
+        let mut nonce = [0u8; 12];
+        aws_lc_rs::rand::fill(&mut nonce)
+            .map_err(|_| anyhow::anyhow!("generate temporary filename"))?;
+        let tmp = parent.join(format!(".{name}.{}.tmp", hex::encode(nonce)));
+        let file = fs::OpenOptions::new()
+            .create_new(true)
             .write(true)
             .mode(0o600)
-            .open(&tmp)?;
-        use std::io::Write;
-        file.write_all(data)?;
-        file.sync_all()?;
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&tmp);
+        let mut file = match file {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let result = (|| -> Result<()> {
+            use std::io::Write;
+            file.write_all(data)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&tmp, path)?;
+            fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        return result;
     }
-    fs::rename(&tmp, path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    bail!("could not allocate a temporary file for {}", path.display())
+}
+
+struct ExclusiveFileLock(fs::File);
+
+impl ExclusiveFileLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)?;
+        loop {
+            // SAFETY: `file` owns a live descriptor for the duration of the lock.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(Self(file));
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err.into());
+            }
+        }
+    }
+}
+
+impl Drop for ExclusiveFileLock {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor remains live until after Drop returns.
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+fn lock_path_for(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("hush");
+    path.with_file_name(format!(".{name}.lock"))
 }
 
 #[derive(Debug)]
@@ -709,6 +782,45 @@ mod tests {
         known_hosts
             .check_or_insert("example.com:4433", "SHA256:abc123", HostTrust::Tofu)
             .unwrap();
+    }
+
+    #[test]
+    fn known_hosts_merges_stale_process_snapshots() {
+        let path = temp_known_hosts_path("merge");
+        let mut first = KnownHosts::load(&path).unwrap();
+        let mut stale = KnownHosts::load(&path).unwrap();
+
+        first
+            .check_or_insert("first.example:22022", "SHA256:first", HostTrust::Tofu)
+            .unwrap();
+        stale
+            .check_or_insert("second.example:22022", "SHA256:second", HostTrust::Tofu)
+            .unwrap();
+
+        let merged = KnownHosts::load(&path).unwrap();
+        assert_eq!(merged.entries.len(), 2);
+        assert_eq!(merged.entries["first.example:22022"], "SHA256:first");
+        assert_eq!(merged.entries["second.example:22022"], "SHA256:second");
+    }
+
+    #[test]
+    fn known_hosts_stale_snapshot_cannot_replace_a_new_pin() {
+        let path = temp_known_hosts_path("pin-race");
+        let mut first = KnownHosts::load(&path).unwrap();
+        let mut stale = KnownHosts::load(&path).unwrap();
+
+        first
+            .check_or_insert("example.com:22022", "SHA256:first", HostTrust::Tofu)
+            .unwrap();
+        let err = stale
+            .check_or_insert("example.com:22022", "SHA256:second", HostTrust::Tofu)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("host certificate mismatch"));
+        assert_eq!(
+            KnownHosts::load(&path).unwrap().entries["example.com:22022"],
+            "SHA256:first"
+        );
     }
 
     fn temp_known_hosts_path(name: &str) -> PathBuf {
