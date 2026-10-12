@@ -18,13 +18,14 @@ pub(crate) struct AsyncStdioFd {
 
 impl AsyncStdioFd {
     pub(crate) fn duplicate(fd: RawFd) -> Result<Self> {
-        let dup = unsafe { libc::dup(fd) };
-        if dup < 0 {
-            bail!("dup stdio fd failed: {}", std::io::Error::last_os_error());
-        }
-        set_nonblocking(dup)?;
+        let dup = hush_core::os::dup_fd(fd)?;
+        // Take ownership before any fallible setup so an error cannot leak the
+        // duplicate. dup_fd uses F_DUPFD_CLOEXEC, avoiding the fork/exec race
+        // of setting FD_CLOEXEC in a second operation.
+        let dup = unsafe { OwnedFd::from_raw_fd(dup) };
+        set_nonblocking(dup.as_raw_fd())?;
         Ok(Self {
-            fd: Arc::new(AsyncFd::new(unsafe { OwnedFd::from_raw_fd(dup) })?),
+            fd: Arc::new(AsyncFd::new(dup)?),
         })
     }
 
