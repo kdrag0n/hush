@@ -510,6 +510,28 @@ fn hcp_copies_tiny_file() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn hcp_rejects_external_symlink_uploads() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let secret = env.temp.path().join("secret.txt");
+    let source = env.temp.path().join("secret-link");
+    let destination = env.temp.path().join("copied-link");
+    fs::write(&secret, "must-not-copy\n").unwrap();
+    std::os::unix::fs::symlink(&secret, &source).unwrap();
+
+    let out = env
+        .hcp()
+        .arg(&source)
+        .arg(format!("{}:{}", env.target(), destination.display()))
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "{out:?}");
+    assert!(!destination.is_file());
+}
+
 #[test]
 fn hcp_resolves_remote_paths_relative_to_home() {
     let mut env = TestEnv::new();

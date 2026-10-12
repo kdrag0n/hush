@@ -127,7 +127,7 @@ async fn upload(
         &mut send,
         &StreamOpen::FileCopy(FileCopyRequest {
             direction: FileCopyDirection::Upload,
-            entries,
+            entries: entries.clone(),
             destination: destination.path.to_string_lossy().into_owned(),
             compression,
         }),
@@ -135,6 +135,7 @@ async fn upload(
     .await?;
 
     let plan = expect_copy_ready(&mut recv).await?;
+    filecopy::validate_upload_plan(&entries, &plan)?;
     let progress = Arc::new(Mutex::new(CopyProgress::new("upload")));
     let entry_progress = Arc::clone(&progress);
     let byte_progress = Arc::clone(&progress);
@@ -250,13 +251,14 @@ async fn relay(
         &mut destination_send,
         &StreamOpen::FileCopy(FileCopyRequest {
             direction: FileCopyDirection::Upload,
-            entries,
+            entries: entries.clone(),
             destination: destination.path.to_string_lossy().into_owned(),
             compression,
         }),
     )
     .await?;
     let plan = expect_copy_ready(&mut destination_recv).await?;
+    filecopy::validate_upload_plan(&entries, &plan)?;
 
     let source_result = async {
         let (mut send, mut recv) = source_conn.conn.open_bi().await?;

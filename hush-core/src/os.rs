@@ -94,6 +94,39 @@ pub fn user_info_for_user(user: &str) -> Result<Option<UserInfo>> {
     })
 }
 
+/// Permanently become `user` in a freshly exec'd single-threaded helper.
+/// `initgroups` must run before the UID changes so group-backed files keep
+/// working, and doing it after `exec` avoids unsafe NSS work in `pre_exec`.
+pub fn drop_privileges_to_user(user: &str) -> Result<UserInfo> {
+    let info = user_info_for_user(user)?.context("unknown user")?;
+    let current_uid = unsafe { libc::geteuid() };
+    if current_uid != 0 {
+        if current_uid != info.uid {
+            bail!("cannot switch from uid {current_uid} to uid {}", info.uid);
+        }
+        return Ok(info);
+    }
+
+    let c_user = CString::new(user).context("username contains NUL")?;
+    #[cfg(target_vendor = "apple")]
+    let base_group = libc::c_int::try_from(info.gid).context("group ID is too large")?;
+    #[cfg(not(target_vendor = "apple"))]
+    let base_group = info.gid;
+    if unsafe { libc::initgroups(c_user.as_ptr(), base_group) } < 0 {
+        bail!("initgroups failed: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::setgid(info.gid) } < 0 {
+        bail!("setgid failed: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::setuid(info.uid) } < 0 {
+        bail!("setuid failed: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::geteuid() } != info.uid || unsafe { libc::getegid() } != info.gid {
+        bail!("privilege drop did not take effect");
+    }
+    Ok(info)
+}
+
 fn passwd_string_for_user(
     user: &str,
     field: impl FnOnce(&libc::passwd) -> *mut libc::c_char,
