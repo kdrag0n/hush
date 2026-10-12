@@ -8,6 +8,8 @@ use ssh_key::{
 };
 use std::{
     env, fs,
+    io::{Read, Write},
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
 };
 use subtle::ConstantTimeEq;
@@ -19,6 +21,12 @@ const DEFAULT_IDENTITY_FILES: &[&str] = &["id_ed25519", "id_ecdsa"];
 
 const OID_ED25519: &str = "1.3.101.112";
 const OID_EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
+const SSH_AGENT_FAILURE: u8 = 5;
+const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
+const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
+const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
+const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
+const MAX_AGENT_MESSAGE_SIZE: usize = 1 << 20;
 
 /// Private-use OID of the certificate extension carrying the username the
 /// client wants to act as. Unregistered: these synthetic certificates are only
@@ -117,26 +125,19 @@ pub fn load_identity_with_options(
 
 fn load_identity_from_agent(socket: &Path) -> Result<Option<LoadedIdentity>> {
     let socket = socket.to_path_buf();
-    let mut client = match ssh_agent_client_rs::Client::connect(&socket) {
-        Ok(client) => client,
+    let identities = match list_agent_identities(&socket) {
+        Ok(identities) => identities,
         Err(err) => {
             tracing::debug!(%err, "failed to connect to ssh-agent");
             return Ok(None);
         }
     };
-    let identities = client
-        .list_all_identities()
-        .context("list ssh-agent identities")?;
     let preferred = preferred_public_key();
     // Prefer the agent key matching a default identity file, but fall back to
     // any supported agent key: an agent-only setup (e.g. Secretive holding a
     // hardware-backed ECDSA key) has no on-disk counterpart to match.
     let mut fallback: Option<PublicKey> = None;
-    for identity in identities {
-        let ssh_agent_client_rs::Identity::PublicKey(public_key) = identity else {
-            continue;
-        };
-        let public_key = public_key.into_owned();
+    for public_key in identities {
         if !is_supported_algorithm(&public_key.algorithm()) {
             continue;
         }
@@ -186,21 +187,14 @@ fn load_identity_from_agent_matching(
     preferred: &PublicKey,
 ) -> Result<Option<LoadedIdentity>> {
     let socket = socket.to_path_buf();
-    let mut client = match ssh_agent_client_rs::Client::connect(&socket) {
-        Ok(client) => client,
+    let identities = match list_agent_identities(&socket) {
+        Ok(identities) => identities,
         Err(err) => {
             tracing::debug!(%err, "failed to connect to ssh-agent");
             return Ok(None);
         }
     };
-    let identities = client
-        .list_all_identities()
-        .context("list ssh-agent identities")?;
-    for identity in identities {
-        let ssh_agent_client_rs::Identity::PublicKey(public_key) = identity else {
-            continue;
-        };
-        let public_key = public_key.into_owned();
+    for public_key in identities {
         if !is_supported_algorithm(&public_key.algorithm())
             || !same_public_key(&public_key, preferred)?
         {
@@ -277,12 +271,103 @@ fn is_ecdsa(algorithm: &Algorithm) -> bool {
 }
 
 pub fn agent_sign(socket: &Path, public_key: &PublicKey, message: &[u8]) -> Result<Vec<u8>> {
-    let mut client = ssh_agent_client_rs::Client::connect(socket)
+    let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("connect ssh-agent {}", socket.display()))?;
-    let sig = client
-        .sign(public_key, message)
-        .context("ssh-agent sign request")?;
+    let key = public_key.to_bytes().context("encode ssh-agent key")?;
+    let mut request = vec![SSH_AGENTC_SIGN_REQUEST];
+    write_agent_string(&mut request, &key)?;
+    write_agent_string(&mut request, message)?;
+    request.extend_from_slice(&0u32.to_be_bytes());
+    write_agent_packet(&mut stream, &request)?;
+    let response = read_agent_packet(&mut stream)?;
+    let (&kind, mut body) = response.split_first().context("empty ssh-agent response")?;
+    if kind == SSH_AGENT_FAILURE {
+        bail!("ssh-agent refused sign request");
+    }
+    if kind != SSH_AGENT_SIGN_RESPONSE {
+        bail!("unexpected ssh-agent sign response {kind}");
+    }
+    let signature = read_agent_string(&mut body)?;
+    if !body.is_empty() {
+        bail!("trailing data in ssh-agent sign response");
+    }
+    let sig = Signature::try_from(signature).context("decode ssh-agent signature")?;
     signature_to_tls_bytes(&sig)
+}
+
+fn list_agent_identities(socket: &Path) -> Result<Vec<PublicKey>> {
+    let mut stream = UnixStream::connect(socket)
+        .with_context(|| format!("connect ssh-agent {}", socket.display()))?;
+    write_agent_packet(&mut stream, &[SSH_AGENTC_REQUEST_IDENTITIES])?;
+    let response = read_agent_packet(&mut stream)?;
+    let (&kind, mut body) = response.split_first().context("empty ssh-agent response")?;
+    if kind == SSH_AGENT_FAILURE {
+        bail!("ssh-agent refused identity request");
+    }
+    if kind != SSH_AGENT_IDENTITIES_ANSWER {
+        bail!("unexpected ssh-agent identity response {kind}");
+    }
+    let count = read_agent_u32(&mut body)? as usize;
+    if count > MAX_AGENT_MESSAGE_SIZE / 8 {
+        bail!("ssh-agent returned too many identities");
+    }
+    let mut identities = Vec::new();
+    for _ in 0..count {
+        let key = read_agent_string(&mut body)?;
+        let _comment = read_agent_string(&mut body)?;
+        if let Ok(public_key) = PublicKey::from_bytes(key) {
+            identities.push(public_key);
+        }
+    }
+    if !body.is_empty() {
+        bail!("trailing data in ssh-agent identity response");
+    }
+    Ok(identities)
+}
+
+fn write_agent_packet(stream: &mut UnixStream, body: &[u8]) -> Result<()> {
+    if body.len() > MAX_AGENT_MESSAGE_SIZE {
+        bail!("ssh-agent request is too large");
+    }
+    let len = u32::try_from(body.len()).context("ssh-agent request is too large")?;
+    stream.write_all(&len.to_be_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn read_agent_packet(stream: &mut UnixStream) -> Result<Vec<u8>> {
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len)?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len == 0 || len > MAX_AGENT_MESSAGE_SIZE {
+        bail!("invalid ssh-agent response length {len}");
+    }
+    let mut body = vec![0; len];
+    stream.read_exact(&mut body)?;
+    Ok(body)
+}
+
+fn write_agent_string(output: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+    let len = u32::try_from(value.len()).context("ssh-agent field is too large")?;
+    output.extend_from_slice(&len.to_be_bytes());
+    output.extend_from_slice(value);
+    Ok(())
+}
+
+fn read_agent_u32(input: &mut &[u8]) -> Result<u32> {
+    let bytes = input.get(..4).context("truncated ssh-agent integer")?;
+    *input = &input[4..];
+    Ok(u32::from_be_bytes(
+        bytes.try_into().expect("four-byte slice"),
+    ))
+}
+
+fn read_agent_string<'a>(input: &mut &'a [u8]) -> Result<&'a [u8]> {
+    let len = read_agent_u32(input)? as usize;
+    let value = input.get(..len).context("truncated ssh-agent string")?;
+    *input = &input[len..];
+    Ok(value)
 }
 
 /// Convert an ssh-agent signature into the raw form rustls/TLS expects. Ed25519

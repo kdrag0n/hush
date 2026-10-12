@@ -27,7 +27,6 @@ serde.workspace = true
 sha2.workspace = true
 socket2.workspace = true
 shell-words.workspace = true
-ssh-agent-client-rs.workspace = true
 ssh-key.workspace = true
 subtle.workspace = true
 tokio.workspace = true
