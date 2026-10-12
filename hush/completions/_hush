@@ -1,0 +1,198 @@
+#compdef hush hcp
+
+# zsh completion for hush and hcp (`hush cp`).
+#
+# Install it on $fpath before compinit runs:
+#   hush --completions zsh > ~/.zfunc/_hush    # with ~/.zfunc on $fpath
+# or load it after compinit:
+#   source <(hush --completions zsh)
+
+# [user@]host, the way ssh completes it. Arguments go to compadd for hosts.
+(( $+functions[_hush_userhost] )) ||
+_hush_userhost() {
+  local expl
+  if compset -P '*@'; then
+    _wanted hosts expl 'remote host name' _hush_hosts "$@"
+  else
+    _alternative \
+      "hosts:remote host name:_hush_hosts ${(j: :)${(@q)@}}" \
+      'users:login name:_hush_users -qS@' \
+      "$hush_extra[@]"
+  fi
+}
+
+# ~/.ssh/config aliases, which hush resolves itself, plus whatever ssh would
+# offer. _ssh_hosts alone skips the config when other sources have hosts.
+(( $+functions[_hush_hosts] )) ||
+_hush_hosts() {
+  local expl key value host ret=1
+  local -a config_hosts
+  if [[ -r ~/.ssh/config ]]; then
+    while IFS=$'=\t ' read -r key value; do
+      [[ $key == (#i)host ]] || continue
+      for host in ${(z)value}; do
+        [[ $host == *[*?!]* ]] || config_hosts+=( $host )
+      done
+    done < ~/.ssh/config
+  fi
+  (( $#config_hosts )) && _wanted hosts expl 'remote host name' \
+    compadd -M 'm:{a-zA-Z}={A-Za-z} r:|.=* r:|=*' "$@" -a config_hosts && ret=0
+  _ssh_hosts "$@" && ret=0
+  return ret
+}
+
+(( $+functions[_hush_users] )) ||
+_hush_users() {
+  _combination -s '[:@]' my-accounts users-hosts users "$@"
+}
+
+# Where the host part of a `hush cp` operand ends, by the rule hush cp uses:
+# the first colon outside brackets, unless it comes first or the word starts
+# with /, ./ or ../. Sets REPLY to the colon's index in $1.
+(( $+functions[_hush_remote_colon] )) ||
+_hush_remote_colon() {
+  local word=$1 c
+  integer i depth=0
+  [[ $word == (/|./|../)* ]] && return 1
+  for (( i = 1; i <= $#word; i++ )); do
+    c=$word[i]
+    if [[ $c == '[' ]]; then
+      (( depth += 1 ))
+    elif [[ $c == ']' ]]; then
+      (( depth > 0 )) && (( depth -= 1 ))
+    elif [[ $c == : ]] && (( depth == 0 )); then
+      (( i > 1 )) || return 1
+      REPLY=$i
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Remote paths for the `hush cp` operand in $PREFIX, whose host part ends at
+# index $1. The rest of the arguments are hush options to connect with.
+(( $+functions[_hush_remote_files] )) ||
+_hush_remote_files() {
+  local colon=$1 word=${(Q)PREFIX} expl ret=1
+  shift
+  local -a listing files dirs autoremove
+  # Asks hush itself, which connects without prompting and only to hosts it
+  # already knows. Evaluated, so the options keep the quoting they were typed
+  # with.
+  listing=( ${(f)"$(_call_program remote-files \
+    $hush_bin __complete-remote "$@" -- ${(q)word} 2>/dev/null)"} )
+
+  IPREFIX+=$PREFIX[1,colon]
+  PREFIX=$PREFIX[colon+1,-1]
+  compset -P '*/'
+  files=( ${listing:#*/} )
+  dirs=( ${(M)listing:#*/} )
+  [[ -o autoremoveslash ]] && autoremove=( -r "/ \t\n\-" )
+
+  _tags remote-files
+  while _tags; do
+    while _next_label remote-files expl 'remote file'; do
+      compadd "$expl[@]" -- $files && ret=0
+      compadd "$expl[@]" -S / $autoremove -d dirs -- ${dirs%/} && ret=0
+    done
+    (( ret )) || return 0
+  done
+  return ret
+}
+
+(( $+functions[_hush_cp] )) ||
+_hush_cp() {
+  local curcontext=$curcontext state state_descr line expl ret=1
+  local -A opt_args
+
+  _arguments -S -s : $common \
+    '-C[disable compression]' \
+    '*: :->path' && ret=0
+
+  if [[ $state == path ]]; then
+    local -a hush_opts
+    local opt
+    for opt in -p -i --data-dir; do
+      (( $+opt_args[$opt] )) && hush_opts+=( $opt $opt_args[$opt] )
+    done
+    (( $+opt_args[-k] || $+opt_args[--insecure] )) && hush_opts+=( -k )
+
+    if _hush_remote_colon $PREFIX; then
+      _hush_remote_files $REPLY $hush_opts && ret=0
+    elif [[ $PREFIX == (/|.|\~)* ]]; then
+      _files && ret=0
+    elif compset -P 1 '*@'; then
+      _wanted hosts expl 'remote host name' _hush_hosts -r: -S: && ret=0
+    else
+      _alternative \
+        'files:local file:_files' \
+        'hosts:remote host name:_hush_hosts -r: -S:' \
+        'users:login name:_hush_users -qS@' && ret=0
+    fi
+  fi
+  return ret
+}
+
+_hush() {
+  local curcontext=$curcontext state state_descr line ret=1
+  local -A opt_args
+  local hush_bin=$words[1]
+  local -a hush_extra common args
+
+  common=(
+    '(-v --verbose)'{-v,--verbose}'[enable client logging]'
+    '(-k --insecure)'{-k,--insecure}'[skip TOFU host certificate verification]'
+    '-p+[connect to this remote port]:port number'
+    '--data-dir=[data directory for known_hosts and client state]:directory:_files -/'
+    '-i+[SSH identity file]:SSH identity file:_files'
+    '(- *)'{-h,--help}'[print help]'
+    '(- *)'{-V,--version}'[print version]'
+  )
+
+  if [[ $service == hcp ]]; then
+    _hush_cp
+    return
+  fi
+  if (( CURRENT > 2 )) && [[ $words[2] == cp ]]; then
+    shift words
+    (( CURRENT-- ))
+    _hush_cp
+    return
+  fi
+
+  # Both are only recognized as the first argument.
+  if (( CURRENT == 2 )); then
+    args+=( '(- *)--completions[print a shell completion script]:shell:(zsh bash)' )
+    hush_extra=( 'commands:hush command:((cp\:"copy files over hush"))' )
+  fi
+
+  _arguments -C -S -s : $common $args \
+    '(-T)-t[force PTY allocation]' \
+    '(-t)-T[disable PTY allocation and use pipes]' \
+    '(-S --no-shell)'{-S,--no-shell}'[execute the command directly instead of through the remote shell]' \
+    '-A[forward the local ssh-agent]' \
+    '*-L+[forward a local TCP port to the remote side]:local forward ([bind\:]port\:host\:hostport)' \
+    '*-R+[forward a remote TCP port to the client side]:remote forward ([bind\:]port\:host\:hostport)' \
+    '1:remote host:->userhost' \
+    '*::remote command:->command' && ret=0
+
+  case $state in
+    userhost)
+      _hush_userhost && ret=0
+      ;;
+    command)
+      # Like ssh: complete the remote command with local definitions.
+      local -a _comp_priv_prefix
+      shift words
+      (( CURRENT-- ))
+      _normal && ret=0
+      ;;
+  esac
+  return ret
+}
+
+if [[ $funcstack[1] == _hush ]]; then
+  _hush "$@"
+else
+  compdef _hush hush hcp
+fi

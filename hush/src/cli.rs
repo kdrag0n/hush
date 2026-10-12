@@ -32,11 +32,23 @@ macro_rules! parse_or_exit {
 pub(crate) enum Cli {
     Session(Args),
     Copy(crate::cp::CpArgs),
+    /// Print a shell completion script.
+    Completions(&'static str),
+    CompleteRemote(crate::complete::RemoteArgs),
 }
 
 impl Cli {
     pub(crate) fn parse_from_env() -> Result<Self> {
         let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        // Before the argv0 check, so completion can call whichever name it
+        // is completing, `hcp` included.
+        if args.get(1).and_then(|arg| arg.to_str()) == Some(crate::complete::COMPLETE_REMOTE) {
+            let words: Vec<&OsStr> = args.iter().skip(2).map(OsStr::new).collect();
+            return Ok(Self::CompleteRemote(parse_or_exit!(
+                crate::complete::RemoteArgs,
+                &words
+            )));
+        }
         let argv0 = args
             .first()
             .and_then(|arg| std::path::Path::new(arg).file_stem())
@@ -51,6 +63,17 @@ impl Cli {
             let words: Vec<&OsStr> = args.iter().skip(1).map(OsStr::new).collect();
             return Ok(Self::Copy(parse_or_exit!(crate::cp::CpArgs, &words)));
         }
+        if args.get(1).and_then(|arg| arg.to_str()) == Some("--completions") {
+            let script = match args.get(2).and_then(|arg| arg.to_str()) {
+                Some("zsh") => crate::complete::ZSH,
+                Some("bash") => crate::complete::BASH,
+                _ => {
+                    eprintln!("hush: --completions takes a shell: zsh or bash");
+                    std::process::exit(2);
+                }
+            };
+            return Ok(Self::Completions(script));
+        }
         let words: Vec<&OsStr> = args.iter().skip(1).map(OsStr::new).collect();
         Ok(Self::Session(parse_or_exit!(Args, &words)))
     }
@@ -63,7 +86,7 @@ impl Cli {
     unknown_flags = "error",
     args_override_self = false,
     about = "SSH-like remote command client over QUIC",
-    long_about = "hush connects to a hush-server over QUIC, authenticates with an Ed25519 or ECDSA (P-256/384/521) SSH key, and runs a remote shell or command.\n\nTarget syntax is [user@]host[:port]. IPv6 literals may be written as [::1]:22022.\n\nForward syntax for -L and -R is [listen_host:]listen_port:target_host:target_port."
+    long_about = "hush connects to a hush-server over QUIC, authenticates with an Ed25519 or ECDSA (P-256/384/521) SSH key, and runs a remote shell or command.\n\nTarget syntax is [user@]host[:port]. IPv6 literals may be written as [::1]:22022.\n\nForward syntax for -L and -R is [listen_host:]listen_port:target_host:target_port.\n\nPrint shell completions with `hush --completions zsh` or `hush --completions bash`."
 )]
 pub(crate) struct Args {
     /// Enable client logging. Without this, client logging is disabled.

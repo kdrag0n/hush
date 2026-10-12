@@ -983,6 +983,66 @@ async fn server_rejects_certificate_claiming_wrong_user() {
 }
 
 #[test]
+fn complete_remote_lists_paths_on_known_hosts_only() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let server_home = env.temp.path().join("server-home");
+    fs::create_dir_all(server_home.join("sub/inner")).unwrap();
+    for name in ["a.txt", "b c", ".hidden"] {
+        fs::write(server_home.join("sub").join(name), "").unwrap();
+    }
+    let complete = |word: String| {
+        Command::new(hush_bin())
+            .env("HOME", &env.home)
+            .env_remove("SSH_AUTH_SOCK")
+            .arg("__complete-remote")
+            .arg("--data-dir")
+            .arg(env.home.join(".hush"))
+            .arg("-p")
+            .arg(env.port.to_string())
+            .arg(word)
+            .output()
+            .unwrap()
+    };
+
+    // Pressing Tab must not pin a host the user never connected to.
+    let out = complete(format!("{}:sub/", env.target()));
+    assert!(!out.status.success(), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert!(!env.home.join(".hush/known_hosts").exists());
+
+    let out = env
+        .hush()
+        .arg("-T")
+        .arg(env.target())
+        .arg("true")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let out = complete(format!("{}:sub/", env.target()));
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a.txt\nb c\ninner/\n");
+    let out = complete(format!("{}:~/sub/.h", env.target()));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), ".hidden\n");
+    let out = complete(format!("{}:su", env.target()));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "sub/\n");
+}
+
+#[test]
+fn completion_scripts_are_printed() {
+    for shell in ["zsh", "bash"] {
+        let out = Command::new(hush_bin())
+            .arg("--completions")
+            .arg(shell)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("hcp"));
+    }
+}
+
+#[test]
 fn tofu_mismatch_fails_without_insecure() {
     let mut env = TestEnv::new();
     env.start_server();

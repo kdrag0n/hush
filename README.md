@@ -34,6 +34,17 @@ hush cp ./build.tar root@192.168.1.1:/tmp/build.tar
 hcp root@192.168.1.1:/var/log/app.log ./app.log
 ```
 
+Shell completions (zsh and bash) cover flags, hosts from `~/.ssh/config` and known hosts, the remote command, and local and remote `hush cp` paths:
+
+```sh
+# zsh: write to a directory on $fpath, before compinit runs
+hush --completions zsh > ~/.zfunc/_hush
+# bash
+hush --completions bash > ~/.local/share/bash-completion/completions/hush
+```
+
+Remote path completion only connects to hosts already in hush's known_hosts, and never prompts for a key passphrase.
+
 ## Features
 
 - High performance on flaky networks

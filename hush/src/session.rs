@@ -414,7 +414,7 @@ async fn quic_to_stdio(mut recv: quinn::RecvStream, fd: i32) -> Result<()> {
     }
 }
 
-async fn expect_session_ready(mut recv: quinn::RecvStream) -> Result<quinn::RecvStream> {
+pub(crate) async fn expect_session_ready(mut recv: quinn::RecvStream) -> Result<quinn::RecvStream> {
     match read_frame::<StreamResponse>(&mut recv).await? {
         StreamResponse::SessionReady => Ok(recv),
         StreamResponse::Error(err) => bail!("{err}"),

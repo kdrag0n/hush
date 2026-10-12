@@ -1,4 +1,5 @@
 mod cli;
+mod complete;
 mod cp;
 mod logging;
 mod net;
@@ -26,6 +27,11 @@ async fn main() -> Result<()> {
     let args = match cli {
         Cli::Session(args) => args,
         Cli::Copy(args) => return cp::run(args).await,
+        Cli::Completions(script) => {
+            print!("{script}");
+            return Ok(());
+        }
+        Cli::CompleteRemote(args) => return complete::run_remote(args).await,
     };
     logging::init(args.verbose);
     hush_core::os::raise_nofile_soft_limit_to_hard()?;

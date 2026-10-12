@@ -387,7 +387,7 @@ fn parse_copy_path(input: &str, port_override: Option<u16>) -> Result<CopyPath> 
     }
 }
 
-fn split_remote(input: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_remote(input: &str) -> Option<(&str, &str)> {
     if input.starts_with('/') || input.starts_with("./") || input.starts_with("../") {
         return None;
     }
