@@ -56,3 +56,9 @@ max_forwards_per_connection = 16
 # Maximum concurrent local-forward streams per connection.
 # Default: 64
 max_forward_streams_per_connection = 64
+
+# Maximum uncompressed payload bytes and filesystem entries in one upload or
+# download. Limits are enforced while archiving and extracting.
+# Default: 68719476736 (64 GiB) and 100000 entries
+max_file_copy_bytes = 68719476736
+max_file_copy_entries = 100000

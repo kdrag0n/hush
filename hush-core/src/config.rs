@@ -12,6 +12,8 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
 pub const DEFAULT_MAX_SESSIONS_PER_CONNECTION: usize = 1;
 pub const DEFAULT_MAX_FORWARDS_PER_CONNECTION: usize = 16;
 pub const DEFAULT_MAX_FORWARD_STREAMS_PER_CONNECTION: usize = 64;
+pub const DEFAULT_MAX_FILE_COPY_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_FILE_COPY_ENTRIES: u64 = 100_000;
 pub const SERVER_CONFIG_EXAMPLE: &str = include_str!("../../config.example.toml");
 
 #[derive(Debug, Clone, Deserialize)]
@@ -28,6 +30,8 @@ pub struct ServerConfigFile {
     pub max_sessions_per_connection: Option<usize>,
     pub max_forwards_per_connection: Option<usize>,
     pub max_forward_streams_per_connection: Option<usize>,
+    pub max_file_copy_bytes: Option<u64>,
+    pub max_file_copy_entries: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +47,7 @@ pub struct ServerRuntimeConfig {
     pub max_sessions_per_connection: usize,
     pub max_forwards_per_connection: usize,
     pub max_forward_streams_per_connection: usize,
+    pub file_copy_limits: crate::filecopy::FileCopyLimits,
 }
 
 impl Default for ServerRuntimeConfig {
@@ -57,6 +62,7 @@ impl Default for ServerRuntimeConfig {
             max_sessions_per_connection: DEFAULT_MAX_SESSIONS_PER_CONNECTION,
             max_forwards_per_connection: DEFAULT_MAX_FORWARDS_PER_CONNECTION,
             max_forward_streams_per_connection: DEFAULT_MAX_FORWARD_STREAMS_PER_CONNECTION,
+            file_copy_limits: crate::filecopy::FileCopyLimits::default(),
         }
     }
 }

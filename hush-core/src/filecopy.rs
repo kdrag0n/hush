@@ -8,10 +8,11 @@ use async_compression::{
     Level,
     tokio::{bufread::ZstdDecoder, write::ZstdEncoder},
 };
+use futures_core::Stream;
 use quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use std::{
-    env,
+    env, io,
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -21,7 +22,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf},
     process::{Child, ChildStdin, ChildStdout, Command},
 };
-use tokio_tar::{ArchiveBuilder, Builder};
+use tokio_tar::{Archive, ArchiveBuilder, Builder};
 
 /// Bytes buffered between the tar layer and the QUIC stream in each direction.
 /// The tar layer moves data in small chunks, and every stream read or write
@@ -29,6 +30,33 @@ use tokio_tar::{ArchiveBuilder, Builder};
 const STREAM_BUFFER: usize = 1 << 20;
 const WORKER_FRAME_LIMIT: usize = 1 << 20;
 pub const WORKER_ARG: &str = "--hush-file-copy-worker";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct FileCopyLimits {
+    pub max_bytes: u64,
+    pub max_entries: u64,
+}
+
+impl Default for FileCopyLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: crate::config::DEFAULT_MAX_FILE_COPY_BYTES,
+            max_entries: crate::config::DEFAULT_MAX_FILE_COPY_ENTRIES,
+        }
+    }
+}
+
+impl FileCopyLimits {
+    pub fn max_wire_bytes(self) -> u64 {
+        wire_byte_limit(self)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkerRequest {
+    request: FileCopyRequest,
+    limits: FileCopyLimits,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 enum WorkerResponse {
@@ -118,13 +146,22 @@ pub async fn send_archive(
     entries: &[FileCopyEntry],
     compression: FileCopyCompression,
 ) -> Result<()> {
-    send_archive_with_progress(send, entries, compression, |_| {}, |_| {}).await
+    send_archive_with_progress(
+        send,
+        entries,
+        compression,
+        FileCopyLimits::default(),
+        |_| {},
+        |_| {},
+    )
+    .await
 }
 
 pub async fn send_archive_with_progress<EntryStarted, BytesTransferred>(
     send: SendStream,
     entries: &[FileCopyEntry],
     compression: FileCopyCompression,
+    limits: FileCopyLimits,
     entry_started: EntryStarted,
     bytes_transferred: BytesTransferred,
 ) -> Result<()>
@@ -132,14 +169,22 @@ where
     EntryStarted: FnMut(&FileCopyEntry),
     BytesTransferred: FnMut(u64) + Send + Unpin + 'static,
 {
-    send_archive_to_with_progress(send, entries, compression, entry_started, bytes_transferred)
-        .await
+    send_archive_to_with_progress(
+        send,
+        entries,
+        compression,
+        limits,
+        entry_started,
+        bytes_transferred,
+    )
+    .await
 }
 
 async fn send_archive_to_with_progress<W, EntryStarted, BytesTransferred>(
     send: W,
     entries: &[FileCopyEntry],
     compression: FileCopyCompression,
+    limits: FileCopyLimits,
     mut entry_started: EntryStarted,
     bytes_transferred: BytesTransferred,
 ) -> Result<()>
@@ -152,28 +197,20 @@ where
         bail!("no sources to copy");
     }
 
+    if limits.max_bytes == 0 || limits.max_entries == 0 {
+        bail!("file copy is disabled by its configured limit");
+    }
     let writer = archive_writer(send, compression);
     let writer = ProgressWriter::new(writer, bytes_transferred);
+    let writer = LimitedWriter::new(writer, archive_byte_limit(limits));
     let mut archive = Builder::new(writer);
     archive.follow_symlinks(false);
+    let mut budget = CopyBudget::new(limits);
     for entry in entries {
         entry_started(entry);
         let src = Path::new(&entry.path);
         let archive_name = Path::new(&entry.archive_name);
-        let metadata = tokio::fs::symlink_metadata(src)
-            .await
-            .with_context(|| format!("stat source `{}`", src.display()))?;
-        if metadata.is_dir() {
-            archive
-                .append_dir_all(archive_name, src)
-                .await
-                .with_context(|| format!("archive directory `{}`", src.display()))?;
-        } else {
-            archive
-                .append_path_with_name(src, archive_name)
-                .await
-                .with_context(|| format!("archive path `{}`", src.display()))?;
-        }
+        append_path_limited(&mut archive, src, archive_name, &mut budget).await?;
     }
 
     let mut writer = archive.into_inner().await.context("finish tar archive")?;
@@ -186,40 +223,178 @@ pub async fn receive_archive(
     destination: &Path,
     compression: FileCopyCompression,
 ) -> Result<()> {
-    receive_archive_with_progress(recv, destination, compression, |_| {}).await
+    receive_archive_with_progress(
+        recv,
+        destination,
+        compression,
+        FileCopyLimits::default(),
+        |_| {},
+    )
+    .await
 }
 
 pub async fn receive_archive_with_progress<BytesTransferred>(
     recv: RecvStream,
     destination: &Path,
     compression: FileCopyCompression,
+    limits: FileCopyLimits,
     bytes_transferred: BytesTransferred,
 ) -> Result<()>
 where
     BytesTransferred: FnMut(u64) + Unpin,
 {
-    receive_archive_from_with_progress(recv, destination, compression, bytes_transferred).await
+    receive_archive_from_with_progress(recv, destination, compression, limits, bytes_transferred)
+        .await
 }
 
 async fn receive_archive_from_with_progress<R, BytesTransferred>(
     recv: R,
     destination: &Path,
     compression: FileCopyCompression,
+    limits: FileCopyLimits,
     bytes_transferred: BytesTransferred,
 ) -> Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
     BytesTransferred: FnMut(u64) + Unpin,
 {
-    let reader = archive_reader(recv, compression);
+    if limits.max_bytes == 0 || limits.max_entries == 0 {
+        bail!("file copy is disabled by its configured limit");
+    }
+    let reader = recv.take(wire_byte_limit(limits));
+    let reader = archive_reader(reader, compression);
     let reader = ProgressReader::new(reader, bytes_transferred);
+    let reader = reader.take(archive_byte_limit(limits));
     let mut archive = ArchiveBuilder::new(reader)
         .set_allow_external_symlinks(false)
         .build();
-    archive
-        .unpack(destination)
+    unpack_archive_limited(&mut archive, destination, limits)
         .await
         .with_context(|| format!("extract archive into `{}`", destination.display()))?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CopyBudget {
+    limits: FileCopyLimits,
+    bytes: u64,
+    entries: u64,
+}
+
+impl CopyBudget {
+    fn new(limits: FileCopyLimits) -> Self {
+        Self {
+            limits,
+            bytes: 0,
+            entries: 0,
+        }
+    }
+
+    fn add(&mut self, bytes: u64) -> Result<()> {
+        self.entries = self.entries.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.entries > self.limits.max_entries {
+            bail!(
+                "file copy exceeds the {} entry limit",
+                self.limits.max_entries
+            );
+        }
+        if self.bytes > self.limits.max_bytes {
+            bail!("file copy exceeds the {} byte limit", self.limits.max_bytes);
+        }
+        Ok(())
+    }
+}
+
+fn archive_byte_limit(limits: FileCopyLimits) -> u64 {
+    limits
+        .max_bytes
+        .saturating_add(limits.max_entries.saturating_mul(1024))
+        .saturating_add(STREAM_BUFFER as u64)
+}
+
+fn wire_byte_limit(limits: FileCopyLimits) -> u64 {
+    archive_byte_limit(limits)
+        .saturating_add(archive_byte_limit(limits) / 100)
+        .saturating_add(STREAM_BUFFER as u64)
+}
+
+async fn append_path_limited<W>(
+    archive: &mut Builder<W>,
+    source: &Path,
+    archive_name: &Path,
+    budget: &mut CopyBudget,
+) -> Result<()>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let mut pending = vec![(source.to_owned(), archive_name.to_owned())];
+    while let Some((source, archive_name)) = pending.pop() {
+        let metadata = tokio::fs::symlink_metadata(&source)
+            .await
+            .with_context(|| format!("stat source `{}`", source.display()))?;
+        budget.add(if metadata.is_file() {
+            metadata.len()
+        } else {
+            0
+        })?;
+        if metadata.is_dir() {
+            archive
+                .append_dir(&archive_name, &source)
+                .await
+                .with_context(|| format!("archive directory `{}`", source.display()))?;
+            let mut children = tokio::fs::read_dir(&source)
+                .await
+                .with_context(|| format!("read directory `{}`", source.display()))?;
+            while let Some(child) = children.next_entry().await? {
+                pending.push((child.path(), archive_name.join(child.file_name())));
+            }
+        } else {
+            archive
+                .append_path_with_name(&source, &archive_name)
+                .await
+                .with_context(|| format!("archive path `{}`", source.display()))?;
+        }
+    }
+    Ok(())
+}
+
+async fn unpack_archive_limited<R>(
+    archive: &mut Archive<R>,
+    destination: &Path,
+    limits: FileCopyLimits,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    if tokio::fs::symlink_metadata(destination).await.is_err() {
+        tokio::fs::create_dir_all(destination).await?;
+    }
+    let destination = tokio::fs::canonicalize(destination).await?;
+    let mut entries = archive.entries()?;
+    let mut directories = Vec::new();
+    let mut targets = Default::default();
+    let mut budget = CopyBudget::new(limits);
+    while let Some(entry) = std::future::poll_fn(|cx| Pin::new(&mut entries).poll_next(cx)).await {
+        let mut entry = entry.context("iterate over archive")?;
+        budget.add(entry.header().size()?)?;
+        if entry.header().entry_type() == tokio_tar::EntryType::Directory {
+            directories.push(entry);
+        } else {
+            entry.unpack_in_raw(&destination, &mut targets).await?;
+        }
+    }
+    let mut directories = directories
+        .into_iter()
+        .map(|entry| {
+            let path = entry.path_bytes()?.into_owned();
+            Ok((entry, path))
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    directories.sort_by(|a, b| b.1.cmp(&a.1));
+    for (mut entry, _) in directories {
+        entry.unpack_in_raw(&destination, &mut targets).await?;
+    }
     Ok(())
 }
 
@@ -268,12 +443,20 @@ pub(crate) async fn handle_upload(
     recv: RecvStream,
     user: &str,
     request: FileCopyRequest,
+    limits: FileCopyLimits,
 ) -> Result<()> {
     set_stream_priority(&send, StreamPriority::FileCopy);
-    if needs_privileged_worker(user) {
-        return handle_upload_worker(send, recv, user, request).await;
+    if request.entries.len() as u64 > limits.max_entries {
+        return write_copy_result(
+            send,
+            Err(anyhow::anyhow!("file copy exceeds the entry limit")),
+        )
+        .await;
     }
-    handle_upload_direct(send, recv, user, request).await
+    if needs_privileged_worker(user) {
+        return handle_upload_worker(send, recv, user, request, limits).await;
+    }
+    handle_upload_direct(send, recv, user, request, limits).await
 }
 
 async fn handle_upload_direct(
@@ -281,6 +464,7 @@ async fn handle_upload_direct(
     recv: RecvStream,
     user: &str,
     request: FileCopyRequest,
+    limits: FileCopyLimits,
 ) -> Result<()> {
     let destination = resolve_remote_path(user, &request.destination);
     let plan = match plan_for_destination(&destination, &request.entries).await {
@@ -288,7 +472,14 @@ async fn handle_upload_direct(
         Err(err) => return write_copy_result(send, Err(err)).await,
     };
     write_frame(&mut send, &StreamResponse::FileCopyReady(plan.clone())).await?;
-    let result = receive_archive(recv, Path::new(&plan.extract_dir), request.compression).await;
+    let result = receive_archive_with_progress(
+        recv,
+        Path::new(&plan.extract_dir),
+        request.compression,
+        limits,
+        |_| {},
+    )
+    .await;
     write_copy_result(send, result).await
 }
 
@@ -296,18 +487,27 @@ pub(crate) async fn handle_download(
     send: SendStream,
     user: &str,
     request: FileCopyRequest,
+    limits: FileCopyLimits,
 ) -> Result<()> {
     set_stream_priority(&send, StreamPriority::FileCopy);
-    if needs_privileged_worker(user) {
-        return handle_download_worker(send, user, request).await;
+    if request.entries.len() as u64 > limits.max_entries {
+        return write_copy_result(
+            send,
+            Err(anyhow::anyhow!("file copy exceeds the entry limit")),
+        )
+        .await;
     }
-    handle_download_direct(send, user, request).await
+    if needs_privileged_worker(user) {
+        return handle_download_worker(send, user, request, limits).await;
+    }
+    handle_download_direct(send, user, request, limits).await
 }
 
 async fn handle_download_direct(
     mut send: SendStream,
     user: &str,
     request: FileCopyRequest,
+    limits: FileCopyLimits,
 ) -> Result<()> {
     let mut entries = request.entries.clone();
     for entry in &mut entries {
@@ -328,7 +528,7 @@ async fn handle_download_direct(
         }),
     )
     .await?;
-    send_archive(send, &entries, request.compression).await
+    send_archive_with_progress(send, &entries, request.compression, limits, |_| {}, |_| {}).await
 }
 
 fn needs_privileged_worker(user: &str) -> bool {
@@ -340,8 +540,9 @@ async fn handle_upload_worker(
     mut recv: RecvStream,
     user: &str,
     request: FileCopyRequest,
+    limits: FileCopyLimits,
 ) -> Result<()> {
-    let mut worker = spawn_worker(user, &request).await?;
+    let mut worker = spawn_worker(user, &request, limits).await?;
     let plan = match read_worker_frame(&mut worker.output).await? {
         WorkerResponse::Ready(plan) => plan,
         WorkerResponse::Error(err) => {
@@ -369,8 +570,9 @@ async fn handle_download_worker(
     mut send: SendStream,
     user: &str,
     request: FileCopyRequest,
+    limits: FileCopyLimits,
 ) -> Result<()> {
-    let mut worker = spawn_worker(user, &request).await?;
+    let mut worker = spawn_worker(user, &request, limits).await?;
     worker.input.shutdown().await?;
     let plan = match read_worker_frame(&mut worker.output).await? {
         WorkerResponse::Ready(plan) => plan,
@@ -386,7 +588,11 @@ async fn handle_download_worker(
     Ok(())
 }
 
-async fn spawn_worker(user: &str, request: &FileCopyRequest) -> Result<Worker> {
+async fn spawn_worker(
+    user: &str,
+    request: &FileCopyRequest,
+    limits: FileCopyLimits,
+) -> Result<Worker> {
     let info = crate::os::user_info_for_user(user)?.context("unknown file-copy user")?;
     let executable = env::current_exe().context("locate hush-server executable")?;
     let mut command = Command::new(executable);
@@ -413,7 +619,14 @@ async fn spawn_worker(user: &str, request: &FileCopyRequest) -> Result<Worker> {
     };
     let mut input = child.stdin.take().context("file-copy worker stdin")?;
     let output = child.stdout.take().context("file-copy worker stdout")?;
-    write_worker_frame(&mut input, request).await?;
+    write_worker_frame(
+        &mut input,
+        &WorkerRequest {
+            request: request.clone(),
+            limits,
+        },
+    )
+    .await?;
     Ok(Worker {
         child,
         input,
@@ -432,7 +645,9 @@ async fn wait_worker(child: &mut Child) -> Result<()> {
 pub async fn run_worker() -> Result<()> {
     let mut input = tokio::io::stdin();
     let mut output = tokio::io::stdout();
-    let request: FileCopyRequest = read_worker_frame(&mut input).await?;
+    let worker_request: WorkerRequest = read_worker_frame(&mut input).await?;
+    let request = worker_request.request;
+    let limits = worker_request.limits;
     let user = crate::auth::current_username();
     match request.direction {
         FileCopyDirection::Upload => {
@@ -440,7 +655,7 @@ pub async fn run_worker() -> Result<()> {
             let plan = match plan_for_destination(&destination, &request.entries).await {
                 Ok(plan) => plan,
                 Err(err) => {
-                    write_worker_frame(&mut output, &WorkerResponse::Error(err.to_string()))
+                    write_worker_frame(&mut output, &WorkerResponse::Error(format!("{err:#}")))
                         .await?;
                     return Ok(());
                 }
@@ -450,13 +665,15 @@ pub async fn run_worker() -> Result<()> {
                 input,
                 Path::new(&plan.extract_dir),
                 request.compression,
+                limits,
                 |_| {},
             )
             .await;
             match result {
                 Ok(()) => write_worker_frame(&mut output, &WorkerResponse::Complete).await?,
                 Err(err) => {
-                    write_worker_frame(&mut output, &WorkerResponse::Error(err.to_string())).await?
+                    write_worker_frame(&mut output, &WorkerResponse::Error(format!("{err:#}")))
+                        .await?
                 }
             }
         }
@@ -467,7 +684,7 @@ pub async fn run_worker() -> Result<()> {
                 if let Err(err) = tokio::fs::symlink_metadata(&path).await {
                     let err = anyhow::Error::new(err)
                         .context(format!("stat source `{}`", path.display()));
-                    write_worker_frame(&mut output, &WorkerResponse::Error(err.to_string()))
+                    write_worker_frame(&mut output, &WorkerResponse::Error(format!("{err:#}")))
                         .await?;
                     return Ok(());
                 }
@@ -478,8 +695,15 @@ pub async fn run_worker() -> Result<()> {
                 entries: entries.clone(),
             };
             write_worker_frame(&mut output, &WorkerResponse::Ready(plan)).await?;
-            send_archive_to_with_progress(output, &entries, request.compression, |_| {}, |_| {})
-                .await?;
+            send_archive_to_with_progress(
+                output,
+                &entries,
+                request.compression,
+                limits,
+                |_| {},
+                |_| {},
+            )
+            .await?;
         }
     }
     Ok(())
@@ -517,7 +741,7 @@ where
 async fn write_copy_result(mut send: SendStream, result: Result<()>) -> Result<()> {
     match result {
         Ok(()) => write_frame(&mut send, &StreamResponse::Ok).await?,
-        Err(err) => write_frame(&mut send, &StreamResponse::Error(err.to_string())).await?,
+        Err(err) => write_frame(&mut send, &StreamResponse::Error(format!("{err:#}"))).await?,
     }
     send.finish()?;
     Ok(())
@@ -550,6 +774,52 @@ where
 struct ProgressWriter<W, F> {
     inner: W,
     bytes_transferred: F,
+}
+
+struct LimitedWriter<W> {
+    inner: W,
+    written: u64,
+    limit: u64,
+}
+
+impl<W> LimitedWriter<W> {
+    fn new(inner: W, limit: u64) -> Self {
+        Self {
+            inner,
+            written: 0,
+            limit,
+        }
+    }
+}
+
+impl<W> AsyncWrite for LimitedWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.written >= self.limit {
+            return Poll::Ready(Err(io::Error::other(
+                "file-copy archive byte limit reached",
+            )));
+        }
+        let available = (self.limit - self.written).min(buf.len() as u64) as usize;
+        let written =
+            std::task::ready!(Pin::new(&mut self.inner).poll_write(cx, &buf[..available]))?;
+        self.written += written as u64;
+        Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 impl<W, F> ProgressWriter<W, F> {
@@ -730,6 +1000,7 @@ mod tests {
                 writer,
                 &entries,
                 FileCopyCompression::None,
+                FileCopyLimits::default(),
                 |_| {},
                 |_| {},
             ),
@@ -737,10 +1008,112 @@ mod tests {
                 reader,
                 destination.path(),
                 FileCopyCompression::None,
+                FileCopyLimits::default(),
                 |_| {},
             ),
         );
         assert!(received.is_err());
         assert!(!destination.path().join("link").is_file());
+    }
+
+    #[tokio::test]
+    async fn archive_send_enforces_payload_byte_limit() {
+        let source = tempfile::tempdir().unwrap();
+        let path = source.path().join("payload");
+        tokio::fs::write(&path, b"12345").await.unwrap();
+        let entries = vec![entry_for_path(&path).unwrap()];
+        let (writer, mut reader) = tokio::io::duplex(64 * 1024);
+        let drain = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await.unwrap();
+        });
+
+        let result = send_archive_to_with_progress(
+            writer,
+            &entries,
+            FileCopyCompression::None,
+            FileCopyLimits {
+                max_bytes: 4,
+                max_entries: 10,
+            },
+            |_| {},
+            |_| {},
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("byte limit"));
+        drain.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn archive_receive_checks_entry_size_before_extracting() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let path = source.path().join("payload");
+        tokio::fs::write(&path, b"12345").await.unwrap();
+        let entries = vec![entry_for_path(&path).unwrap()];
+        let (writer, reader) = tokio::io::duplex(64 * 1024);
+
+        let (sent, received) = tokio::join!(
+            send_archive_to_with_progress(
+                writer,
+                &entries,
+                FileCopyCompression::None,
+                FileCopyLimits::default(),
+                |_| {},
+                |_| {},
+            ),
+            receive_archive_from_with_progress(
+                reader,
+                destination.path(),
+                FileCopyCompression::None,
+                FileCopyLimits {
+                    max_bytes: 4,
+                    max_entries: 10,
+                },
+                |_| {},
+            ),
+        );
+        // The receiver may close as soon as it sees the oversized header,
+        // before the sender flushes the rest of the tar stream.
+        let _ = sent;
+        assert!(format!("{:#}", received.unwrap_err()).contains("byte limit"));
+        assert!(!destination.path().join("payload").exists());
+    }
+
+    #[tokio::test]
+    async fn archive_receive_enforces_entry_limit() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let first = source.path().join("first");
+        let second = source.path().join("second");
+        tokio::fs::write(&first, b"1").await.unwrap();
+        tokio::fs::write(&second, b"2").await.unwrap();
+        let entries = vec![
+            entry_for_path(&first).unwrap(),
+            entry_for_path(&second).unwrap(),
+        ];
+        let (writer, reader) = tokio::io::duplex(64 * 1024);
+
+        let (_, received) = tokio::join!(
+            send_archive_to_with_progress(
+                writer,
+                &entries,
+                FileCopyCompression::None,
+                FileCopyLimits::default(),
+                |_| {},
+                |_| {},
+            ),
+            receive_archive_from_with_progress(
+                reader,
+                destination.path(),
+                FileCopyCompression::None,
+                FileCopyLimits {
+                    max_bytes: 1024,
+                    max_entries: 1,
+                },
+                |_| {},
+            ),
+        );
+        assert!(format!("{:#}", received.unwrap_err()).contains("entry limit"));
     }
 }

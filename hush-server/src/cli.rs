@@ -66,4 +66,12 @@ pub(crate) struct Args {
     /// Maximum concurrent local-forward streams per connection.
     #[usage(long, value_name = "N", help_heading = "Limits")]
     pub(crate) max_forward_streams_per_connection: Option<usize>,
+
+    /// Maximum uncompressed payload bytes per file copy.
+    #[usage(long, value_name = "BYTES", help_heading = "Limits")]
+    pub(crate) max_file_copy_bytes: Option<u64>,
+
+    /// Maximum filesystem entries per file copy.
+    #[usage(long, value_name = "N", help_heading = "Limits")]
+    pub(crate) max_file_copy_entries: Option<u64>,
 }

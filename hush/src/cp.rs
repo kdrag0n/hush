@@ -50,6 +50,14 @@ pub(crate) struct CpArgs {
     #[usage(short = 'i', value_name = "PATH", help_heading = "Authentication")]
     pub(crate) identity_file: Option<PathBuf>,
 
+    /// Maximum uncompressed payload bytes accepted from or read for one copy.
+    #[usage(long, value_name = "BYTES", help_heading = "Limits")]
+    pub(crate) max_bytes: Option<u64>,
+
+    /// Maximum filesystem entries accepted from or read for one copy.
+    #[usage(long, value_name = "N", help_heading = "Limits")]
+    pub(crate) max_entries: Option<u64>,
+
     /// Source paths followed by one destination.
     #[usage(arg, required, var_min = 2, value_name = "SRC... DEST")]
     pub(crate) paths: Vec<String>,
@@ -98,6 +106,17 @@ pub(crate) async fn run(args: CpArgs) -> Result<()> {
     }
 }
 
+fn copy_limits(args: &CpArgs) -> filecopy::FileCopyLimits {
+    filecopy::FileCopyLimits {
+        max_bytes: args
+            .max_bytes
+            .unwrap_or(hush_core::config::DEFAULT_MAX_FILE_COPY_BYTES),
+        max_entries: args
+            .max_entries
+            .unwrap_or(hush_core::config::DEFAULT_MAX_FILE_COPY_ENTRIES),
+    }
+}
+
 async fn upload(
     args: &CpArgs,
     compression: FileCopyCompression,
@@ -143,6 +162,7 @@ async fn upload(
         send,
         &plan.entries,
         compression,
+        copy_limits(args),
         move |entry| entry_progress.lock().unwrap().start_entry(entry),
         move |bytes| byte_progress.lock().unwrap().add_bytes(bytes),
     )
@@ -201,6 +221,7 @@ async fn download(
         recv,
         Path::new(&plan.extract_dir),
         compression,
+        copy_limits(args),
         move |bytes| byte_progress.lock().unwrap().add_bytes(bytes),
     )
     .await;
@@ -295,6 +316,7 @@ async fn relay(
         source_recv,
         destination_send,
         &mut destination_recv,
+        copy_limits(args),
         move |bytes| byte_progress.lock().unwrap().add_bytes(bytes),
     )
     .await;
@@ -317,11 +339,13 @@ async fn relay_archive(
     mut source: quinn::RecvStream,
     mut destination: quinn::SendStream,
     destination_recv: &mut quinn::RecvStream,
+    limits: filecopy::FileCopyLimits,
     mut bytes_transferred: impl FnMut(u64),
 ) -> Result<()> {
     // Moving several chunks per call takes each connection's lock once per
     // batch rather than once per packet.
     let mut chunks: [_; 32] = Default::default();
+    let mut transferred = 0u64;
     loop {
         let count = match source.read_chunks(&mut chunks).await {
             Ok(Some(count)) => count,
@@ -334,6 +358,12 @@ async fn relay_archive(
             }
         };
         let bytes = chunks[..count].iter().map(|chunk| chunk.len() as u64).sum();
+        transferred = transferred.saturating_add(bytes);
+        if transferred > limits.max_wire_bytes() {
+            let _ = source.stop(0u32.into());
+            let _ = destination.reset(0u32.into());
+            bail!("file copy exceeds the configured byte limit");
+        }
         if let Err(err) = destination.write_all_chunks(&mut chunks[..count]).await {
             let _ = source.stop(0u32.into());
             // The destination stops reading when extraction fails, and its

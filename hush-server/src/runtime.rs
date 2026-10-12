@@ -68,6 +68,16 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             .max_forward_streams_per_connection
             .or(file_cfg.max_forward_streams_per_connection)
             .unwrap_or(config::DEFAULT_MAX_FORWARD_STREAMS_PER_CONNECTION),
+        file_copy_limits: hush_core::filecopy::FileCopyLimits {
+            max_bytes: args
+                .max_file_copy_bytes
+                .or(file_cfg.max_file_copy_bytes)
+                .unwrap_or(config::DEFAULT_MAX_FILE_COPY_BYTES),
+            max_entries: args
+                .max_file_copy_entries
+                .or(file_cfg.max_file_copy_entries)
+                .unwrap_or(config::DEFAULT_MAX_FILE_COPY_ENTRIES),
+        },
     };
     runtime_config.validate(hush_core::os::is_root())?;
 
@@ -135,6 +145,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         max_sessions_per_connection = runtime_config.max_sessions_per_connection,
         max_forwards_per_connection = runtime_config.max_forwards_per_connection,
         max_forward_streams_per_connection = runtime_config.max_forward_streams_per_connection,
+        max_file_copy_bytes = runtime_config.file_copy_limits.max_bytes,
+        max_file_copy_entries = runtime_config.file_copy_limits.max_entries,
         "hush server listening"
     );
 
@@ -259,5 +271,7 @@ fn empty_file_config() -> config::ServerConfigFile {
         max_sessions_per_connection: None,
         max_forwards_per_connection: None,
         max_forward_streams_per_connection: None,
+        max_file_copy_bytes: None,
+        max_file_copy_entries: None,
     }
 }

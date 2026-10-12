@@ -267,10 +267,23 @@ impl AuthenticatedConnection {
                     crate::tls::switch_to_bulk(&self.conn);
                     let result = match request.direction {
                         FileCopyDirection::Upload => {
-                            filecopy::handle_upload(send, recv, &self.user, request).await
+                            filecopy::handle_upload(
+                                send,
+                                recv,
+                                &self.user,
+                                request,
+                                self.config.file_copy_limits,
+                            )
+                            .await
                         }
                         FileCopyDirection::Download => {
-                            filecopy::handle_download(send, &self.user, request).await
+                            filecopy::handle_download(
+                                send,
+                                &self.user,
+                                request,
+                                self.config.file_copy_limits,
+                            )
+                            .await
                         }
                     };
                     tracing::debug!(stats = ?self.conn.stats(), "file copy finished");

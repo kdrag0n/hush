@@ -532,6 +532,29 @@ fn hcp_copies_tiny_file() {
     );
 }
 
+#[test]
+fn hcp_server_rejects_copy_over_byte_limit() {
+    let mut env = TestEnv::new();
+    env.start_server_with(&["--max-file-copy-bytes", "4"]);
+    let source = env.temp.path().join("five-bytes.txt");
+    let destination = env.temp.path().join("must-not-exist.txt");
+    fs::write(&source, b"12345").unwrap();
+
+    let out = env
+        .hcp()
+        .arg(&source)
+        .arg(format!("{}:{}", env.target(), destination.display()))
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("byte limit"),
+        "{out:?}"
+    );
+    assert!(!destination.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn hcp_rejects_external_symlink_uploads() {
