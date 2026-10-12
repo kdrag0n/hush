@@ -97,14 +97,19 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let (endpoint, sockets) = if use_nw {
         #[cfg(target_os = "macos")]
         {
-            let socket = hush_core::nwsock::NwSocket::listen(listen)?;
+            let socket = Arc::new(hush_core::nwsock::NwSocket::listen(listen)?);
             let endpoint = Endpoint::new_with_abstract_socket(
                 endpoint_config,
                 Some(server_config),
-                Arc::new(socket) as Arc<dyn quinn::AsyncUdpSocket>,
+                Arc::clone(&socket) as Arc<dyn quinn::AsyncUdpSocket>,
                 runtime,
             )?;
-            (endpoint, None)
+            (
+                endpoint,
+                Some(Arc::new(hush_core::server::ConnectionSockets::Network(
+                    socket,
+                ))),
+            )
         }
         #[cfg(not(target_os = "macos"))]
         unreachable!()
@@ -117,7 +122,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             Arc::clone(&sockets) as Arc<dyn quinn::AsyncUdpSocket>,
             runtime,
         )?;
-        (endpoint, Some(sockets))
+        (
+            endpoint,
+            Some(Arc::new(hush_core::server::ConnectionSockets::Bsd(sockets))),
+        )
     };
     let local_addr = endpoint.local_addr()?;
     tracing::info!(

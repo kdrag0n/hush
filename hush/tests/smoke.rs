@@ -209,6 +209,25 @@ fn propagates_exit_status() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn authenticated_connection_survives_pre_auth_flow_timeout() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    let out = env
+        .hush()
+        .arg("-T")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("sleep 5; printf flow-alive")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, b"flow-alive");
+}
+
 #[test]
 fn non_pty_exit_does_not_wait_for_stdin_eof() {
     let mut env = TestEnv::new();

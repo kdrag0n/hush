@@ -39,11 +39,51 @@ const AUTH_FAILURE_MESSAGE: &str = "unauthorized";
 
 /// Authenticate and serve one accepted connection. This is the single entry
 /// point for handling a connection.
+pub enum ConnectionSockets {
+    Bsd(Arc<MultiSocket>),
+    #[cfg(target_os = "macos")]
+    Network(Arc<crate::nwsock::NwSocket>),
+}
+
+enum ConnectionSocketGuard {
+    Bsd {
+        _guard: crate::fastsock::PrivateSocketGuard,
+    },
+    #[cfg(target_os = "macos")]
+    Network { _guard: crate::nwsock::NwFlowGuard },
+}
+
+impl ConnectionSockets {
+    fn adopt(
+        &self,
+        local_ip: Option<IpAddr>,
+        peer: SocketAddr,
+    ) -> std::io::Result<ConnectionSocketGuard> {
+        match self {
+            Self::Bsd(sockets) => {
+                let local_ip = local_ip.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::AddrNotAvailable,
+                        "connection has no local address",
+                    )
+                })?;
+                Ok(ConnectionSocketGuard::Bsd {
+                    _guard: sockets.adopt(local_ip, peer),
+                })
+            }
+            #[cfg(target_os = "macos")]
+            Self::Network(socket) => socket
+                .adopt(peer)
+                .map(|guard| ConnectionSocketGuard::Network { _guard: guard }),
+        }
+    }
+}
+
 pub async fn serve_connection(
     conn: Connection,
     config: ServerRuntimeConfig,
     server_addr: SocketAddr,
-    sockets: Option<Arc<MultiSocket>>,
+    sockets: Option<Arc<ConnectionSockets>>,
 ) -> Result<()> {
     PendingConnection::new(conn, config, server_addr)?
         .authenticate()?
@@ -167,7 +207,7 @@ impl AuthenticatedConnection {
     }
 
     /// Serve streams until the connection closes or a session finishes.
-    pub async fn serve(self, sockets: Option<Arc<MultiSocket>>) -> Result<()> {
+    pub async fn serve(self, sockets: Option<Arc<ConnectionSockets>>) -> Result<()> {
         let mut remote_forwards = 0usize;
         let mut remote_forward_tasks = RemoteForwardTasks::default();
         let remote_forward_streams = Arc::new(Semaphore::new(
@@ -176,10 +216,22 @@ impl AuthenticatedConnection {
         // Give the connection a private socket once it has settled, and keep
         // the guard alive as long as the connection: every packet of it,
         // including its close, then goes through that socket.
-        let _private_socket = sockets.and_then(|sockets| {
-            let local_ip = self.conn.local_ip()?;
-            Some(sockets.adopt(local_ip, self.conn.remote_address()))
+        let private_socket = sockets.and_then(|sockets| {
+            match sockets.adopt(self.conn.local_ip(), self.conn.remote_address()) {
+                Ok(guard) => Some(guard),
+                Err(err) => {
+                    tracing::debug!(%err, "could not adopt authenticated peer socket");
+                    None
+                }
+            }
         });
+        if let Some(private_socket) = private_socket {
+            let conn = self.conn.clone();
+            tokio::spawn(async move {
+                conn.closed().await;
+                drop(private_socket);
+            });
+        }
         loop {
             let (mut send, mut recv) = self.conn.accept_bi().await?;
             match read_frame::<StreamOpen>(&mut recv).await? {

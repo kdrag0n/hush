@@ -7,8 +7,7 @@
 //! port are refused on some macOS hosts. One handle is either a listener
 //! whose peers become flows, or a single client flow.
 //!
-//! Not yet handled: ECN (quinn disables it after validation fails), and
-//! idle flows of long-gone peers are not reaped.
+//! ECN is not yet handled (quinn disables it after validation fails).
 
 use quinn::{
     AsyncUdpSocket, UdpPollHelper, UdpPoller,
@@ -31,12 +30,20 @@ struct Handle {
 
 type FlowCb = extern "C" fn(*mut c_void, u64, *const libc::sockaddr, *const libc::sockaddr);
 type RecvCb = extern "C" fn(*mut c_void, u64, *const u8, usize);
+type CloseCb = extern "C" fn(*mut c_void, u64);
 
 unsafe extern "C" {
-    fn nwudp_create(ctx: *mut c_void, on_flow: FlowCb, on_recv: RecvCb) -> *mut Handle;
+    fn nwudp_create(
+        ctx: *mut c_void,
+        on_flow: FlowCb,
+        on_recv: RecvCb,
+        on_close: CloseCb,
+    ) -> *mut Handle;
     fn nwudp_listen(h: *mut Handle, host: *const libc::c_char, port: u16) -> i32;
     fn nwudp_connect(h: *mut Handle, host: *const libc::c_char, port: u16) -> u64;
     fn nwudp_send(h: *mut Handle, flow: u64, data: *const u8, len: usize, seg: usize) -> i32;
+    fn nwudp_close_flow(h: *mut Handle, flow: u64);
+    fn nwudp_protect_flow(h: *mut Handle, flow: u64) -> i32;
 }
 
 /// Bytes of received datagrams held before the endpoint reads them.
@@ -144,6 +151,18 @@ extern "C" fn on_recv(ctx: *mut c_void, flow: u64, data: *const u8, len: usize) 
     }
 }
 
+extern "C" fn on_close(ctx: *mut c_void, flow: u64) {
+    // SAFETY: as in on_flow.
+    let inner = unsafe { &*(ctx as *const Inner) };
+    let Some(peer) = inner.peers.lock().unwrap().remove(&flow) else {
+        return;
+    };
+    let mut flows = inner.flows.lock().unwrap();
+    if flows.get(&peer) == Some(&flow) {
+        flows.remove(&peer);
+    }
+}
+
 /// A quinn socket backed by Network.framework.
 #[derive(Debug)]
 pub struct NwSocket {
@@ -171,7 +190,7 @@ impl NwSocket {
         // stays valid for the process lifetime (experimental transport).
         let ctx = Arc::into_raw(Arc::clone(&inner)) as *mut c_void;
         // SAFETY: the callbacks match the shim's expected signatures.
-        let handle = unsafe { nwudp_create(ctx, on_flow, on_recv) };
+        let handle = unsafe { nwudp_create(ctx, on_flow, on_recv, on_close) };
         // SAFETY: Inner is behind an Arc we own; handle set once here.
         unsafe { (*(Arc::as_ptr(&inner) as *mut Inner)).handle = handle };
         Self { inner }
@@ -211,6 +230,46 @@ impl NwSocket {
         socket.inner.flows.lock().unwrap().insert(addr, flow);
         socket.inner.peers.lock().unwrap().insert(flow, addr);
         Ok(socket)
+    }
+
+    /// Protect an authenticated peer's flow from the short unauthenticated
+    /// idle timeout. Dropping the guard closes the flow immediately.
+    pub fn adopt(self: &Arc<Self>, peer: SocketAddr) -> io::Result<NwFlowGuard> {
+        let peer = self.inner.canonical(peer);
+        let flow = self
+            .inner
+            .flows
+            .lock()
+            .unwrap()
+            .get(&peer)
+            .copied()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "peer flow is gone"))?;
+        // SAFETY: the handle remains alive with `inner` and the flow id came
+        // from that handle's callback.
+        if unsafe { nwudp_protect_flow(self.inner.handle, flow) } != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "peer flow closed before authentication completed",
+            ));
+        }
+        Ok(NwFlowGuard {
+            inner: Arc::clone(&self.inner),
+            flow,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct NwFlowGuard {
+    inner: Arc<Inner>,
+    flow: u64,
+}
+
+impl Drop for NwFlowGuard {
+    fn drop(&mut self) {
+        // SAFETY: the handle remains alive with `inner`; closing an already
+        // closed flow is explicitly harmless in the shim.
+        unsafe { nwudp_close_flow(self.inner.handle, self.flow) };
     }
 }
 
