@@ -132,6 +132,7 @@ class Hush < Formula
   def install
     bin.install cached_download => "hush"
     bin.install resource("hush-server").cached_download => "hush-server"
+    generate_completions_from_executable(bin/"hush", "--completions", shells: [:bash, :zsh])
   end
 
   service do
