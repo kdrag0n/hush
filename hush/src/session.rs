@@ -34,13 +34,11 @@ pub(crate) async fn run_pty(conn: quinn::Connection, session: OpenSession) -> Re
     let mut status_task = tokio::spawn(read_exit_status(conn.clone()));
     let (in_task, mut escape_rx) = spawn_stdin_pump(send);
     let out_task = tokio::spawn(quic_to_stdio(recv, os::STDOUT_FD));
-    let end = loop {
-        tokio::select! {
-            status = &mut status_task => break completed_status(status),
-            Some(()) = escape_rx.recv() => {
-                conn.close(0u32.into(), b"~.");
-                break SessionEnd::Escape;
-            }
+    let end = tokio::select! {
+        status = &mut status_task => completed_status(status),
+        Some(()) = escape_rx.recv() => {
+            conn.close(0u32.into(), b"~.");
+            SessionEnd::Escape
         }
     };
     status_task.abort();
