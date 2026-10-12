@@ -963,6 +963,22 @@ fn unauthorized_key_cannot_authenticate_or_forward() {
     assert!(std::net::TcpStream::connect(("127.0.0.1", remote_port)).is_err());
 }
 
+#[test]
+fn zero_connection_limit_refuses_before_handshake() {
+    let mut env = TestEnv::new();
+    env.start_server_with(&["--max-connections", "0"]);
+    let out = env
+        .hush()
+        .arg("-T")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/true")
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "{out:?}");
+}
+
 /// A protocol-level client whose certificate claims a user its key is not
 /// authorized for, racing a remote forward request against the rejection. The
 /// server must close the connection without serving any stream, even though

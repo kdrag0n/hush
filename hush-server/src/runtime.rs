@@ -151,11 +151,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     Ok(permit) => permit,
                     Err(_) => {
                         tracing::warn!("rejecting connection because max_connections is reached");
-                        tokio::spawn(async move {
-                            if let Ok(conn) = connecting.await {
-                                conn.close(0u32.into(), b"server connection limit reached");
-                            }
-                        });
+                        connecting.refuse();
                         continue;
                     }
                 };
