@@ -4,7 +4,7 @@ use crate::{
     net::{copy_quic_to_writer, copy_reader_to_quic},
     os::{
         AsyncPty, configure_child_pre_exec, dup_fd, open_pty, process_exit_from_status,
-        send_process_group_signal, set_nonblocking, shell_for_user, tty_name,
+        send_process_group_signal, set_nonblocking, shell_for_user, spawn_lock, tty_name,
     },
     priority::{StreamPriority, set_stream_priority},
     protocol::{
@@ -22,7 +22,7 @@ use std::{
     process::Stdio,
     sync::Arc,
 };
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::Semaphore;
 
 struct ConnectionEnv {
@@ -242,12 +242,16 @@ async fn run_pipes(
     set_env: &[EnvVar],
     connection_env: &ConnectionEnv,
 ) -> Result<ProcessExit> {
-    let env = session_env(env, set_env, connection_env, None);
+    let privileged_switch = crate::os::is_root() && user != auth::current_username();
+    let env = session_env(env, set_env, connection_env, None, privileged_switch);
     let mut cmd = command_for_user(user, command, false, use_shell, &env)?;
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().context("spawn remote command")?;
+    let mut child = {
+        let _spawn_guard = spawn_lock();
+        cmd.spawn().context("spawn remote command")?
+    };
     let child_pid = child.id().context("child pid missing")? as i32;
     let stdin = child.stdin.take().context("child stdin missing")?;
     let stdout = child.stdout.take().context("child stdout missing")?;
@@ -256,12 +260,7 @@ async fn run_pipes(
     let in_task = tokio::spawn(copy_quic_to_writer(recv, stdin));
     let out_task = tokio::spawn(copy_reader_to_quic(stdout, send));
     let err_task = tokio::spawn(copy_reader_to_quic(stderr, err_send));
-    let status = loop {
-        tokio::select! {
-            status = child.wait() => break status.context("wait for remote command")?,
-            Some(signal) = signal_rx.recv() => send_process_group_signal(child_pid, signal)?,
-        }
-    };
+    let status = wait_for_child(&mut child, child_pid, &mut signal_rx).await?;
     // The client's stdin may never reach EOF (e.g. an idle terminal), and the
     // child can no longer read it anyway.
     in_task.abort();
@@ -285,10 +284,18 @@ async fn run_pty(
     set_env: &[EnvVar],
     connection_env: &ConnectionEnv,
 ) -> Result<ProcessExit> {
+    let _spawn_guard = spawn_lock();
     let argv = pty_argv(user, command, use_shell)?;
     let pty = open_pty(&size)?;
     let ssh_tty = tty_name(pty.slave.as_raw_fd());
-    let env = session_env(env, set_env, connection_env, ssh_tty.as_deref());
+    let privileged_switch = crate::os::is_root() && user != auth::current_username();
+    let env = session_env(
+        env,
+        set_env,
+        connection_env,
+        ssh_tty.as_deref(),
+        privileged_switch,
+    );
     set_nonblocking(pty.master.as_raw_fd())?;
     let pty_master = AsyncPty::new(pty.master)?;
     let mut cmd = command_from_argv(&argv)?;
@@ -300,8 +307,9 @@ async fn run_pty(
     cmd.stdin(unsafe { Stdio::from_raw_fd(stdin_fd) })
         .stdout(unsafe { Stdio::from_raw_fd(stdout_fd) })
         .stderr(unsafe { Stdio::from_raw_fd(stderr_fd) });
-    configure_child_pre_exec(&mut cmd, true, Some(term.to_owned()));
+    configure_child_pre_exec(&mut cmd, true);
     let mut child = cmd.spawn().context("spawn remote pty command")?;
+    drop(_spawn_guard);
     let child_pid = child.id().context("child pid missing")? as i32;
     let resize_pty = pty_master.clone();
     let resize_task = tokio::spawn(async move {
@@ -313,12 +321,7 @@ async fn run_pty(
     });
     let in_task = tokio::spawn(copy_quic_to_pty(recv, pty_master.clone()));
     let out_task = tokio::spawn(copy_pty_to_quic(pty_master, send));
-    let status = loop {
-        tokio::select! {
-            status = child.wait() => break status.context("wait for remote pty command")?,
-            Some(signal) = signal_rx.recv() => send_process_group_signal(child_pid, signal)?,
-        }
-    };
+    let status = wait_for_child(&mut child, child_pid, &mut signal_rx).await?;
     // Command retains the parent's slave handles for subsequent spawns. Close
     // them before draining output so the master can reach EOF. Keep them until
     // child exit because login may close and reopen the slave during startup.
@@ -366,7 +369,7 @@ fn command_for_user(
 ) -> Result<Command> {
     let root_switch = crate::os::is_root() && user != auth::current_username();
     if root_switch {
-        let mut cmd = Command::new("su");
+        let mut cmd = Command::new(trusted_system_program("su"));
         cmd.arg("-l").arg(user);
         if !command.is_empty() {
             if use_shell {
@@ -376,7 +379,7 @@ fn command_for_user(
             }
         }
         apply_session_env(&mut cmd, env);
-        configure_child_pre_exec(&mut cmd, false, None);
+        configure_child_pre_exec(&mut cmd, false);
         return Ok(cmd);
     }
 
@@ -384,7 +387,7 @@ fn command_for_user(
         let mut cmd = Command::new(&command[0]);
         cmd.args(&command[1..]);
         apply_session_env(&mut cmd, env);
-        configure_child_pre_exec(&mut cmd, false, None);
+        configure_child_pre_exec(&mut cmd, false);
         return Ok(cmd);
     }
 
@@ -406,7 +409,7 @@ fn command_for_user(
         cmd.arg("-lc").arg(shell_words::join(command));
     }
     apply_session_env(&mut cmd, env);
-    configure_child_pre_exec(&mut cmd, false, None);
+    configure_child_pre_exec(&mut cmd, false);
     Ok(cmd)
 }
 
@@ -423,6 +426,7 @@ fn session_env(
     set_env: &[EnvVar],
     connection_env: &ConnectionEnv,
     ssh_tty: Option<&str>,
+    privileged_switch: bool,
 ) -> Vec<EnvVar> {
     let mut env = Vec::new();
     for var in client_env {
@@ -431,7 +435,7 @@ fn session_env(
         }
     }
     for var in set_env {
-        if valid_env_key(&var.key) {
+        if valid_env_key(&var.key) && (!privileged_switch || allowed_env_key(&var.key)) {
             push_or_replace_env(&mut env, var.clone());
         }
     }
@@ -499,7 +503,9 @@ fn pty_argv_strings(
         #[cfg(target_os = "macos")]
         {
             return Ok(vec![
-                "login".to_string(),
+                trusted_system_program("login")
+                    .to_string_lossy()
+                    .into_owned(),
                 "-fp".to_string(),
                 user.to_string(),
             ]);
@@ -507,7 +513,9 @@ fn pty_argv_strings(
         #[cfg(target_os = "linux")]
         {
             return Ok(vec![
-                "login".to_string(),
+                trusted_system_program("login")
+                    .to_string_lossy()
+                    .into_owned(),
                 "-p".to_string(),
                 "-f".to_string(),
                 user.to_string(),
@@ -521,7 +529,7 @@ fn pty_argv_strings(
 
     if root_switch {
         return Ok(vec![
-            "su".to_string(),
+            trusted_system_program("su").to_string_lossy().into_owned(),
             "-l".to_string(),
             user.to_string(),
             "-c".to_string(),
@@ -544,6 +552,46 @@ fn pty_argv_strings(
     }
 }
 
+fn trusted_system_program(name: &str) -> PathBuf {
+    for dir in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        let candidate = PathBuf::from(dir).join(name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from("/usr/bin").join(name)
+}
+
+async fn wait_for_child(
+    child: &mut Child,
+    child_pid: i32,
+    signal_rx: &mut tokio::sync::mpsc::Receiver<RemoteSignal>,
+) -> Result<std::process::ExitStatus> {
+    loop {
+        tokio::select! {
+            status = child.wait() => return status.context("wait for remote command"),
+            signal = signal_rx.recv() => match signal {
+                Some(signal) => send_process_group_signal(child_pid, signal)?,
+                None => return terminate_child_group(child, child_pid).await,
+            },
+        }
+    }
+}
+
+async fn terminate_child_group(
+    child: &mut Child,
+    child_pid: i32,
+) -> Result<std::process::ExitStatus> {
+    let _ = send_process_group_signal(child_pid, RemoteSignal::SIGHUP);
+    match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
+        Ok(status) => status.context("wait for disconnected remote command"),
+        Err(_) => {
+            let _ = send_process_group_signal(child_pid, RemoteSignal::SIGKILL);
+            child.wait().await.context("reap remote command")
+        }
+    }
+}
+
 fn exec_argv_command(command: &[String]) -> String {
     let mut script = String::from("exec");
     for arg in command {
@@ -562,9 +610,35 @@ mod tests {
         let argv = pty_argv_strings(true, "root", "root", &[], true).unwrap();
 
         #[cfg(target_os = "linux")]
-        assert_eq!(argv, ["login", "-p", "-f", "root"]);
+        assert_eq!(argv, ["/usr/bin/login", "-p", "-f", "root"]);
 
         #[cfg(target_os = "macos")]
-        assert_eq!(argv, ["login", "-fp", "root"]);
+        assert_eq!(argv, ["/usr/bin/login", "-fp", "root"]);
+    }
+
+    #[test]
+    fn privileged_switch_rejects_arbitrary_set_env() {
+        let env = session_env(
+            &[],
+            &[
+                EnvVar {
+                    key: "PATH".into(),
+                    value: "/tmp".into(),
+                },
+                EnvVar {
+                    key: "LANG".into(),
+                    value: "C".into(),
+                },
+            ],
+            &ConnectionEnv {
+                ssh_client: "client".into(),
+                ssh_connection: "connection".into(),
+                auth_sock: None,
+            },
+            None,
+            true,
+        );
+        assert!(!env.iter().any(|var| var.key == "PATH"));
+        assert!(env.iter().any(|var| var.key == "LANG" && var.value == "C"));
     }
 }

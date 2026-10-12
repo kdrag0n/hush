@@ -9,7 +9,7 @@ use std::{
     },
     path::PathBuf,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
     task::{Context as TaskContext, Poll},
 };
 use tokio::{
@@ -19,6 +19,14 @@ use tokio::{
 
 const DEFAULT_PASSWD_BUFFER_LEN: usize = 16 * 1024;
 const TTY_NAME_BUFFER_LEN: usize = 1024;
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Debug, Clone)]
+pub struct UserInfo {
+    pub uid: u32,
+    pub gid: u32,
+    pub home: PathBuf,
+}
 
 pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
@@ -54,7 +62,7 @@ fn current_username_from_passwd() -> Option<String> {
 }
 
 pub fn home_for_user(user: &str) -> Result<Option<PathBuf>> {
-    Ok(passwd_string_for_user(user, |pwd| pwd.pw_dir)?.map(PathBuf::from))
+    Ok(user_info_for_user(user)?.map(|info| info.home))
 }
 
 pub fn shell_for_user(user: &str) -> Option<String> {
@@ -64,32 +72,87 @@ pub fn shell_for_user(user: &str) -> Option<String> {
 }
 
 pub fn uid_gid_for_user(user: &str) -> Result<Option<(u32, u32)>> {
-    unsafe {
-        let c_user = CString::new(user).context("username contains NUL")?;
-        let pwd = libc::getpwnam(c_user.as_ptr());
-        if pwd.is_null() {
-            return Ok(None);
+    Ok(user_info_for_user(user)?.map(|info| (info.uid, info.gid)))
+}
+
+pub fn user_info_for_user(user: &str) -> Result<Option<UserInfo>> {
+    passwd_for_user(user, |pwd| {
+        let home = if pwd.pw_dir.is_null() {
+            PathBuf::from("/")
+        } else {
+            PathBuf::from(
+                unsafe { CStr::from_ptr(pwd.pw_dir) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+        UserInfo {
+            uid: pwd.pw_uid,
+            gid: pwd.pw_gid,
+            home,
         }
-        Ok(Some(((*pwd).pw_uid, (*pwd).pw_gid)))
-    }
+    })
 }
 
 fn passwd_string_for_user(
     user: &str,
     field: impl FnOnce(&libc::passwd) -> *mut libc::c_char,
 ) -> Result<Option<String>> {
-    unsafe {
-        let c_user = CString::new(user).context("username contains NUL")?;
-        let pwd = libc::getpwnam(c_user.as_ptr());
-        if pwd.is_null() {
-            return Ok(None);
-        }
-        let ptr = field(&*pwd);
+    passwd_for_user(user, |pwd| {
+        let ptr = field(pwd);
         if ptr.is_null() {
+            return None;
+        }
+        Some(
+            unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    })
+    .map(|value| value.flatten())
+}
+
+fn passwd_for_user<T>(user: &str, extract: impl FnOnce(&libc::passwd) -> T) -> Result<Option<T>> {
+    let c_user = CString::new(user).context("username contains NUL")?;
+    let size = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut buffer_len = if size > 0 {
+        size as usize
+    } else {
+        DEFAULT_PASSWD_BUFFER_LEN
+    };
+    loop {
+        let mut pwd = unsafe { std::mem::zeroed::<libc::passwd>() };
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0 as libc::c_char; buffer_len];
+        let rc = unsafe {
+            libc::getpwnam_r(
+                c_user.as_ptr(),
+                &mut pwd,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            buffer_len = buffer_len
+                .checked_mul(2)
+                .context("passwd lookup buffer is too large")?;
+            continue;
+        }
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc)).context("look up user");
+        }
+        if result.is_null() {
             return Ok(None);
         }
-        Ok(Some(CStr::from_ptr(ptr).to_string_lossy().into_owned()))
+        return Ok(Some(extract(&pwd)));
     }
+}
+
+/// Serialize descriptor creation through `exec` so descriptors returned
+/// without atomic CLOEXEC support cannot leak into another session's child.
+pub fn spawn_lock() -> MutexGuard<'static, ()> {
+    SPAWN_LOCK.lock().unwrap_or_else(|err| err.into_inner())
 }
 
 pub fn raise_nofile_soft_limit_to_hard() -> Result<()> {
@@ -367,16 +430,17 @@ fn set_winsize(fd: RawFd, size: &TermSize) -> Result<()> {
 }
 
 pub fn dup_fd(fd: RawFd) -> Result<RawFd> {
-    let dup = unsafe { libc::dup(fd) };
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if dup < 0 {
-        bail!("dup failed: {}", std::io::Error::last_os_error());
+        bail!(
+            "fcntl(F_DUPFD_CLOEXEC) failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
     Ok(dup)
 }
 
-pub fn configure_child_pre_exec(cmd: &mut Command, controlling_tty: bool, term: Option<String>) {
-    let term = term.map(|term| CString::new(term).expect("TERM contains NUL"));
-    let term_key = CString::new("TERM").expect("TERM key contains NUL");
+pub fn configure_child_pre_exec(cmd: &mut Command, controlling_tty: bool) {
     unsafe {
         cmd.pre_exec(move || {
             reset_child_signal_state()?;
@@ -385,11 +449,6 @@ pub fn configure_child_pre_exec(cmd: &mut Command, controlling_tty: bool, term: 
             }
             if controlling_tty && libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
-            }
-            if let Some(term) = &term {
-                if libc::setenv(term_key.as_ptr(), term.as_ptr(), 1) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
             }
             Ok(())
         });
