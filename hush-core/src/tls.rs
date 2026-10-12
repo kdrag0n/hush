@@ -2,7 +2,7 @@ use crate::{
     ALPN,
     auth::{self, IdentityKey},
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use quinn::{
     AckFrequencyConfig, ClientConfig, MtuDiscoveryConfig, ServerConfig, TransportConfig, VarInt,
 };
@@ -233,17 +233,35 @@ pub fn load_or_create_host_cert(
 ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
     let server_dir = crate::paths::server_dir(data_dir);
     ensure_private_dir(&server_dir)?;
+    // Certificate and key installation is a single logical transaction. Hold
+    // one lock across the read/generate/write sequence so concurrent server
+    // starts cannot persist halves from different keypairs.
+    let _lock = ExclusiveFileLock::acquire(&server_dir.join(".host-identity.lock"))?;
+    let uses_explicit_path = cert_path.is_some() || key_path.is_some();
     let cert_path = cert_path
         .map(Path::to_owned)
         .unwrap_or_else(|| server_dir.join("host_cert.der"));
     let key_path = key_path
         .map(Path::to_owned)
         .unwrap_or_else(|| server_dir.join("host_key.der"));
-    if cert_path.exists() && key_path.exists() {
-        return Ok((
-            CertificateDer::from(fs::read(cert_path)?),
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(fs::read(key_path)?)),
-        ));
+    if cert_path == key_path {
+        bail!("host certificate and key paths must be different");
+    }
+    let cert = read_private_file_if_present(&cert_path)?;
+    let key = read_private_file_if_present(&key_path)?;
+    if let (Some(cert), Some(key)) = (cert, key) {
+        let cert = CertificateDer::from(cert);
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key));
+        match make_server_config(cert.clone(), key.clone_key()) {
+            Ok(_) => return Ok((cert, key)),
+            Err(err) if uses_explicit_path => {
+                return Err(err).context("host certificate and key do not form a valid pair");
+            }
+            // A crash between the two atomic file replacements can leave the
+            // generated defaults mismatched. Repair them while holding the
+            // identity lock.
+            Err(_) => {}
+        }
     }
     let signing_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)?;
     let key_der = signing_key.serialize_der();
@@ -519,9 +537,6 @@ fn ensure_private_dir(path: &Path) -> Result<()> {
 }
 
 fn write_private_file_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        ensure_private_dir(parent)?;
-    }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
@@ -558,6 +573,24 @@ fn write_private_file_atomic(path: &Path, data: &[u8]) -> Result<()> {
         return result;
     }
     bail!("could not allocate a temporary file for {}", path.display())
+}
+
+fn read_private_file_if_present(path: &Path) -> Result<Option<Vec<u8>>> {
+    use std::io::Read;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path);
+    let mut file = match file {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
+    Ok(Some(data))
 }
 
 struct ExclusiveFileLock(fs::File);
@@ -821,6 +854,65 @@ mod tests {
             KnownHosts::load(&path).unwrap().entries["example.com:22022"],
             "SHA256:first"
         );
+    }
+
+    #[test]
+    fn concurrent_host_identity_creation_converges() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_owned();
+        let barrier = Arc::new(Barrier::new(8));
+        let threads = (0..8)
+            .map(|_| {
+                let data_dir = data_dir.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let (cert, key) = load_or_create_host_cert(&data_dir, None, None).unwrap();
+                    (cert.as_ref().to_vec(), key.secret_der().to_vec())
+                })
+            })
+            .collect::<Vec<_>>();
+        let identities = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(identities.iter().all(|identity| identity == &identities[0]));
+    }
+
+    #[test]
+    fn custom_host_identity_does_not_restrict_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let external = dir.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::set_permissions(&external, fs::Permissions::from_mode(0o755)).unwrap();
+
+        load_or_create_host_cert(
+            dir.path(),
+            Some(&external.join("host-cert.der")),
+            Some(&external.join("host-key.der")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::metadata(external).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn generated_host_identity_recovers_from_an_interrupted_pair_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old_cert, _) = load_or_create_host_cert(dir.path(), None, None).unwrap();
+        let key_path = crate::paths::server_dir(dir.path()).join("host_key.der");
+        fs::write(key_path, b"incomplete replacement").unwrap();
+
+        let (cert, key) = load_or_create_host_cert(dir.path(), None, None).unwrap();
+
+        assert_ne!(cert.as_ref(), old_cert.as_ref());
+        make_server_config(cert, key).unwrap();
     }
 
     fn temp_known_hosts_path(name: &str) -> PathBuf {
