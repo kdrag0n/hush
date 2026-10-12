@@ -81,20 +81,12 @@ static dispatch_data_t copy_datagram(nwudp_t *h, const void *data, size_t len) {
     return dispatch_data_create(copy, len, h->queue, DISPATCH_DATA_DESTRUCTOR_FREE);
 }
 
-static void restore_listener_slot(nwudp_t *h) {
-    if (!h->listener) return;
-    uint32_t available = nw_listener_get_new_connection_limit(h->listener);
-    if (available < NW_LISTENER_INFINITE_CONNECTION_LIMIT - 1)
-        nw_listener_set_new_connection_limit(h->listener, available + 1);
-}
-
 static void destroy_flow(nwudp_t *h, flow_t *f) {
     h->on_close(h->ctx, f->id);
     nw_connection_cancel(f->conn);
     for (int i = 0; i < f->npending; i++) dispatch_release(f->pending[i]);
     nw_release(f->conn);
     free(f);
-    restore_listener_slot(h);
 }
 
 static void close_flow(nwudp_t *h, uint64_t id) {
@@ -295,10 +287,6 @@ int nwudp_listen(nwudp_t *h, const char *host, uint16_t port,
     }
     nw_release(p);
     if (!h->listener) return -1;
-    uint32_t native_limit = max_unprotected_flows >= NW_LISTENER_INFINITE_CONNECTION_LIMIT
-                                ? NW_LISTENER_INFINITE_CONNECTION_LIMIT - 1
-                                : (uint32_t)max_unprotected_flows;
-    nw_listener_set_new_connection_limit(h->listener, native_limit);
     nw_listener_set_queue(h->listener, h->queue);
     nw_listener_set_new_connection_handler(h->listener, ^(nw_connection_t conn) {
         if (!reserve_unprotected_flow(h)) {
@@ -307,10 +295,7 @@ int nwudp_listen(nwudp_t *h, const char *host, uint16_t port,
         }
         flow_t *f = add_flow(h, conn);
         if (f) start_flow(h, f);
-        else {
-            nw_connection_cancel(conn);
-            restore_listener_slot(h);
-        }
+        else nw_connection_cancel(conn);
     });
     nw_listener_set_state_changed_handler(h->listener, ^(nw_listener_state_t state, nw_error_t err) {
         if (state == nw_listener_state_failed && err)
