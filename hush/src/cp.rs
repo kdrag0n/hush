@@ -1,7 +1,7 @@
-use crate::{cli::Target, connect, expect_ok, logging};
+use crate::{cli::Target, connect, expect_ok, host_trust, logging};
 use anyhow::{Context, Result, anyhow, bail};
 use hush_core::{
-    filecopy,
+    auth, filecopy,
     priority::{StreamPriority, set_stream_priority},
     protocol::{
         FileCopyCompression, FileCopyDirection, FileCopyEntry, FileCopyPlan, FileCopyRequest,
@@ -116,7 +116,8 @@ async fn upload(
         args.port,
         args.data_dir.clone(),
         args.identity_file.clone(),
-        args.insecure,
+        host_trust(args.insecure),
+        auth::Passphrase::Prompt,
         TransportProfile::Bulk,
     )
     .await?;
@@ -171,7 +172,8 @@ async fn download(
         args.port,
         args.data_dir.clone(),
         args.identity_file.clone(),
-        args.insecure,
+        host_trust(args.insecure),
+        auth::Passphrase::Prompt,
         TransportProfile::Bulk,
     )
     .await?;
@@ -226,7 +228,8 @@ async fn relay(
         args.port,
         args.data_dir.clone(),
         args.identity_file.clone(),
-        args.insecure,
+        host_trust(args.insecure),
+        auth::Passphrase::Prompt,
         TransportProfile::Bulk,
     )
     .await?;
@@ -235,7 +238,8 @@ async fn relay(
         args.port,
         args.data_dir.clone(),
         args.identity_file.clone(),
-        args.insecure,
+        host_trust(args.insecure),
+        auth::Passphrase::Prompt,
         TransportProfile::Bulk,
     )
     .await?;

@@ -65,6 +65,18 @@ pub enum TransportProfile {
     Bulk,
 }
 
+/// How the server's host certificate is checked against known_hosts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostTrust {
+    /// Trust a host on first use and remember it; reject a changed certificate.
+    Tofu,
+    /// Accept only hosts already in known_hosts, and never write it. For
+    /// non-interactive callers that must not pin a host as a side effect.
+    KnownOnly,
+    /// Skip verification entirely (`-k`).
+    Insecure,
+}
+
 #[derive(Debug, Clone)]
 struct KnownHosts {
     path: PathBuf,
@@ -94,8 +106,8 @@ impl KnownHosts {
         })
     }
 
-    fn check_or_insert(&mut self, host: &str, fingerprint: &str, insecure: bool) -> Result<()> {
-        if insecure {
+    fn check_or_insert(&mut self, host: &str, fingerprint: &str, trust: HostTrust) -> Result<()> {
+        if trust == HostTrust::Insecure {
             return Ok(());
         }
         match self.entries.get(host) {
@@ -105,6 +117,7 @@ impl KnownHosts {
                     "host certificate mismatch for {host}: known {old}, got {fingerprint}; use -k to bypass"
                 )
             }
+            None if trust == HostTrust::KnownOnly => bail!("unknown host {host}"),
             None => {
                 self.entries.insert(host.to_owned(), fingerprint.to_owned());
                 self.save()?;
@@ -136,7 +149,7 @@ pub fn make_client_config(
     host_key: String,
     identity: auth::LoadedIdentity,
     user: &str,
-    insecure: bool,
+    trust: HostTrust,
     profile: TransportProfile,
 ) -> Result<ClientConfig> {
     let provider = pq_provider();
@@ -144,7 +157,7 @@ pub fn make_client_config(
         provider: provider.clone(),
         known_hosts: Mutex::new(KnownHosts::load(data_dir.join("known_hosts"))?),
         host_key,
-        insecure,
+        trust,
     });
     let builder = RustlsClientConfig::builder_with_provider(provider.into())
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -518,7 +531,7 @@ struct TofuServerVerifier {
     provider: CryptoProvider,
     known_hosts: Mutex<KnownHosts>,
     host_key: String,
-    insecure: bool,
+    trust: HostTrust,
 }
 
 impl ServerCertVerifier for TofuServerVerifier {
@@ -534,7 +547,7 @@ impl ServerCertVerifier for TofuServerVerifier {
         self.known_hosts
             .lock()
             .map_err(|_| RustlsError::General("known_hosts lock poisoned".into()))?
-            .check_or_insert(&self.host_key, &fp, self.insecure)
+            .check_or_insert(&self.host_key, &fp, self.trust)
             .map_err(|e| RustlsError::General(e.to_string()))?;
         Ok(ServerCertVerified::assertion())
     }
@@ -645,12 +658,30 @@ mod tests {
 
         let mut known_hosts = KnownHosts::load(&path).unwrap();
         known_hosts
-            .check_or_insert("example.com:4433", "SHA256:abc123", false)
+            .check_or_insert("example.com:4433", "SHA256:abc123", HostTrust::Tofu)
             .unwrap();
 
         let data = fs::read_to_string(&path).unwrap();
         assert!(data.contains("[hosts]"));
         assert!(data.contains("\"example.com:4433\" = \"SHA256:abc123\""));
+    }
+
+    #[test]
+    fn known_hosts_known_only_rejects_new_hosts_without_saving() {
+        let path = temp_known_hosts_path("known-only");
+
+        let mut known_hosts = KnownHosts::load(&path).unwrap();
+        known_hosts
+            .check_or_insert("example.com:4433", "SHA256:abc123", HostTrust::KnownOnly)
+            .unwrap_err();
+        assert!(!path.exists());
+
+        known_hosts
+            .check_or_insert("example.com:4433", "SHA256:abc123", HostTrust::Tofu)
+            .unwrap();
+        known_hosts
+            .check_or_insert("example.com:4433", "SHA256:abc123", HostTrust::KnownOnly)
+            .unwrap();
     }
 
     #[test]
@@ -676,7 +707,7 @@ mod tests {
 
         let mut known_hosts = KnownHosts::load(&path).unwrap();
         known_hosts
-            .check_or_insert("example.com:4433", "SHA256:abc123", false)
+            .check_or_insert("example.com:4433", "SHA256:abc123", HostTrust::Tofu)
             .unwrap();
     }
 

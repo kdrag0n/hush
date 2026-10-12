@@ -71,16 +71,26 @@ impl AgentSocket {
 }
 
 pub fn load_identity() -> Result<LoadedIdentity> {
-    load_identity_with_options(None, &AgentSocket::Default)
+    load_identity_with_options(None, &AgentSocket::Default, Passphrase::Prompt)
 }
 
 pub fn load_identity_with_file(identity_file: Option<&Path>) -> Result<LoadedIdentity> {
-    load_identity_with_options(identity_file, &AgentSocket::Default)
+    load_identity_with_options(identity_file, &AgentSocket::Default, Passphrase::Prompt)
+}
+
+/// Whether loading an encrypted key file may ask for its passphrase on the
+/// terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Passphrase {
+    Prompt,
+    /// Fail instead, for callers that must never block on the terminal.
+    Refuse,
 }
 
 pub fn load_identity_with_options(
     identity_file: Option<&Path>,
     agent: &AgentSocket,
+    passphrase: Passphrase,
 ) -> Result<LoadedIdentity> {
     let socket = agent.resolve();
     if let Some(path) = identity_file {
@@ -89,7 +99,7 @@ pub fn load_identity_with_options(
         {
             return Ok(identity);
         }
-        return load_identity_from_file(path);
+        return load_identity_from_file_with(path, passphrase);
     }
     if let Some(socket) = &socket
         && let Some(identity) = load_identity_from_agent(socket)?
@@ -102,7 +112,7 @@ pub fn load_identity_with_options(
         .map(|name| ssh_dir.join(name))
         .find(|path| path.exists())
         .unwrap_or_else(|| ssh_dir.join(DEFAULT_IDENTITY_FILES[0]));
-    load_identity_from_file(&path)
+    load_identity_from_file_with(&path, passphrase)
 }
 
 fn load_identity_from_agent(socket: &Path) -> Result<Option<LoadedIdentity>> {
@@ -207,12 +217,19 @@ fn load_identity_from_agent_matching(
 }
 
 pub fn load_identity_from_file(path: &Path) -> Result<LoadedIdentity> {
+    load_identity_from_file_with(path, Passphrase::Prompt)
+}
+
+fn load_identity_from_file_with(path: &Path, passphrase: Passphrase) -> Result<LoadedIdentity> {
     let pem =
         fs::read(path).with_context(|| format!("read OpenSSH private key {}", path.display()))?;
     match PrivateKey::from_openssh(&pem) {
         Ok(key) => {
             if !key.is_encrypted() {
                 return identity_from_private_key(&key);
+            }
+            if passphrase == Passphrase::Refuse {
+                bail!("private key {} is encrypted", path.display());
             }
             let pass =
                 rpassword::prompt_password(format!("Enter passphrase for {}: ", path.display()))?;

@@ -938,7 +938,7 @@ async fn server_rejects_certificate_claiming_wrong_user() {
         hush_core::tls::host_key("127.0.0.1", env.port),
         identity,
         "hush-wrong-user",
-        true,
+        hush_core::tls::HostTrust::Insecure,
         hush_core::tls::TransportProfile::Interactive,
     )
     .unwrap();
