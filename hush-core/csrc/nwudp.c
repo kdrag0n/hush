@@ -121,6 +121,32 @@ static void reap_flows(nwudp_t *h) {
     }
 }
 
+static bool reserve_unprotected_flow(nwudp_t *h) {
+    for (;;) {
+        uint64_t victim = 0;
+        uint64_t oldest = UINT64_MAX;
+        size_t unprotected = 0;
+        pthread_mutex_lock(&h->lock);
+        for (size_t i = 0; i < h->nflows; i++) {
+            flow_t *f = h->flows[i];
+            if (f->protected) continue;
+            unprotected++;
+            if (f->last_activity < oldest) {
+                oldest = f->last_activity;
+                victim = f->id;
+            }
+        }
+        if (unprotected < h->max_unprotected_flows) {
+            pthread_mutex_unlock(&h->lock);
+            return true;
+        }
+        flow_t *f = victim ? take_flow(h, victim) : NULL;
+        pthread_mutex_unlock(&h->lock);
+        if (!f) return false;
+        destroy_flow(h, f);
+    }
+}
+
 static void recv_loop(nwudp_t *h, uint64_t id, nw_connection_t conn);
 
 static void flow_ready(nwudp_t *h, uint64_t id) {
@@ -199,14 +225,23 @@ static void recv_loop(nwudp_t *h, uint64_t id, nw_connection_t conn) {
 
 static flow_t *add_flow(nwudp_t *h, nw_connection_t conn) {
     flow_t *f = calloc(1, sizeof(*f));
+    if (!f) return NULL;
     nw_retain(conn);
     f->conn = conn;
     f->last_activity = monotonic_ns();
     pthread_mutex_lock(&h->lock);
     f->id = ++h->next_id;
     if (h->nflows == h->cap) {
-        h->cap = h->cap ? h->cap * 2 : 8;
-        h->flows = realloc(h->flows, h->cap * sizeof(*h->flows));
+        size_t cap = h->cap ? h->cap * 2 : 8;
+        flow_t **flows = realloc(h->flows, cap * sizeof(*h->flows));
+        if (!flows) {
+            pthread_mutex_unlock(&h->lock);
+            nw_release(conn);
+            free(f);
+            return NULL;
+        }
+        h->cap = cap;
+        h->flows = flows;
     }
     h->flows[h->nflows++] = f;
     pthread_mutex_unlock(&h->lock);
@@ -254,7 +289,13 @@ int nwudp_listen(nwudp_t *h, const char *host, uint16_t port,
     if (!h->listener) return -1;
     nw_listener_set_queue(h->listener, h->queue);
     nw_listener_set_new_connection_handler(h->listener, ^(nw_connection_t conn) {
-        start_flow(h, add_flow(h, conn));
+        if (!reserve_unprotected_flow(h)) {
+            nw_connection_cancel(conn);
+            return;
+        }
+        flow_t *f = add_flow(h, conn);
+        if (f) start_flow(h, f);
+        else nw_connection_cancel(conn);
     });
     nw_listener_set_state_changed_handler(h->listener, ^(nw_listener_state_t state, nw_error_t err) {
         if (state == nw_listener_state_failed && err)
@@ -274,6 +315,7 @@ uint64_t nwudp_connect(nwudp_t *h, const char *host, uint16_t port) {
     nw_release(ep);
     flow_t *f = add_flow(h, conn);
     nw_release(conn);
+    if (!f) return 0;
     start_flow(h, f);
     return f->id;
 }
