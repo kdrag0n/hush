@@ -66,6 +66,8 @@ impl TestEnv {
             .arg(&self.data)
             .arg("--authorized-keys")
             .arg(&self.authorized_keys)
+            .arg("--allow-user")
+            .arg(hush_core::auth::current_username())
             .arg("-l")
             .arg(format!("127.0.0.1:{}", self.port))
             .args(extra_args)
@@ -84,8 +86,9 @@ impl TestEnv {
         fs::write(
             server_dir.join("config.toml"),
             format!(
-                "listen = \"127.0.0.1:{}\"\nauthorized_keys_path = {authorized_keys:?}\n",
-                self.port
+                "listen = \"127.0.0.1:{}\"\nauthorized_keys_path = {authorized_keys:?}\nallow_users = [{:?}]\n",
+                self.port,
+                hush_core::auth::current_username()
             ),
         )
         .unwrap();

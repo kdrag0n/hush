@@ -25,6 +25,8 @@ listen = "[::]:22022"
 
 # authorized_keys file used for client public-key authorization.
 # If omitted, hush-server uses the target user's ~/.ssh/authorized_keys.
+# A root server using this override must also set allow_users below so the
+# shared file cannot authorize arbitrary claimed local usernames.
 # authorized_keys_path = "/home/alice/.ssh/authorized_keys"
 
 # Restrict logins to these users. Leave empty or omit to allow any local user

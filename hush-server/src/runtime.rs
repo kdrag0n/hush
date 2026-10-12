@@ -69,6 +69,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             .or(file_cfg.max_forward_streams_per_connection)
             .unwrap_or(config::DEFAULT_MAX_FORWARD_STREAMS_PER_CONNECTION),
     };
+    runtime_config.validate(hush_core::os::is_root())?;
 
     let (host_cert_der, host_key_der) = hush_core::tls::load_or_create_host_cert(
         &data_dir,

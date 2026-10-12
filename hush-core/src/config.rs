@@ -61,6 +61,17 @@ impl Default for ServerRuntimeConfig {
     }
 }
 
+impl ServerRuntimeConfig {
+    pub fn validate(&self, running_as_root: bool) -> Result<()> {
+        if running_as_root && self.authorized_keys_path.is_some() && self.allow_users.is_empty() {
+            anyhow::bail!(
+                "a root server using authorized_keys_path must set allow_users (or --allow-user)"
+            );
+        }
+        Ok(())
+    }
+}
+
 pub fn read_server_config(path: &Path) -> Result<Option<ServerConfigFile>> {
     if !path.exists() {
         return Ok(None);
@@ -500,6 +511,20 @@ mod tests {
             fs::read_to_string(path).unwrap(),
             "listen = \"127.0.0.1:22022\"\n"
         );
+    }
+
+    #[test]
+    fn root_authorized_keys_override_requires_an_explicit_user_scope() {
+        let mut cfg = super::ServerRuntimeConfig {
+            authorized_keys_path: Some("/tmp/authorized_keys".into()),
+            ..Default::default()
+        };
+
+        assert!(cfg.validate(true).is_err());
+        cfg.allow_users.push("deploy".to_owned());
+        cfg.validate(true).unwrap();
+        cfg.allow_users.clear();
+        cfg.validate(false).unwrap();
     }
 
     #[test]

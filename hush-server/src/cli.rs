@@ -34,7 +34,8 @@ pub(crate) struct Args {
     #[usage(long, value_name = "PATH", help_heading = "Configuration")]
     pub(crate) host_key: Option<PathBuf>,
 
-    /// authorized_keys file to use instead of the target user's default.
+    /// authorized_keys file to use instead of the target user's default. A
+    /// root server must also set one or more --allow-user values.
     #[usage(long, value_name = "PATH", help_heading = "Configuration")]
     pub(crate) authorized_keys: Option<PathBuf>,
 
