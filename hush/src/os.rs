@@ -1,78 +1,10 @@
 use anyhow::{Result, bail};
 use hush_core::protocol::{RemoteSignal, TermSize};
-use std::{
-    io::IsTerminal,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-    sync::Arc,
-};
-use tokio::io::unix::AsyncFd;
+use std::{io::IsTerminal, os::fd::RawFd};
 
 pub(crate) const STDIN_FD: RawFd = libc::STDIN_FILENO;
 pub(crate) const STDOUT_FD: RawFd = libc::STDOUT_FILENO;
 pub(crate) const STDERR_FD: RawFd = libc::STDERR_FILENO;
-
-#[derive(Clone)]
-pub(crate) struct AsyncStdioFd {
-    fd: Arc<AsyncFd<OwnedFd>>,
-}
-
-impl AsyncStdioFd {
-    pub(crate) fn duplicate(fd: RawFd) -> Result<Self> {
-        let dup = hush_core::os::dup_fd(fd)?;
-        // Take ownership before any fallible setup so an error cannot leak the
-        // duplicate. dup_fd uses F_DUPFD_CLOEXEC, avoiding the fork/exec race
-        // of setting FD_CLOEXEC in a second operation.
-        let dup = unsafe { OwnedFd::from_raw_fd(dup) };
-        set_nonblocking(dup.as_raw_fd())?;
-        Ok(Self {
-            fd: Arc::new(AsyncFd::new(dup)?),
-        })
-    }
-
-    pub(crate) async fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        loop {
-            let mut guard = self.fd.readable().await?;
-            match guard.try_io(|inner| read_fd(inner.get_ref().as_raw_fd(), buf)) {
-                Ok(Ok(n)) => return Ok(n),
-                Ok(Err(err)) => return Err(err.into()),
-                Err(_) => continue,
-            }
-        }
-    }
-
-    pub(crate) async fn write_all(&self, mut buf: &[u8]) -> Result<()> {
-        while !buf.is_empty() {
-            let mut guard = self.fd.writable().await?;
-            match guard.try_io(|inner| write_fd(inner.get_ref().as_raw_fd(), buf)) {
-                Ok(Ok(0)) => return Ok(()),
-                Ok(Ok(n)) => buf = &buf[n..],
-                Ok(Err(err)) => return Err(err.into()),
-                Err(_) => continue,
-            }
-        }
-        Ok(())
-    }
-}
-
-fn set_nonblocking(fd: RawFd) -> Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        bail!("fcntl(F_GETFL) failed: {}", std::io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        bail!("fcntl(F_SETFL) failed: {}", std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
-    let rc = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-    if rc >= 0 {
-        Ok(rc as usize)
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
 
 fn write_fd(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
     let rc = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };

@@ -386,6 +386,50 @@ fn stateless_reset_after_server_restart_closes_client() {
 }
 
 #[test]
+fn terminal_stdin_does_not_block_exit_after_server_shutdown() {
+    let mut env = TestEnv::new();
+    env.start_server();
+    // `script` gives hush a real terminal while this test retains the input
+    // pipe, reproducing an idle interactive stdin read.
+    let mut client = Command::new("/usr/bin/script")
+        .arg("-q")
+        .arg("/dev/null")
+        .arg(hush_bin())
+        .arg("--data-dir")
+        .arg(env.home.join(".hush"))
+        .arg("-p")
+        .arg(env.port.to_string())
+        .arg("-T")
+        .arg("-S")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sleep")
+        .arg("60")
+        .env("HOME", &env.home)
+        .env_remove("SSH_AUTH_SOCK")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_secs(1));
+
+    let server = env.server.as_mut().unwrap();
+    unsafe {
+        libc::kill(server.id() as i32, libc::SIGINT);
+    }
+    server.wait().unwrap();
+    env.server = None;
+
+    let status = wait_for_child_exit(&mut client, Duration::from_secs(5)).unwrap_or_else(|| {
+        let _ = client.kill();
+        let _ = client.wait();
+        panic!("terminal-backed client did not exit after server shutdown");
+    });
+    assert!(!status.success(), "{status:?}");
+}
+
+#[test]
 fn no_shell_preserves_argv() {
     let mut env = TestEnv::new();
     env.start_server();

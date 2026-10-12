@@ -5,6 +5,7 @@ use hush_core::protocol::{
     EnvVar, OpenSession, ProcessExit, RemoteSignal, SessionMode, StreamOpen, StreamResponse,
     read_frame, write_frame,
 };
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const STDIO_BUFFER_LEN: usize = 8192;
 
@@ -35,7 +36,7 @@ pub(crate) async fn run_pty(conn: quinn::Connection, session: OpenSession) -> Re
     let out_task = tokio::spawn(quic_to_stdio(recv, os::STDOUT_FD));
     let end = loop {
         tokio::select! {
-            status = &mut status_task => break SessionEnd::Remote(status??),
+            status = &mut status_task => break completed_status(status),
             Some(()) = escape_rx.recv() => {
                 conn.close(0u32.into(), b"~.");
                 break SessionEnd::Escape;
@@ -90,7 +91,7 @@ pub(crate) async fn run_pipes(conn: quinn::Connection, session: OpenSession) -> 
     });
     let end = loop {
         tokio::select! {
-            status = &mut status_task => break SessionEnd::Remote(status??),
+            status = &mut status_task => break completed_status(status),
             Some(()) = escape_rx.recv() => {
                 conn.close(0u32.into(), b"~.");
                 break SessionEnd::Escape;
@@ -159,10 +160,21 @@ enum StdinPumpExit {
     Escape,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 enum SessionEnd {
     Remote(ProcessExit),
     Escape,
+    Error(anyhow::Error),
+}
+
+fn completed_status(
+    status: std::result::Result<Result<ProcessExit>, tokio::task::JoinError>,
+) -> SessionEnd {
+    match status {
+        Ok(Ok(status)) => SessionEnd::Remote(status),
+        Ok(Err(err)) => SessionEnd::Error(err),
+        Err(err) => SessionEnd::Error(err.into()),
+    }
 }
 
 fn spawn_stdin_pump(
@@ -183,12 +195,15 @@ fn spawn_stdin_pump(
 
 async fn stdio_to_quic(mut send: quinn::SendStream) -> Result<StdinPumpExit> {
     let enable_escape = os::stdin_is_terminal();
-    let fd = os::AsyncStdioFd::duplicate(os::STDIN_FD)?;
+    // Tokio's stdio handles use blocking-pool workers. This avoids setting
+    // O_NONBLOCK on the inherited descriptor: duplicated descriptors share
+    // that status flag with the invoking shell.
+    let mut stdin = tokio::io::stdin();
     let mut escape = EscapeFilter::new(enable_escape);
     let mut buf = vec![0u8; STDIO_BUFFER_LEN];
     let mut out = Vec::with_capacity(buf.len());
     loop {
-        match fd.read(&mut buf).await {
+        match stdin.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
                 out.clear();
@@ -199,7 +214,7 @@ async fn stdio_to_quic(mut send: quinn::SendStream) -> Result<StdinPumpExit> {
                     send.write_all(&out).await?;
                 }
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         }
     }
     out.clear();
@@ -403,14 +418,25 @@ fn classify_kitty_key(params: &[u8]) -> Option<EscapeKey> {
 }
 
 async fn quic_to_stdio(mut recv: quinn::RecvStream, fd: i32) -> Result<()> {
-    let fd = os::AsyncStdioFd::duplicate(fd)?;
+    match fd {
+        os::STDOUT_FD => quic_to_writer(&mut recv, tokio::io::stdout()).await,
+        os::STDERR_FD => quic_to_writer(&mut recv, tokio::io::stderr()).await,
+        _ => bail!("unsupported output descriptor {fd}"),
+    }
+}
+
+async fn quic_to_writer<W>(recv: &mut quinn::RecvStream, mut writer: W) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut buf = vec![0u8; STDIO_BUFFER_LEN];
     loop {
         let n = recv.read(&mut buf).await?.unwrap_or(0);
         if n == 0 {
+            writer.flush().await?;
             return Ok(());
         }
-        fd.write_all(&buf[..n]).await?;
+        writer.write_all(&buf[..n]).await?;
     }
 }
 
@@ -438,6 +464,13 @@ fn finish_session(end: SessionEnd) -> ! {
         SessionEnd::Remote(ProcessExit::Code(code)) => std::process::exit(code),
         SessionEnd::Remote(ProcessExit::Signal(signal)) => os::self_terminate_with_signal(signal),
         SessionEnd::Escape => std::process::exit(255),
+        SessionEnd::Error(err) => {
+            eprintln!("hush: {err:#}");
+            // Tokio's terminal stdin reader uses a blocking worker that cannot
+            // be cancelled while no input is available. Exit directly after
+            // cleanup instead of waiting forever for runtime teardown.
+            std::process::exit(255)
+        }
     }
 }
 
