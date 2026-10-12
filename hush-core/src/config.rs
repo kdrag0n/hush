@@ -5,6 +5,7 @@ use std::{
     fs,
     io::{ErrorKind, Write},
     net::SocketAddr,
+    os::unix::fs::OpenOptionsExt,
     path::Path,
 };
 
@@ -79,10 +80,11 @@ impl ServerRuntimeConfig {
 }
 
 pub fn read_server_config(path: &Path) -> Result<Option<ServerConfigFile>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let data = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let data = match fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
     let cfg = toml::from_str(&data).with_context(|| format!("parse {}", path.display()))?;
     Ok(Some(cfg))
 }
@@ -94,6 +96,8 @@ pub fn write_server_config_example_if_missing(path: &Path) -> Result<()> {
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)
     {
         Ok(mut file) => file
@@ -487,7 +491,7 @@ mod tests {
         write_server_config_example_if_missing,
     };
     use crate::protocol::EnvVar;
-    use std::fs;
+    use std::{fs, os::unix::fs::PermissionsExt};
 
     #[test]
     fn config_example_parses() {
@@ -502,7 +506,11 @@ mod tests {
 
         write_server_config_example_if_missing(&path).unwrap();
 
-        assert_eq!(fs::read_to_string(path).unwrap(), SERVER_CONFIG_EXAMPLE);
+        assert_eq!(fs::read_to_string(&path).unwrap(), SERVER_CONFIG_EXAMPLE);
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
