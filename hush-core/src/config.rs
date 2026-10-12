@@ -149,9 +149,7 @@ fn parse_ssh_config(alias: &str, data: &str) -> Result<SshHostConfig> {
         let key = parts.next().unwrap_or_default().to_ascii_lowercase();
         let value = parts.next().unwrap_or_default().trim();
         if key == "host" {
-            active = value
-                .split_whitespace()
-                .any(|pat| host_pattern_matches(pat, alias));
+            active = host_block_matches(value, alias);
             continue;
         }
         if !active {
@@ -418,20 +416,57 @@ fn expand_env(value: &str) -> String {
     out
 }
 
+fn host_block_matches(patterns: &str, host: &str) -> bool {
+    let mut positive_match = false;
+    for pattern in patterns.split_whitespace() {
+        let (negated, pattern) = match pattern.strip_prefix('!') {
+            Some(pattern) => (true, pattern),
+            None => (false, pattern),
+        };
+        if pattern.is_empty() || !host_pattern_matches(pattern, host) {
+            continue;
+        }
+        if negated {
+            return false;
+        }
+        positive_match = true;
+    }
+    positive_match
+}
+
 fn host_pattern_matches(pattern: &str, host: &str) -> bool {
-    if pattern == "*" {
-        return true;
+    let pattern = pattern.to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
+    let pattern = pattern.as_bytes();
+    let host = host.as_bytes();
+    let (mut p, mut h) = (0usize, 0usize);
+    let (mut star, mut after_star) = (None, 0usize);
+    while h < host.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == host[h]) {
+            p += 1;
+            h += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            after_star = h;
+        } else if let Some(star_index) = star {
+            p = star_index + 1;
+            after_star += 1;
+            h = after_star;
+        } else {
+            return false;
+        }
     }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return host.starts_with(prefix);
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
     }
-    pattern == host
+    p == pattern.len()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        SERVER_CONFIG_EXAMPLE, ServerConfigFile, SshForward, parse_ssh_forward,
+        SERVER_CONFIG_EXAMPLE, ServerConfigFile, SshForward, parse_ssh_config, parse_ssh_forward,
         write_server_config_example_if_missing,
     };
     use crate::protocol::EnvVar;
@@ -567,6 +602,61 @@ Host edge
                 target_port: 5432,
             }]
         );
+    }
+
+    #[test]
+    fn ssh_config_host_globs_match_any_position_case_insensitively() {
+        let cfg = parse_ssh_config(
+            "API.Staging.Example.COM",
+            r#"
+Host api.*.example.?om
+    User deploy
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.user.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn ssh_config_negated_host_pattern_excludes_a_broader_match() {
+        let prod = parse_ssh_config(
+            "prod.example.com",
+            r#"
+Host *.example.com !prod.example.com
+    User broad
+Host prod.example.com
+    User production
+"#,
+        )
+        .unwrap();
+        let staging = parse_ssh_config(
+            "staging.example.com",
+            r#"
+Host *.example.com !prod.example.com
+    User broad
+Host prod.example.com
+    User production
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(prod.user.as_deref(), Some("production"));
+        assert_eq!(staging.user.as_deref(), Some("broad"));
+    }
+
+    #[test]
+    fn ssh_config_negated_pattern_alone_never_activates_a_block() {
+        let cfg = parse_ssh_config(
+            "staging.example.com",
+            r#"
+Host !prod.example.com
+    User should-not-match
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.user, None);
     }
 
     #[test]
