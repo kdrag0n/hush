@@ -27,6 +27,7 @@ const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
 const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
 const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
 const MAX_AGENT_MESSAGE_SIZE: usize = 1 << 20;
+const MAX_AUTHORIZED_KEYS_SIZE: u64 = 16 << 20;
 
 /// Private-use OID of the certificate extension carrying the username the
 /// client wants to act as. Unregistered: these synthetic certificates are only
@@ -490,9 +491,22 @@ pub fn is_authorized(user: &str, key: &PublicKey, override_path: Option<&Path>) 
         Some(path) => path.to_owned(),
         None => authorized_keys_for_user(user)?,
     };
-    let Ok(data) = fs::read_to_string(&path) else {
-        return Ok(false);
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("open {}", path.display())),
     };
+    let mut data = String::new();
+    file.take(MAX_AUTHORIZED_KEYS_SIZE + 1)
+        .read_to_string(&mut data)
+        .with_context(|| format!("read {}", path.display()))?;
+    if data.len() as u64 > MAX_AUTHORIZED_KEYS_SIZE {
+        bail!(
+            "{} exceeds the {} byte authorized_keys limit",
+            path.display(),
+            MAX_AUTHORIZED_KEYS_SIZE
+        );
+    }
     let wanted = key.to_bytes().context("serialize peer public key")?;
     for line in data.lines() {
         let line = line.trim();
