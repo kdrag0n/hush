@@ -106,7 +106,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let (endpoint, sockets) = if use_nw {
         #[cfg(target_os = "macos")]
         {
-            let socket = Arc::new(hush_core::nwsock::NwSocket::listen(listen)?);
+            let socket = Arc::new(hush_core::nwsock::NwSocket::listen(
+                listen,
+                runtime_config.max_connections,
+            )?);
             let endpoint = Endpoint::new_with_abstract_socket(
                 endpoint_config,
                 Some(server_config),

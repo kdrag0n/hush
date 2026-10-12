@@ -39,7 +39,12 @@ unsafe extern "C" {
         on_recv: RecvCb,
         on_close: CloseCb,
     ) -> *mut Handle;
-    fn nwudp_listen(h: *mut Handle, host: *const libc::c_char, port: u16) -> i32;
+    fn nwudp_listen(
+        h: *mut Handle,
+        host: *const libc::c_char,
+        port: u16,
+        max_unprotected_flows: usize,
+    ) -> i32;
     fn nwudp_connect(h: *mut Handle, host: *const libc::c_char, port: u16) -> u64;
     fn nwudp_send(h: *mut Handle, flow: u64, data: *const u8, len: usize, seg: usize) -> i32;
     fn nwudp_close_flow(h: *mut Handle, flow: u64);
@@ -197,7 +202,7 @@ impl NwSocket {
     }
 
     /// Listen on `addr`; an unspecified address means every address.
-    pub fn listen(addr: SocketAddr) -> io::Result<Self> {
+    pub fn listen(addr: SocketAddr, max_unprotected_flows: usize) -> io::Result<Self> {
         let socket = Self::new(addr.is_ipv6(), addr);
         let host = (!addr.ip().is_unspecified())
             .then(|| CString::new(addr.ip().to_string()))
@@ -205,7 +210,15 @@ impl NwSocket {
             .map_err(io::Error::other)?;
         let host_ptr = host.as_ref().map_or(std::ptr::null(), |h| h.as_ptr());
         // SAFETY: valid handle; host is NULL or a C string alive for the call.
-        if unsafe { nwudp_listen(socket.inner.handle, host_ptr, addr.port()) } != 0 {
+        if unsafe {
+            nwudp_listen(
+                socket.inner.handle,
+                host_ptr,
+                addr.port(),
+                max_unprotected_flows,
+            )
+        } != 0
+        {
             return Err(io::Error::other("nw listener failed"));
         }
         Ok(socket)

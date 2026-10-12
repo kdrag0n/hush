@@ -39,6 +39,7 @@ typedef struct nwudp {
     pthread_mutex_t lock;
     flow_t **flows;
     size_t nflows, cap;
+    size_t max_unprotected_flows;
     uint64_t next_id;
     dispatch_source_t reaper;
 } nwudp_t;
@@ -111,7 +112,7 @@ static void reap_flows(nwudp_t *h) {
                 victim = f->id;
             }
         }
-        bool over_limit = unprotected > NWUDP_MAX_UNPROTECTED_FLOWS;
+        bool over_limit = unprotected > h->max_unprotected_flows;
         bool idle = victim != 0 && now - oldest >= NWUDP_UNPROTECTED_IDLE_NS;
         flow_t *f = (over_limit || idle) ? take_flow(h, victim) : NULL;
         pthread_mutex_unlock(&h->lock);
@@ -220,6 +221,7 @@ nwudp_t *nwudp_create(void *ctx, nwudp_flow_cb on_flow, nwudp_recv_cb on_recv,
     h->on_flow = on_flow;
     h->on_recv = on_recv;
     h->on_close = on_close;
+    h->max_unprotected_flows = NWUDP_MAX_UNPROTECTED_FLOWS;
     h->queue = dispatch_queue_create("hush.nwudp", DISPATCH_QUEUE_SERIAL);
     pthread_mutex_init(&h->lock, NULL);
     h->reaper = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, h->queue);
@@ -232,7 +234,9 @@ nwudp_t *nwudp_create(void *ctx, nwudp_flow_cb on_flow, nwudp_recv_cb on_recv,
 
 // Listen on `port`; `host` (may be NULL for all addresses) restricts the
 // local address, e.g. "127.0.0.1".
-int nwudp_listen(nwudp_t *h, const char *host, uint16_t port) {
+int nwudp_listen(nwudp_t *h, const char *host, uint16_t port,
+                 size_t max_unprotected_flows) {
+    h->max_unprotected_flows = max_unprotected_flows;
     char portstr[8];
     snprintf(portstr, sizeof portstr, "%u", port);
     nw_parameters_t p = udp_params();
