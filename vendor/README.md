@@ -5,7 +5,7 @@ in the workspace `Cargo.toml`. Each directory is the crates.io release named
 below plus the changes listed; the first commit adding each directory is the
 pristine upstream source, so `git log -- vendor/<crate>` shows the patches.
 
-## quinn-udp 0.5.14
+## quinn-udp 0.5.16
 
 - Connected sockets: sends omit the destination when the socket is connected
   (`UdpSocketState::connected`, `set_connected`). On macOS a connected
@@ -16,7 +16,7 @@ pristine upstream source, so `git log -- vendor/<crate>` shows the patches.
 - Receive ignores ICMP-derived errors (`ECONNREFUSED`, `EHOSTUNREACH`, ...)
   that connected sockets report, instead of failing the endpoint.
 
-## quinn 0.11.9
+## quinn 0.11.12
 
 - `Connection::set_congestion_controller`, `set_ack_frequency_config` and
   `set_remote_address` wrappers.
@@ -24,7 +24,7 @@ pristine upstream source, so `git log -- vendor/<crate>` shows the patches.
   than dropped or treated as a fatal error.
 - `UdpPollHelper` is public so custom `AsyncUdpSocket`s can reuse it.
 
-## quinn-proto 0.11.14
+## quinn-proto 0.11.19
 
 - `Connection::set_congestion_controller` replaces the path's controller at
   runtime, and paths created afterwards (by a migration) use the same

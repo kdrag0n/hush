@@ -21,7 +21,7 @@ use crate::{
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
-    config::{ServerConfig, TransportConfig},
+    config::{AckFrequencyConfig, ServerConfig, TransportConfig},
     crypto::{self, KeyPair, Keys, PacketKey},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
     packet::{
@@ -88,7 +88,7 @@ pub use streams::{
 };
 
 mod timer;
-use crate::congestion::Controller;
+use crate::congestion::{Controller, ControllerFactory};
 use timer::{Timer, TimerTable};
 
 /// Protocol state and logic for a single QUIC connection
@@ -133,6 +133,11 @@ use timer::{Timer, TimerTable};
 pub struct Connection {
     endpoint_config: Arc<EndpointConfig>,
     config: Arc<TransportConfig>,
+    /// Requested peer ACK behavior; starts as the config's and may be changed at runtime
+    ack_frequency_config: Option<AckFrequencyConfig>,
+    /// Builds the congestion controller for new paths; starts as the config's and may be
+    /// changed at runtime
+    congestion_controller_factory: Arc<dyn ControllerFactory + Send + Sync>,
     rng: StdRng,
     crypto: Box<dyn crypto::Session>,
     /// The CID we initially chose, for use during the handshake
@@ -342,6 +347,8 @@ impl Connection {
                 &TransportParameters::default(),
             )),
             next_bundled_ack_time: None,
+            ack_frequency_config: config.ack_frequency_config.clone(),
+            congestion_controller_factory: config.congestion_controller_factory.clone(),
 
             pto_count: 0,
 
@@ -507,7 +514,7 @@ impl Connection {
         };
 
         // Check whether we need to send an ACK_FREQUENCY frame
-        if let Some(config) = &self.config.ack_frequency_config {
+        if let Some(config) = &self.ack_frequency_config {
             self.spaces[SpaceId::Data].pending.ack_frequency = self
                 .ack_frequency
                 .should_send_ack_frequency(self.path.rtt.get(), config, &self.peer_params)
@@ -1453,6 +1460,43 @@ impl Connection {
     /// See [`TransportConfig::send_window()`]
     pub fn set_send_window(&mut self, send_window: u64) {
         self.streams.set_send_window(send_window);
+    }
+
+    /// Replace the congestion controller on the current path.
+    ///
+    /// The new controller starts from its initial state, as if the path were
+    /// new. Useful when a connection's purpose changes, e.g. from interactive
+    /// traffic to a bulk transfer that wants a different algorithm.
+    pub fn set_congestion_controller(
+        &mut self,
+        factory: Arc<dyn ControllerFactory + Send + Sync>,
+        now: Instant,
+    ) {
+        self.path.congestion = factory.clone().build(now, self.path.current_mtu());
+        // Paths created later, e.g. by a migration, must use it too
+        self.congestion_controller_factory = factory;
+    }
+
+    /// Change how often the peer is asked to acknowledge our packets.
+    ///
+    /// Takes effect by sending a new ACK_FREQUENCY frame when the peer supports
+    /// the extension; `None` stops sending such frames.
+    pub fn set_ack_frequency_config(&mut self, config: Option<AckFrequencyConfig>) {
+        self.ack_frequency_config = config;
+        if self.ack_frequency_config.is_some() {
+            self.ack_frequency.force_resend();
+        }
+    }
+
+    /// Redirect the current path to a different peer address.
+    ///
+    /// Clients normally discard packets from any address but the server's, so
+    /// this is for a peer that has agreed out of band to continue the
+    /// connection from `remote`, e.g. a server moving a connection to a
+    /// dedicated socket. The path keeps its state; the peer must not have
+    /// changed identity.
+    pub fn set_remote_address(&mut self, remote: SocketAddr) {
+        self.path.remote = remote;
     }
 
     /// See [`TransportConfig::receive_window()`]
@@ -3081,6 +3125,17 @@ impl Connection {
                 &self.config,
             )
         };
+        if !Arc::ptr_eq(
+            &self.congestion_controller_factory,
+            &self.config.congestion_controller_factory,
+        ) && !(remote.is_ipv4() && remote.ip() == self.path.remote.ip())
+        {
+            // `PathData::new` built a controller from the config; honor a runtime override
+            new_path.congestion = self
+                .congestion_controller_factory
+                .clone()
+                .build(now, new_path.current_mtu());
+        }
         new_path.challenge = Some(self.rng.random());
         new_path.challenge_pending = true;
         let prev_pto = self.pto(SpaceId::Data);
@@ -3208,7 +3263,7 @@ impl Connection {
             let sequence_number = self.ack_frequency.next_sequence_number();
 
             // Safe to unwrap because this is always provided when ACK frequency is enabled
-            let config = self.config.ack_frequency_config.as_ref().unwrap();
+            let config = self.ack_frequency_config.as_ref().unwrap();
 
             // Ensure the delay is within bounds to avoid a PROTOCOL_VIOLATION error
             let max_ack_delay = self.ack_frequency.candidate_max_ack_delay(
