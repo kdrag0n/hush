@@ -1,6 +1,10 @@
 use anyhow::{Result, bail};
 use hush_core::protocol::{RemoteSignal, TermSize};
-use std::{io::IsTerminal, os::fd::RawFd};
+use std::{
+    io::IsTerminal,
+    os::fd::RawFd,
+    sync::atomic::{AtomicU8, Ordering},
+};
 
 pub(crate) const STDIN_FD: RawFd = libc::STDIN_FILENO;
 pub(crate) const STDOUT_FD: RawFd = libc::STDOUT_FILENO;
@@ -27,7 +31,7 @@ fn write_all_fd(fd: RawFd, mut buf: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-const TERMINAL_CLEANUP_SEQUENCES: &[u8] = concat!(
+const TERMINAL_CLEANUP_BEFORE_ALT_SCREEN: &str = concat!(
     "\x1b[<u",  // pop one kitty keyboard protocol stack entry
     "\x1b[=0u", // force kitty keyboard protocol flags to the default
     "\x1b[?9;1000;1001;1002;1003;1005;1006;1015;1016l", // mouse reporting/encodings
@@ -40,20 +44,60 @@ const TERMINAL_CLEANUP_SEQUENCES: &[u8] = concat!(
     "\x1b[?7h", // autowrap
     "\x1b[?12l", // blinking cursor
     "\x1b[?25h", // visible cursor
-    "\x1b[?47;1047;1048;1049l", // alternate screen and saved cursor variants
-    "\x1b[?66l", // application keypad
-    "\x1b[0 q", // default cursor style
-    "\x1b[0m",  // default graphics rendition
-)
-.as_bytes();
+);
 
-fn terminal_cleanup_sequences() -> &'static [u8] {
-    TERMINAL_CLEANUP_SEQUENCES
+const TERMINAL_CLEANUP_AFTER_ALT_SCREEN: &str = concat!(
+    "\x1b[?66l", // application keypad
+    "\x1b[0 q",  // default cursor style
+    "\x1b[0m",   // default graphics rendition
+);
+
+/// Alternate screen the remote side left active, as seen in its output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum AltScreen {
+    Off,
+    /// Entered with mode 47 or 1047, which don't save the cursor.
+    Plain,
+    /// Entered with mode 1049, which saves the cursor to restore on exit.
+    SaveCursor,
+}
+
+static REMOTE_ALT_SCREEN: AtomicU8 = AtomicU8::new(AltScreen::Off as u8);
+
+pub(crate) fn set_remote_alt_screen(alt: AltScreen) {
+    REMOTE_ALT_SCREEN.store(alt as u8, Ordering::Relaxed);
+}
+
+fn remote_alt_screen() -> AltScreen {
+    match REMOTE_ALT_SCREEN.load(Ordering::Relaxed) {
+        x if x == AltScreen::Plain as u8 => AltScreen::Plain,
+        x if x == AltScreen::SaveCursor as u8 => AltScreen::SaveCursor,
+        _ => AltScreen::Off,
+    }
+}
+
+/// Only leaves the alternate screen when the remote side entered it: exiting
+/// it (or restoring the cursor) otherwise jumps to a stale saved cursor, and
+/// the next shell prompt clears everything below it.
+fn terminal_cleanup_sequences(alt: AltScreen) -> Vec<u8> {
+    let alt = match alt {
+        AltScreen::Off => "",
+        AltScreen::Plain => "\x1b[?1047l",
+        AltScreen::SaveCursor => "\x1b[?1049l",
+    };
+    [
+        TERMINAL_CLEANUP_BEFORE_ALT_SCREEN,
+        alt,
+        TERMINAL_CLEANUP_AFTER_ALT_SCREEN,
+    ]
+    .concat()
+    .into_bytes()
 }
 
 fn cleanup_terminal_features() {
     if stdout_is_terminal() {
-        let _ = write_all_fd(STDOUT_FD, terminal_cleanup_sequences());
+        let _ = write_all_fd(STDOUT_FD, &terminal_cleanup_sequences(remote_alt_screen()));
     }
 }
 
@@ -182,19 +226,32 @@ mod tests {
 
     #[test]
     fn terminal_cleanup_disables_interactive_modes_without_ris() {
-        let seq = terminal_cleanup_sequences();
+        let seq = terminal_cleanup_sequences(AltScreen::Off);
         assert!(seq.starts_with(b"\x1b[<u\x1b[=0u"));
         assert!(seq_contains(
-            seq,
+            &seq,
             b"\x1b[?9;1000;1001;1002;1003;1005;1006;1015;1016l"
         ));
-        assert!(seq_contains(seq, b"\x1b[?1004l"));
-        assert!(seq_contains(seq, b"\x1b[?2004;2005;2006l"));
-        assert!(seq_contains(seq, b"\x1b[?2026l"));
-        assert!(seq_contains(seq, b"\x1b[?47;1047;1048;1049l"));
-        assert!(seq_contains(seq, b"\x1b[?25h"));
+        assert!(seq_contains(&seq, b"\x1b[?1004l"));
+        assert!(seq_contains(&seq, b"\x1b[?2004;2005;2006l"));
+        assert!(seq_contains(&seq, b"\x1b[?2026l"));
+        assert!(seq_contains(&seq, b"\x1b[?25h"));
         assert!(seq.ends_with(b"\x1b[0 q\x1b[0m"));
-        assert!(!seq_contains(seq, b"\x1bc"));
+        assert!(!seq_contains(&seq, b"\x1bc"));
+    }
+
+    #[test]
+    fn terminal_cleanup_only_leaves_alt_screen_when_entered() {
+        let off = terminal_cleanup_sequences(AltScreen::Off);
+        for mode in [b"47".as_slice(), b"1047", b"1048", b"1049"] {
+            assert!(!seq_contains(&off, mode));
+        }
+        let plain = terminal_cleanup_sequences(AltScreen::Plain);
+        assert!(seq_contains(&plain, b"\x1b[?1047l"));
+        assert!(!seq_contains(&plain, b"1049"));
+        let save_cursor = terminal_cleanup_sequences(AltScreen::SaveCursor);
+        assert!(seq_contains(&save_cursor, b"\x1b[?1049l\x1b[?66l"));
+        assert!(!seq_contains(&save_cursor, b"1047"));
     }
 
     fn seq_contains(seq: &[u8], needle: &[u8]) -> bool {

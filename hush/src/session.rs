@@ -33,7 +33,7 @@ pub(crate) async fn run_pty(conn: quinn::Connection, session: OpenSession) -> Re
     let resize_task = tokio::spawn(os::watch_resize(stream_tx.clone()));
     let mut status_task = tokio::spawn(read_exit_status(conn.clone()));
     let (in_task, mut escape_rx) = spawn_stdin_pump(send);
-    let out_task = tokio::spawn(quic_to_stdio(recv, os::STDOUT_FD));
+    let out_task = tokio::spawn(quic_to_terminal(recv));
     let end = tokio::select! {
         status = &mut status_task => completed_status(status),
         Some(()) = escape_rx.recv() => {
@@ -423,6 +423,114 @@ async fn quic_to_stdio(mut recv: quinn::RecvStream, fd: i32) -> Result<()> {
     }
 }
 
+async fn quic_to_terminal(mut recv: quinn::RecvStream) -> Result<()> {
+    let mut stdout = tokio::io::stdout();
+    let mut alt_screen = AltScreenTracker::default();
+    let mut buf = vec![0u8; STDIO_BUFFER_LEN];
+    loop {
+        let n = recv.read(&mut buf).await?.unwrap_or(0);
+        if n == 0 {
+            stdout.flush().await?;
+            return Ok(());
+        }
+        // Track before writing so cleanup never misses a switch that reached the terminal.
+        if alt_screen.push(&buf[..n]) {
+            os::set_remote_alt_screen(alt_screen.alt);
+        }
+        stdout.write_all(&buf[..n]).await?;
+    }
+}
+
+/// Follows alternate screen switches (`CSI ? 47/1047/1049 h/l`) in terminal
+/// output, carrying partial sequences across reads.
+#[derive(Debug)]
+struct AltScreenTracker {
+    alt: os::AltScreen,
+    state: CsiState,
+    param: u32,
+    /// Alternate screen mode named by the private mode sequence being parsed.
+    seq_mode: Option<os::AltScreen>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CsiState {
+    Ground,
+    Escape,
+    Entry,
+    PrivateParams,
+    Ignore,
+}
+
+impl Default for AltScreenTracker {
+    fn default() -> Self {
+        Self {
+            alt: os::AltScreen::Off,
+            state: CsiState::Ground,
+            param: 0,
+            seq_mode: None,
+        }
+    }
+}
+
+impl AltScreenTracker {
+    /// Returns whether the alternate screen state changed.
+    fn push(&mut self, output: &[u8]) -> bool {
+        let before = self.alt;
+        for &byte in output {
+            self.state = match (self.state, byte) {
+                (_, 0x1b) => CsiState::Escape,
+                // CAN and SUB abort a sequence.
+                (_, 0x18 | 0x1a) => CsiState::Ground,
+                (CsiState::Ground, _) => CsiState::Ground,
+                (CsiState::Escape, b'[') => CsiState::Entry,
+                (CsiState::Escape, _) => CsiState::Ground,
+                // Other C0 controls execute without interrupting the sequence.
+                (state, 0x00..=0x1f) => state,
+                (CsiState::Entry, b'?') => {
+                    self.param = 0;
+                    self.seq_mode = None;
+                    CsiState::PrivateParams
+                }
+                (CsiState::PrivateParams, b'0'..=b'9') => {
+                    self.param = self
+                        .param
+                        .saturating_mul(10)
+                        .saturating_add(u32::from(byte - b'0'));
+                    CsiState::PrivateParams
+                }
+                (CsiState::PrivateParams, b';') => {
+                    self.end_param();
+                    CsiState::PrivateParams
+                }
+                (CsiState::PrivateParams, b'h' | b'l') => {
+                    self.end_param();
+                    if let Some(mode) = self.seq_mode {
+                        self.alt = if byte == b'h' {
+                            mode
+                        } else {
+                            os::AltScreen::Off
+                        };
+                    }
+                    CsiState::Ground
+                }
+                // Final byte of any other CSI sequence.
+                (_, 0x40..=0x7e) => CsiState::Ground,
+                _ => CsiState::Ignore,
+            };
+        }
+        self.alt != before
+    }
+
+    fn end_param(&mut self) {
+        match self.param {
+            47 | 1047 => self.seq_mode = Some(os::AltScreen::Plain),
+            1049 => self.seq_mode = Some(os::AltScreen::SaveCursor),
+            _ => {}
+        }
+        self.param = 0;
+    }
+}
+
 async fn quic_to_writer<W>(recv: &mut quinn::RecvStream, mut writer: W) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -567,6 +675,52 @@ mod tests {
         assert_eq!(output, b"\x1b");
         assert!(!filter.push(b"[~.", &mut output));
         assert_eq!(output, b"\x1b[~.");
+    }
+
+    #[test]
+    fn alt_screen_tracker_follows_switches() {
+        use os::AltScreen;
+        assert_eq!(track_alt_screen(&[b"plain \x1b[?25h text"]), AltScreen::Off);
+        assert_eq!(track_alt_screen(&[b"\x1b[?1049h"]), AltScreen::SaveCursor);
+        assert_eq!(track_alt_screen(&[b"\x1b[?1;1047;25h"]), AltScreen::Plain);
+        assert_eq!(track_alt_screen(&[b"\x1b[?47h"]), AltScreen::Plain);
+        assert_eq!(
+            track_alt_screen(&[b"\x1b[?1049h vim \x1b[?1049l"]),
+            AltScreen::Off
+        );
+        assert_eq!(track_alt_screen(&[b"\x1b[?1049h\x1b[?47l"]), AltScreen::Off);
+    }
+
+    #[test]
+    fn alt_screen_tracker_carries_sequences_across_reads() {
+        use os::AltScreen;
+        assert_eq!(
+            track_alt_screen(&[b"\x1b", b"[?10", b"49", b"h"]),
+            AltScreen::SaveCursor
+        );
+        assert_eq!(
+            track_alt_screen(&[b"\x1b[?1049h\x1b[?", b"1049l"]),
+            AltScreen::Off
+        );
+    }
+
+    #[test]
+    fn alt_screen_tracker_ignores_other_sequences() {
+        use os::AltScreen;
+        // DECRQM query, non-private mode, aborted and interrupted sequences.
+        assert_eq!(track_alt_screen(&[b"\x1b[?1049$p"]), AltScreen::Off);
+        assert_eq!(track_alt_screen(&[b"\x1b[1049h"]), AltScreen::Off);
+        assert_eq!(track_alt_screen(&[b"\x1b[?1049\x18h"]), AltScreen::Off);
+        assert_eq!(track_alt_screen(&[b"\x1b[?10\x1b[49h"]), AltScreen::Off);
+        assert_eq!(track_alt_screen(&[b"\x1b[?1049:1h"]), AltScreen::Off);
+    }
+
+    fn track_alt_screen(chunks: &[&[u8]]) -> os::AltScreen {
+        let mut tracker = AltScreenTracker::default();
+        for chunk in chunks {
+            tracker.push(chunk);
+        }
+        tracker.alt
     }
 
     fn run_escape_filter(enabled: bool, chunks: &[&[u8]]) -> (bool, Vec<u8>) {
