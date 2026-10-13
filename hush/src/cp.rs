@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Debug, usage::Cli)]
+#[derive(Debug, usage_rs::Cli)]
 #[usage(
     bin = "hcp",
     version,

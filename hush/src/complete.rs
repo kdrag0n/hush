@@ -50,7 +50,7 @@ for f in "$p"*; do
 done
 "#;
 
-#[derive(Debug, usage::Cli)]
+#[derive(Debug, usage_rs::Cli)]
 #[usage(
     bin = "hush __complete-remote",
     unknown_flags = "error",

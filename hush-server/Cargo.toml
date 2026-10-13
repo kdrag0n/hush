@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-usage.workspace = true
+usage-rs.workspace = true
 hush-core = { path = "../hush-core" }
 quinn.workspace = true
 rustls-pki-types.workspace = true

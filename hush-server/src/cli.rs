@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf};
 
-#[derive(Debug, usage::Cli)]
+#[derive(Debug, usage_rs::Cli)]
 #[usage(
     bin = "hush-server",
     version,

@@ -9,13 +9,13 @@ macro_rules! parse_or_exit {
         let words: &[&::std::ffi::OsStr] = $words;
         match <$ty>::parse_from(words) {
             Ok(cli) => cli,
-            Err(usage::Error::Help { cmd, long }) => {
+            Err(usage_rs::Error::Help { cmd, long }) => {
                 if let Some(page) = <$ty>::render_help(cmd, long) {
                     print!("{page}");
                 }
                 ::std::process::exit(0);
             }
-            Err(usage::Error::Version { .. }) => {
+            Err(usage_rs::Error::Version { .. }) => {
                 let bin = <$ty>::spec().bin.unwrap_or(env!("CARGO_PKG_NAME"));
                 println!("{bin} {}", env!("CARGO_PKG_VERSION"));
                 ::std::process::exit(0);
@@ -79,7 +79,7 @@ impl Cli {
     }
 }
 
-#[derive(Debug, usage::Cli)]
+#[derive(Debug, usage_rs::Cli)]
 #[usage(
     bin = "hush",
     version,
@@ -307,6 +307,6 @@ mod tests {
     fn tty_short_flag_cannot_be_repeated() {
         let words = ["-tt", "example.test"].map(OsStr::new);
         let err = Args::parse_from(&words).unwrap_err();
-        assert!(matches!(err, usage::Error::DuplicateFlag { .. }), "{err:?}");
+        assert!(matches!(err, usage_rs::Error::DuplicateFlag { .. }), "{err:?}");
     }
 }
