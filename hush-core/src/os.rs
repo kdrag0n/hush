@@ -295,9 +295,10 @@ pub struct AsyncPty {
 
 impl AsyncPty {
     pub fn new(fd: OwnedFd) -> io::Result<Self> {
-        Ok(Self {
-            fd: Arc::new(AsyncFd::new(fd)?),
-        })
+        // SAFETY: the AsyncFd owns the OwnedFd, which stays open and is never
+        // replaced until the AsyncFd is dropped.
+        let fd = unsafe { AsyncFd::register(fd) }?;
+        Ok(Self { fd: Arc::new(fd) })
     }
 
     pub fn resize(&self, size: &TermSize) -> Result<()> {
