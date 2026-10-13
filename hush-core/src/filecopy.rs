@@ -377,7 +377,7 @@ where
     let mut budget = CopyBudget::new(limits);
     while let Some(entry) = std::future::poll_fn(|cx| Pin::new(&mut entries).poll_next(cx)).await {
         let mut entry = entry.context("iterate over archive")?;
-        budget.add(entry.header().size()?)?;
+        budget.add(entry.effective_size())?;
         if entry.header().entry_type() == tokio_tar::EntryType::Directory {
             directories.push(entry);
         } else {
