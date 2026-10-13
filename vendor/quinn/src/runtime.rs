@@ -17,6 +17,7 @@ pub trait Runtime: Send + Sync + Debug + 'static {
     /// Construct a timer that will expire at `i`
     fn new_timer(&self, i: Instant) -> Pin<Box<dyn AsyncTimer>>;
     /// Drive `future` to completion in the background
+    #[track_caller]
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>);
     /// Convert `t` into the socket type used by this runtime
     #[cfg(not(wasm_browser))]
@@ -103,9 +104,8 @@ pub trait UdpPoller: Send + Sync + Debug + 'static {
 
 pin_project_lite::pin_project! {
     /// Helper adapting a function `MakeFut` that constructs a single-use future `Fut` into a
-    /// [`UdpPoller`] that may be reused indefinitely. Public so custom
-    /// [`AsyncUdpSocket`] implementations can reuse it.
-    pub struct UdpPollHelper<MakeFut, Fut> {
+    /// [`UdpPoller`] that may be reused indefinitely
+    struct UdpPollHelper<MakeFut, Fut> {
         make_fut: MakeFut,
         #[pin]
         fut: Option<Fut>,
@@ -121,7 +121,7 @@ impl<MakeFut, Fut> UdpPollHelper<MakeFut, Fut> {
         feature = "runtime-smol",
         feature = "runtime-tokio",
     ))]
-    pub fn new(make_fut: MakeFut) -> Self {
+    fn new(make_fut: MakeFut) -> Self {
         Self {
             make_fut,
             fut: None,

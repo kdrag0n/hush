@@ -83,13 +83,6 @@ pub use imp::UdpSocketState;
 /// Number of UDP packets to send/receive at a time
 #[cfg(not(wasm_browser))]
 pub const BATCH_SIZE: usize = imp::BATCH_SIZE;
-
-/// The OS error code a send returns when the interface queue is full and the
-/// datagram was not queued. Never matches on platforms without it.
-#[cfg(unix)]
-pub const ENOBUFS: i32 = libc::ENOBUFS;
-#[cfg(not(unix))]
-pub const ENOBUFS: i32 = i32::MIN;
 /// Number of UDP packets to send/receive at a time
 #[cfg(wasm_browser)]
 pub const BATCH_SIZE: usize = 1;

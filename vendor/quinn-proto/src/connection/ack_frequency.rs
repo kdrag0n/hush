@@ -12,8 +12,6 @@ pub(super) struct AckFrequencyState {
     in_flight_ack_frequency_frame: Option<(u64, Duration)>,
     next_outgoing_sequence_number: VarInt,
     pub(super) peer_max_ack_delay: Duration,
-    /// Send a frame at the next opportunity regardless of the current error
-    force_resend: bool,
 
     //
     // Receiving ACK_FREQUENCY frames
@@ -28,7 +26,6 @@ impl AckFrequencyState {
             in_flight_ack_frequency_frame: None,
             next_outgoing_sequence_number: VarInt(0),
             peer_max_ack_delay: default_max_ack_delay,
-            force_resend: false,
 
             last_ack_frequency_frame: None,
             max_ack_delay: default_max_ack_delay,
@@ -43,13 +40,18 @@ impl AckFrequencyState {
         config: &AckFrequencyConfig,
         peer_params: &TransportParameters,
     ) -> Duration {
-        // Use the peer's max_ack_delay if no custom max_ack_delay was provided in the config
         let min_ack_delay =
             Duration::from_micros(peer_params.min_ack_delay.map_or(0, |x| x.into()));
-        config
-            .max_ack_delay
-            .unwrap_or(self.peer_max_ack_delay)
-            .clamp(min_ack_delay, rtt.max(MIN_AUTOMATIC_ACK_DELAY))
+
+        // Use the peer's max_ack_delay if no custom max_ack_delay was provided in the config
+        let candidate = config.max_ack_delay.unwrap_or(self.peer_max_ack_delay);
+
+        // Must be no smaller than the `min_ack_delay` advertised by the peer
+        Ord::max(
+            // Should be less than the RTT (itself at least `MIN_AUTOMATIC_ACK_DELAY`)
+            Ord::min(candidate, Ord::max(rtt, MIN_AUTOMATIC_ACK_DELAY)),
+            min_ack_delay,
+        )
     }
 
     /// Returns the `max_ack_delay` for the purposes of calculating the PTO
@@ -82,8 +84,8 @@ impl AckFrequencyState {
         config: &AckFrequencyConfig,
         peer_params: &TransportParameters,
     ) -> bool {
-        if self.next_outgoing_sequence_number.0 == 0 || self.force_resend {
-            // Always send at startup, or after the requested behavior changed
+        if self.next_outgoing_sequence_number.0 == 0 {
+            // Always send at startup
             return true;
         }
         let current = self
@@ -97,13 +99,6 @@ impl AckFrequencyState {
     /// Notifies the [`AckFrequencyState`] that a packet containing an ACK_FREQUENCY frame was sent
     pub(super) fn ack_frequency_sent(&mut self, pn: u64, requested_max_ack_delay: Duration) {
         self.in_flight_ack_frequency_frame = Some((pn, requested_max_ack_delay));
-        self.force_resend = false;
-    }
-
-    /// Request that the next ACK_FREQUENCY frame be sent even if the computed
-    /// max ACK delay has not changed, because other parameters have.
-    pub(super) fn force_resend(&mut self) {
-        self.force_resend = true;
     }
 
     /// Notifies the [`AckFrequencyState`] that a packet has been ACKed
@@ -163,3 +158,49 @@ const MAX_RTT_ERROR: f32 = 0.2;
 /// extension and an explicit max ACK delay is not configured.
 // Keep in sync with `AckFrequencyConfig::max_ack_delay` documentation
 const MIN_AUTOMATIC_ACK_DELAY: Duration = Duration::from_millis(25);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Side;
+
+    #[test]
+    fn peer_min_ack_delay_can_exceed_rtt() {
+        let params = TransportParameters {
+            min_ack_delay: Some(100_000u32.into()),
+            max_ack_delay: 100u32.into(),
+            ..TransportParameters::default()
+        };
+        let mut encoded = Vec::new();
+        params.write(&mut encoded);
+        let params = TransportParameters::read(Side::Client, &mut encoded.as_slice())
+            .expect("peer parameters must pass wire-level validation");
+        let state = AckFrequencyState::new(Duration::from_millis(100));
+        let delay = state.candidate_max_ack_delay(
+            Duration::from_millis(5),
+            &AckFrequencyConfig::default(),
+            &params,
+        );
+        assert_eq!(delay, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn peer_min_ack_delay_can_exceed_rtt_with_large_max() {
+        let params = TransportParameters {
+            min_ack_delay: Some(100_000u32.into()),
+            max_ack_delay: 200u32.into(),
+            ..TransportParameters::default()
+        };
+        let mut encoded = Vec::new();
+        params.write(&mut encoded);
+        let params = TransportParameters::read(Side::Client, &mut encoded.as_slice())
+            .expect("peer parameters must pass wire-level validation");
+        let state = AckFrequencyState::new(Duration::from_millis(100));
+        let delay = state.candidate_max_ack_delay(
+            Duration::from_millis(5),
+            &AckFrequencyConfig::default(),
+            &params,
+        );
+        assert_eq!(delay, Duration::from_millis(100));
+    }
+}

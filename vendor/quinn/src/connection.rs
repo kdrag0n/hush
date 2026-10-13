@@ -5,7 +5,10 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll, Waker, ready},
 };
 
@@ -59,7 +62,7 @@ impl Connecting {
             runtime.clone(),
         );
 
-        let driver = ConnectionDriver(conn.clone());
+        let driver = ConnectionDriver::new(conn.clone());
         runtime.spawn(Box::pin(
             async {
                 if let Err(e) = driver.await {
@@ -234,19 +237,31 @@ impl Future for ZeroRttAccepted {
 /// packets still in flight from the peer are handled gracefully.
 #[must_use = "connection drivers must be spawned for their connections to function"]
 #[derive(Debug)]
-struct ConnectionDriver(ConnectionRef);
+struct ConnectionDriver {
+    conn: ConnectionRef,
+    span: Span,
+}
+
+impl ConnectionDriver {
+    fn new(conn: ConnectionRef) -> Self {
+        let span = {
+            let conn = &mut conn.state.lock("poll");
+            debug_span!("drive", id = conn.handle.0)
+        };
+
+        Self { conn, span }
+    }
+}
 
 impl Future for ConnectionDriver {
     type Output = Result<(), io::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let conn = &mut *self.0.state.lock("poll");
+        let conn = &mut *self.conn.state.lock("poll");
+        let _guard = self.span.enter();
 
-        let span = debug_span!("drive", id = conn.handle.0);
-        let _guard = span.enter();
-
-        if let Err(e) = conn.process_conn_events(&self.0.shared, cx) {
-            conn.terminate(e, &self.0.shared);
+        if let Err(e) = conn.process_conn_events(&self.conn.shared, cx) {
+            conn.terminate(e, &self.conn.shared);
             return Poll::Ready(Ok(()));
         }
         let mut keep_going = conn.drive_transmit(cx)?;
@@ -254,7 +269,7 @@ impl Future for ConnectionDriver {
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
         conn.forward_endpoint_events();
-        conn.forward_app_events(&self.0.shared);
+        conn.forward_app_events(&self.conn.shared);
 
         if !conn.inner.is_drained() {
             if keep_going {
@@ -530,6 +545,11 @@ impl Connection {
         self.0.state.lock("rtt").inner.rtt()
     }
 
+    /// Minimum RTT seen on this path, ignoring ack delay
+    pub fn min_rtt(&self) -> Duration {
+        self.0.state.lock("min_rtt").inner.min_rtt()
+    }
+
     /// Returns connection statistics
     pub fn stats(&self) -> ConnectionStats {
         self.0.state.lock("stats").inner.stats()
@@ -631,37 +651,6 @@ impl Connection {
     pub fn set_send_window(&self, send_window: u64) {
         let mut conn = self.0.state.lock("set_send_window");
         conn.inner.set_send_window(send_window);
-        conn.wake();
-    }
-
-    /// Replace the congestion controller on the current path.
-    ///
-    /// See [`proto::Connection::set_congestion_controller()`].
-    pub fn set_congestion_controller(
-        &self,
-        factory: Arc<dyn proto::congestion::ControllerFactory + Send + Sync>,
-    ) {
-        let mut conn = self.0.state.lock("set_congestion_controller");
-        let now = conn.runtime.now();
-        conn.inner.set_congestion_controller(factory, now);
-        conn.wake();
-    }
-
-    /// Change how often the peer is asked to acknowledge our packets.
-    ///
-    /// See [`proto::Connection::set_ack_frequency_config()`].
-    pub fn set_ack_frequency_config(&self, config: Option<proto::AckFrequencyConfig>) {
-        let mut conn = self.0.state.lock("set_ack_frequency_config");
-        conn.inner.set_ack_frequency_config(config);
-        conn.wake();
-    }
-
-    /// Redirect the connection to a different peer address.
-    ///
-    /// See [`proto::Connection::set_remote_address()`].
-    pub fn set_remote_address(&self, remote: SocketAddr) {
-        let mut conn = self.0.state.lock("set_remote_address");
-        conn.inner.set_remote_address(remote);
         conn.wake();
     }
 
@@ -932,13 +921,11 @@ impl ConnectionRef {
                 blocked_readers: FxHashMap::default(),
                 stopped: FxHashMap::default(),
                 error: None,
-                ref_count: 0,
                 io_poller: socket.clone().create_io_poller(),
                 socket,
                 runtime,
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
-                send_retry: None,
             }),
             shared: Shared::default(),
         }))
@@ -951,23 +938,25 @@ impl ConnectionRef {
 
 impl Clone for ConnectionRef {
     fn clone(&self) -> Self {
-        self.state.lock("clone").ref_count += 1;
+        self.shared.ref_count.fetch_add(1, Ordering::Relaxed);
         Self(self.0.clone())
     }
 }
 
 impl Drop for ConnectionRef {
     fn drop(&mut self) {
+        if self.shared.ref_count.fetch_sub(1, Ordering::Relaxed) > 1 {
+            return;
+        }
+
         let conn = &mut *self.state.lock("drop");
-        if let Some(x) = conn.ref_count.checked_sub(1) {
-            conn.ref_count = x;
-            if x == 0 && !conn.inner.is_closed() {
-                // If the driver is alive, it's just it and us, so we'd better shut it down. If it's
-                // not, we can't do any harm. If there were any streams being opened, then either
-                // the connection will be closed for an unrelated reason or a fresh reference will
-                // be constructed for the newly opened stream.
-                conn.implicit_close(&self.shared);
-            }
+
+        if !conn.inner.is_closed() {
+            // If the driver is alive, it's just it and us, so we'd better shut it down. If it's
+            // not, we can't do any harm. If there were any streams being opened, then either
+            // the connection will be closed for an unrelated reason or a fresh reference will
+            // be constructed for the newly opened stream.
+            conn.implicit_close(&self.shared);
         }
     }
 }
@@ -995,6 +984,8 @@ pub(crate) struct Shared {
     datagram_received: Notify,
     datagrams_unblocked: Notify,
     closed: Notify,
+    /// Number of live handles that can used to initiate or handle I/O; excludes the driver
+    ref_count: AtomicUsize,
 }
 
 pub(crate) struct State {
@@ -1013,17 +1004,12 @@ pub(crate) struct State {
     pub(crate) stopped: FxHashMap<StreamId, Arc<Notify>>,
     /// Always set to Some before the connection becomes drained
     pub(crate) error: Option<ConnectionError>,
-    /// Number of live handles that can be used to initiate or handle I/O; excludes the driver
-    ref_count: usize,
     socket: Arc<dyn AsyncUdpSocket>,
     io_poller: Pin<Box<dyn UdpPoller>>,
     runtime: Arc<dyn Runtime>,
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
     buffered_transmit: Option<proto::Transmit>,
-    /// Timer armed after the kernel refused a send with ENOBUFS; the buffered
-    /// transmit is retried when it fires.
-    send_retry: Option<Pin<Box<dyn AsyncTimer>>>,
 }
 
 impl State {
@@ -1035,13 +1021,6 @@ impl State {
             .socket
             .max_transmit_segments()
             .min(MAX_TRANSMIT_SEGMENTS);
-
-        if let Some(timer) = &mut self.send_retry {
-            if timer.as_mut().poll(cx).is_pending() {
-                return Ok(false);
-            }
-            self.send_retry = None;
-        }
 
         loop {
             // Retry the last transmit, or get a new one.
@@ -1079,19 +1058,6 @@ impl State {
             {
                 Ok(()) => false,
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
-                Err(ref e) if e.raw_os_error() == Some(ENOBUFS) => {
-                    // The interface queue is full. Platforms such as macOS
-                    // neither block a non-blocking sender nor signal
-                    // writability when the queue drains, so hold the transmit
-                    // and retry shortly instead of dropping it: a drop here
-                    // looks like path loss to the congestion controller and,
-                    // in bursts, like an MTU black hole.
-                    self.buffered_transmit = Some(t);
-                    let mut timer = self.runtime.new_timer(now + SEND_RETRY_DELAY);
-                    let _ = timer.as_mut().poll(cx);
-                    self.send_retry = Some(timer);
-                    return Ok(false);
-                }
                 Err(e) => return Err(e),
             };
             if retry {
@@ -1208,37 +1174,33 @@ impl State {
         }
     }
 
-    fn drive_timer(&mut self, cx: &mut Context) -> bool {
-        // Check whether we need to (re)set the timer. If so, we must poll again to ensure the
-        // timer is registered with the runtime (and check whether it's already
-        // expired).
-        match self.inner.poll_timeout() {
-            Some(deadline) => {
-                if let Some(delay) = &mut self.timer {
-                    // There is no need to reset the tokio timer if the deadline
-                    // did not change
-                    if self
-                        .timer_deadline
-                        .map(|current_deadline| current_deadline != deadline)
-                        .unwrap_or(true)
-                    {
-                        delay.as_mut().reset(deadline);
-                    }
-                } else {
-                    self.timer = Some(self.runtime.new_timer(deadline));
-                }
-                // Store the actual expiration time of the timer
-                self.timer_deadline = Some(deadline);
-            }
-            None => {
-                self.timer_deadline = None;
-                return false;
-            }
+    fn drive_timer(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(deadline) = self.inner.poll_timeout() else {
+            self.timer_deadline = None;
+            return false;
+        };
+
+        // Use the clock rather than the async timer to detect expiry: Sleep::poll
+        // respects Tokio's cooperative budget and can return Pending for elapsed
+        // deadlines.
+        let now = self.runtime.now();
+        if now >= deadline {
+            self.inner.handle_timeout(now);
+            self.timer_deadline = None;
+            return true;
         }
 
-        if self.timer_deadline.is_none() {
-            return false;
+        match &mut self.timer {
+            // Avoid resetting the timer when the deadline is unchanged.
+            Some(delay) if self.timer_deadline != Some(deadline) => {
+                delay.as_mut().reset(deadline);
+            }
+            None => {
+                self.timer = Some(self.runtime.new_timer(deadline));
+            }
+            _ => {}
         }
+        self.timer_deadline = Some(deadline);
 
         let delay = self
             .timer
@@ -1246,13 +1208,10 @@ impl State {
             .expect("timer must exist in this state")
             .as_mut();
         if delay.poll(cx).is_pending() {
-            // Since there wasn't a timeout event, there is nothing new
-            // for the connection to do
             return false;
         }
 
-        // A timer expired, so the caller needs to check for
-        // new transmits, which might cause new timers to be set.
+        // The deadline elapsed in the window between the clock check and poll.
         self.inner.handle_timeout(self.runtime.now());
         self.timer_deadline = None;
         true
@@ -1380,8 +1339,3 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 20;
 /// memory allocations when calling `poll_transmit()`. Benchmarks have shown
 /// that numbers around 10 are a good compromise.
 const MAX_TRANSMIT_SEGMENTS: usize = 10;
-
-/// How long to wait before retrying a send the kernel refused with ENOBUFS
-const SEND_RETRY_DELAY: Duration = Duration::from_millis(1);
-
-const ENOBUFS: i32 = udp::ENOBUFS;

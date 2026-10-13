@@ -80,8 +80,6 @@ pub struct UdpSocketState {
     /// In particular, we do not use IP_TOS cmsg_type in this case,
     /// which is not supported on Linux <3.13 and results in not sending the UDP packet at all.
     sendmsg_einval: AtomicBool,
-    /// True if the socket is connected; sends then omit the destination address.
-    connected: AtomicBool,
 }
 
 impl UdpSocketState {
@@ -189,7 +187,6 @@ impl UdpSocketState {
         Ok(Self {
             last_send_error: Mutex::new(now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now)),
             max_gso_segments: AtomicUsize::new(gso::max_gso_segments()),
-            connected: AtomicBool::new(io.peer_addr().is_ok()),
             gro_segments: gro::gro_segments(),
             may_fragment,
             sendmsg_einval: AtomicBool::new(false),
@@ -211,12 +208,6 @@ impl UdpSocketState {
         match send(self, socket.0, transmit) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
-            // The caller can retry (ENOBUFS: interface queue full) or switch
-            // sockets (EPIPE: the kernel has shut this socket down), so these
-            // are reported rather than dropped.
-            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOBUFS) | Some(libc::EPIPE)) => {
-                Err(e)
-            }
             // - EMSGSIZE is expected for MTU probes. Future work might be able to avoid
             //   these by automatically clamping the MTUD upper bound to the interface MTU.
             Err(e) if e.raw_os_error() == Some(libc::EMSGSIZE) => Ok(()),
@@ -250,19 +241,6 @@ impl UdpSocketState {
     #[inline]
     pub fn max_gso_segments(&self) -> usize {
         self.max_gso_segments.load(Ordering::Relaxed)
-    }
-
-    /// Whether sends omit the destination because the socket is connected.
-    ///
-    /// Detected at construction; call [`Self::set_connected`] after
-    /// `connect()`ing a socket that was already wrapped.
-    pub fn connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
-    }
-
-    /// Record that the socket has been `connect()`ed (or disconnected).
-    pub fn set_connected(&self, connected: bool) {
-        self.connected.store(connected, Ordering::Relaxed);
     }
 
     /// The number of segments to read when GRO is enabled. Used as a factor to
@@ -434,10 +412,6 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
             state.sendmsg_einval(),
         );
         hdrs[i].msg_datalen = chunk.len();
-        if state.connected() {
-            hdrs[i].msg_name = std::ptr::null_mut();
-            hdrs[i].msg_namelen = 0;
-        }
         cnt += 1;
     }
     loop {
@@ -520,10 +494,6 @@ fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> 
         match e.kind() {
             // Retry receiving
             io::ErrorKind::Interrupted => continue,
-            // A connected socket reports ICMP errors for the peer here. They
-            // are transient path conditions, not socket failures, so drop them
-            // and let QUIC's own loss recovery decide.
-            _ if is_icmp_error(&e) => continue,
             _ => return Err(e),
         }
     };
@@ -559,10 +529,6 @@ fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> 
         match e.kind() {
             // Retry receiving
             io::ErrorKind::Interrupted => continue,
-            // A connected socket reports ICMP errors for the peer here. They
-            // are transient path conditions, not socket failures, so drop them
-            // and let QUIC's own loss recovery decide.
-            _ if is_icmp_error(&e) => continue,
             _ => return Err(e),
         }
     };
@@ -574,18 +540,32 @@ fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> 
 
 #[cfg(any(target_os = "openbsd", target_os = "netbsd", solarish, apple_slow))]
 fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> io::Result<usize> {
+    recv_single(io, bufs, meta)
+}
+
+#[cfg(any(
+    all(test, not(apple_fast)),
+    target_os = "openbsd",
+    target_os = "netbsd",
+    solarish,
+    apple_slow
+))]
+fn recv_single(
+    io: SockRef<'_>,
+    bufs: &mut [IoSliceMut<'_>],
+    meta: &mut [RecvMeta],
+) -> io::Result<usize> {
     let mut name = MaybeUninit::<libc::sockaddr_storage>::uninit();
     let mut ctrl = cmsg::Aligned(MaybeUninit::<[u8; CMSG_LEN]>::uninit());
     let mut hdr = unsafe { mem::zeroed::<libc::msghdr>() };
-    prepare_recv(&mut bufs[0], &mut name, &mut ctrl, &mut hdr);
     let n = loop {
+        prepare_recv(&mut bufs[0], &mut name, &mut ctrl, &mut hdr);
         let n = unsafe { libc::recvmsg(io.as_raw_fd(), &mut hdr, 0) };
 
-        if hdr.msg_flags & libc::MSG_TRUNC != 0 {
-            continue;
-        }
-
         if n >= 0 {
+            if hdr.msg_flags & libc::MSG_TRUNC != 0 {
+                continue;
+            }
             break n;
         }
 
@@ -593,7 +573,6 @@ fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> 
         match e.kind() {
             // Retry receiving
             io::ErrorKind::Interrupted => continue,
-            _ if is_icmp_error(&e) => continue,
             _ => return Err(e),
         }
     };
@@ -602,21 +581,6 @@ fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> 
 }
 
 const CMSG_LEN: usize = 88;
-
-
-/// Errors a connected datagram socket surfaces when ICMP reports trouble
-/// reaching the peer.
-fn is_icmp_error(e: &io::Error) -> bool {
-    matches!(
-        e.raw_os_error(),
-        Some(libc::ECONNREFUSED)
-            | Some(libc::EHOSTUNREACH)
-            | Some(libc::ENETUNREACH)
-            | Some(libc::EHOSTDOWN)
-            | Some(libc::ENETDOWN)
-            | Some(libc::EMSGSIZE)
-    )
-}
 
 fn prepare_msg(
     transmit: &Transmit<'_>,
@@ -1111,5 +1075,67 @@ const OPTION_ON: libc::c_int = 1;
 mod gro {
     pub(super) fn gro_segments() -> usize {
         1
+    }
+}
+
+#[cfg(all(test, not(apple_fast)))]
+mod tests {
+    use std::{net::UdpSocket, sync::mpsc, thread, time::Duration};
+
+    use super::*;
+
+    #[test]
+    fn recv_single_after_truncation_returns_would_block_instead_of_spin() {
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let address = receiver.local_addr().unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        sender.send_to(&[0; 16], address).unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut buffer = [0; 8];
+            let result = recv_single(
+                SockRef::from(&receiver),
+                &mut [IoSliceMut::new(&mut buffer)],
+                &mut [RecvMeta::default()],
+            );
+            done_tx.send(result).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(1));
+        if result.is_err() {
+            // Release a regressed receive loop before failing the test.
+            sender.send_to(b"ok", address).unwrap();
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+        }
+        worker.join().unwrap();
+        assert!(matches!(result, Ok(Err(error)) if error.kind() == io::ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    fn recv_single_skips_truncated_datagrams() {
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = receiver.local_addr().unwrap();
+        sender.send_to(&[0; 16], address).unwrap();
+        sender.send_to(b"ok", address).unwrap();
+
+        let mut buffer = [0; 8];
+        let mut meta = [RecvMeta::default()];
+        assert_eq!(
+            recv_single(
+                SockRef::from(&receiver),
+                &mut [IoSliceMut::new(&mut buffer)],
+                &mut meta,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(&buffer[..meta[0].len], b"ok");
+        assert_eq!(meta[0].addr, sender.local_addr().unwrap());
     }
 }
