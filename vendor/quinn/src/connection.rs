@@ -270,6 +270,7 @@ impl Future for ConnectionDriver {
         keep_going |= conn.drive_timer(cx);
         conn.forward_endpoint_events();
         conn.forward_app_events(&self.conn.shared);
+        conn.check_remote_address(&self.conn.shared);
 
         if !conn.inner.is_drained() {
             if keep_going {
@@ -304,6 +305,42 @@ impl Future for ConnectionDriver {
 /// [`Connection::close()`]: Connection::close
 #[derive(Debug, Clone)]
 pub struct Connection(ConnectionRef);
+
+/// Observes a [`Connection`] without keeping it open; see [`Connection::weak_handle`]
+#[derive(Debug, Clone)]
+pub struct WeakConnectionHandle(std::sync::Weak<ConnectionInner>);
+
+impl WeakConnectionHandle {
+    /// Whether the connection is still open and an application handle to it
+    /// still exists
+    pub fn is_alive(&self) -> bool {
+        self.0.upgrade().is_some_and(|conn| {
+            conn.shared.ref_count.load(Ordering::Relaxed) > 0
+                && conn.state.lock("is_alive").error.is_none()
+        })
+    }
+
+    /// See [`Connection::stats`]; `None` once the connection is gone
+    pub fn stats(&self) -> Option<ConnectionStats> {
+        let conn = self.0.upgrade()?;
+        let stats = conn.state.lock("stats").inner.stats();
+        Some(stats)
+    }
+
+    /// See [`Connection::rtt`]; `None` once the connection is gone
+    pub fn rtt(&self) -> Option<Duration> {
+        let conn = self.0.upgrade()?;
+        let rtt = conn.state.lock("rtt").inner.rtt();
+        Some(rtt)
+    }
+
+    /// See [`Connection::remote_address`]; `None` once the connection is gone
+    pub fn remote_address(&self) -> Option<SocketAddr> {
+        let conn = self.0.upgrade()?;
+        let remote = conn.state.lock("remote_address").inner.remote_address();
+        Some(remote)
+    }
+}
 
 impl Connection {
     /// Initiate a new outgoing unidirectional stream.
@@ -525,6 +562,36 @@ impl Connection {
     /// switching to a cellular internet connection.
     pub fn remote_address(&self) -> SocketAddr {
         self.0.state.lock("remote_address").inner.remote_address()
+    }
+
+    /// Wait until the peer's address differs from `known`, such as after the
+    /// peer migrated, and return the new address
+    ///
+    /// Returns `None` once the connection is closed.
+    pub async fn remote_address_changed(&self, known: SocketAddr) -> Option<SocketAddr> {
+        loop {
+            {
+                let state = self.0.state.lock("remote_address_changed");
+                if state.error.is_some() {
+                    return None;
+                }
+                let current = state.inner.remote_address();
+                if current != known {
+                    return Some(current);
+                }
+                // Construct the future while the lock is held, as in `closed`.
+                self.0.shared.remote_address_changed.notified()
+            }
+            .await;
+        }
+    }
+
+    /// A handle that observes the connection without keeping it open
+    ///
+    /// Unlike a clone, it does not count as a reference for the implicit close
+    /// that happens once every handle to the connection is dropped.
+    pub fn weak_handle(&self) -> WeakConnectionHandle {
+        WeakConnectionHandle(Arc::downgrade(&self.0.0))
     }
 
     /// The local IP address which was used when the peer established
@@ -936,6 +1003,7 @@ impl ConnectionRef {
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
+        let remote_address = conn.remote_address();
         Self(Arc::new(ConnectionInner {
             state: Mutex::new(State {
                 inner: conn,
@@ -958,6 +1026,7 @@ impl ConnectionRef {
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
                 send_retry: None,
+                remote_address,
             }),
             shared: Shared::default(),
         }))
@@ -1016,6 +1085,9 @@ pub(crate) struct Shared {
     datagram_received: Notify,
     datagrams_unblocked: Notify,
     closed: Notify,
+    /// Notified when the peer's address changes, such as by a migration, and
+    /// when the connection closes
+    remote_address_changed: Notify,
     /// Number of live handles that can used to initiate or handle I/O; excludes the driver
     ref_count: AtomicUsize,
 }
@@ -1045,6 +1117,8 @@ pub(crate) struct State {
     /// Timer armed after the kernel refused a send with ENOBUFS; the buffered
     /// transmit is retried when it fires.
     send_retry: Option<Pin<Box<dyn AsyncTimer>>>,
+    /// The peer address waiters on `Shared::remote_address_changed` last saw
+    remote_address: SocketAddr,
 }
 
 impl State {
@@ -1280,6 +1354,15 @@ impl State {
     }
 
     /// Used to wake up all blocked futures when the connection becomes closed for any reason
+    /// Wake waiters for a new peer address if the peer has moved.
+    fn check_remote_address(&mut self, shared: &Shared) {
+        let remote_address = self.inner.remote_address();
+        if remote_address != self.remote_address {
+            self.remote_address = remote_address;
+            shared.remote_address_changed.notify_waiters();
+        }
+    }
+
     fn terminate(&mut self, reason: ConnectionError, shared: &Shared) {
         self.error = Some(reason.clone());
         if let Some(x) = self.on_handshake_data.take() {
@@ -1293,6 +1376,7 @@ impl State {
         shared.stream_incoming[Dir::Bi as usize].notify_waiters();
         shared.datagram_received.notify_waiters();
         shared.datagrams_unblocked.notify_waiters();
+        shared.remote_address_changed.notify_waiters();
         if let Some(x) = self.on_connected.take() {
             let _ = x.send(false);
         }

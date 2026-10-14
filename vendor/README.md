@@ -26,6 +26,11 @@ pristine upstream source, so `git log -- vendor/<crate>` shows the patches.
 - A send refused with ENOBUFS is held and retried after a short timer rather
   than dropped or treated as a fatal error.
 - `UdpPollHelper` is public so custom `AsyncUdpSocket`s can reuse it.
+- `Connection::remote_address_changed` waits for the peer's address to
+  change (a migration), so a server can move its per-peer socket along.
+- `Connection::weak_handle` returns a `WeakConnectionHandle` that reads a
+  connection's stats, RTT and peer address without keeping it open, for a
+  client task that watches the path and rebinds the endpoint.
 
 ## quinn-proto 0.11.19
 
