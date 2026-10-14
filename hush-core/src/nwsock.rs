@@ -62,6 +62,9 @@ struct Inner {
     /// Peer address, in the form the local address family prefers, to flow id
     flows: Mutex<HashMap<SocketAddr, u64>>,
     peers: Mutex<HashMap<u64, SocketAddr>>,
+    /// Authenticated peers, by address, with their number of guards. Their
+    /// flows, including ones opened later, are exempt from the reaper.
+    protected: Mutex<HashMap<SocketAddr, usize>>,
     inbox: Mutex<Inbox>,
     waker: Mutex<Option<Waker>>,
     local: Mutex<SocketAddr>,
@@ -127,6 +130,13 @@ extern "C" fn on_flow(
         let remote = inner.canonical(remote);
         inner.flows.lock().unwrap().insert(remote, flow);
         inner.peers.lock().unwrap().insert(flow, remote);
+        // A protected peer's earlier flow may have closed, and this is the
+        // one its packets arrive on now. `adopt` registers the peer before
+        // looking for its flow, so one of the two protects it.
+        if inner.protected.lock().unwrap().contains_key(&remote) {
+            // SAFETY: the handle is set before any flow can become ready.
+            unsafe { nwudp_protect_flow(inner.handle, flow) };
+        }
     }
     if let Some(local) = sockaddr_to_addr(local) {
         let mut current = inner.local.lock().unwrap();
@@ -186,6 +196,7 @@ impl NwSocket {
             handle: std::ptr::null_mut(),
             flows: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),
+            protected: Mutex::new(HashMap::new()),
             inbox: Mutex::new((VecDeque::new(), 0)),
             waker: Mutex::new(None),
             local: Mutex::new(local),
@@ -245,44 +256,58 @@ impl NwSocket {
         Ok(socket)
     }
 
-    /// Protect an authenticated peer's flow from the short unauthenticated
-    /// idle timeout. Dropping the guard closes the flow immediately.
-    pub fn adopt(self: &Arc<Self>, peer: SocketAddr) -> io::Result<NwFlowGuard> {
+    /// Protect an authenticated peer's flows from the short unauthenticated
+    /// idle timeout: its current one, and any it opens later, since a flow
+    /// can close (or be reaped before this runs) while the peer stays. Dropping
+    /// the guard closes the peer's flow immediately.
+    pub fn adopt(self: &Arc<Self>, peer: SocketAddr) -> NwFlowGuard {
         let peer = self.inner.canonical(peer);
-        let flow = self
+        *self
             .inner
-            .flows
+            .protected
             .lock()
             .unwrap()
-            .get(&peer)
-            .copied()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "peer flow is gone"))?;
-        // SAFETY: the handle remains alive with `inner` and the flow id came
-        // from that handle's callback.
-        if unsafe { nwudp_protect_flow(self.inner.handle, flow) } != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "peer flow closed before authentication completed",
-            ));
+            .entry(peer)
+            .or_insert(0) += 1;
+        let flow = self.inner.flows.lock().unwrap().get(&peer).copied();
+        if let Some(flow) = flow {
+            // SAFETY: the handle remains alive with `inner` and the flow id
+            // came from that handle's callback. A flow that closed meanwhile
+            // is ignored; the peer's next one is protected by `on_flow`.
+            unsafe { nwudp_protect_flow(self.inner.handle, flow) };
         }
-        Ok(NwFlowGuard {
+        NwFlowGuard {
             inner: Arc::clone(&self.inner),
-            flow,
-        })
+            peer,
+        }
     }
 }
 
 #[derive(Debug)]
 pub struct NwFlowGuard {
     inner: Arc<Inner>,
-    flow: u64,
+    peer: SocketAddr,
 }
 
 impl Drop for NwFlowGuard {
     fn drop(&mut self) {
-        // SAFETY: the handle remains alive with `inner`; closing an already
-        // closed flow is explicitly harmless in the shim.
-        unsafe { nwudp_close_flow(self.inner.handle, self.flow) };
+        {
+            let mut protected = self.inner.protected.lock().unwrap();
+            let Some(guards) = protected.get_mut(&self.peer) else {
+                return;
+            };
+            *guards -= 1;
+            if *guards > 0 {
+                return;
+            }
+            protected.remove(&self.peer);
+        }
+        let flow = self.inner.flows.lock().unwrap().get(&self.peer).copied();
+        if let Some(flow) = flow {
+            // SAFETY: the handle remains alive with `inner`; closing an
+            // already closed flow is explicitly harmless in the shim.
+            unsafe { nwudp_close_flow(self.inner.handle, flow) };
+        }
     }
 }
 

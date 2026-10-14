@@ -72,11 +72,36 @@ impl ConnectionSockets {
                 })
             }
             #[cfg(target_os = "macos")]
-            Self::Network(socket) => socket
-                .adopt(peer)
-                .map(|guard| ConnectionSocketGuard::Network { _guard: guard }),
+            Self::Network(socket) => Ok(ConnectionSocketGuard::Network {
+                _guard: socket.adopt(peer),
+            }),
         }
     }
+}
+
+/// Give the connection a private socket for its peer once it has settled,
+/// and keep one for as long as the connection lives: every packet of it,
+/// including its close, then goes through that socket. When the peer
+/// migrates, such as a client that changed networks or rebound to escape a
+/// broken NAT mapping, the socket moves to its new address.
+async fn follow_peer(conn: Connection, sockets: Arc<ConnectionSockets>) {
+    let adopt = |peer| match sockets.adopt(conn.local_ip(), peer) {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            tracing::debug!(%err, %peer, "could not adopt authenticated peer socket");
+            None
+        }
+    };
+    let mut peer = conn.remote_address();
+    let mut guard = adopt(peer);
+    while let Some(new_peer) = conn.remote_address_changed(peer).await {
+        tracing::debug!(from = %peer, to = %new_peer, "peer migrated");
+        peer = new_peer;
+        // The old address's socket closes once the new one is in place; its
+        // late packets reach the listener.
+        guard = adopt(peer);
+    }
+    drop(guard);
 }
 
 pub async fn serve_connection(
@@ -213,24 +238,8 @@ impl AuthenticatedConnection {
         let remote_forward_streams = Arc::new(Semaphore::new(
             self.config.max_forward_streams_per_connection,
         ));
-        // Give the connection a private socket once it has settled, and keep
-        // the guard alive as long as the connection: every packet of it,
-        // including its close, then goes through that socket.
-        let private_socket = sockets.and_then(|sockets| {
-            match sockets.adopt(self.conn.local_ip(), self.conn.remote_address()) {
-                Ok(guard) => Some(guard),
-                Err(err) => {
-                    tracing::debug!(%err, "could not adopt authenticated peer socket");
-                    None
-                }
-            }
-        });
-        if let Some(private_socket) = private_socket {
-            let conn = self.conn.clone();
-            tokio::spawn(async move {
-                conn.closed().await;
-                drop(private_socket);
-            });
+        if let Some(sockets) = sockets {
+            tokio::spawn(follow_peer(self.conn.clone(), sockets));
         }
         loop {
             let (mut send, mut recv) = self.conn.accept_bi().await?;
