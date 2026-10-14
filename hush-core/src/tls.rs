@@ -44,7 +44,9 @@ const QUIC_FAST_PACKET_THRESHOLD: u32 = 3;
 const QUIC_FAST_TIME_THRESHOLD: f32 = 1.0;
 const QUIC_FAST_INITIAL_RTT: Duration = Duration::from_millis(100);
 const QUIC_FAST_ACK_DELAY: Duration = Duration::from_millis(1);
-const QUIC_CLIENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
+/// Under the 30 s that some carrier NATs keep an idle UDP mapping, and the
+/// longest an idle client goes before noticing that its path has died.
+const QUIC_CLIENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(25);
 const QUIC_MTU_BLACK_HOLE_COOLDOWN: Duration = Duration::from_secs(1);
 const QUIC_MTU_UPPER_BOUND: u16 = 1500 - 20 - 8;
 /// Bulk transfers ask the peer to acknowledge at most every 51 packets or
