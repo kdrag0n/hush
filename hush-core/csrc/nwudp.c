@@ -316,6 +316,11 @@ uint64_t nwudp_connect(nwudp_t *h, const char *host, uint16_t port) {
     flow_t *f = add_flow(h, conn);
     nw_release(conn);
     if (!f) return 0;
+    // The reaper is for flows unauthenticated peers open on a listener; a
+    // client's own flow lives as long as its owner keeps it.
+    pthread_mutex_lock(&h->lock);
+    f->protected = true;
+    pthread_mutex_unlock(&h->lock);
     start_flow(h, f);
     return f->id;
 }
