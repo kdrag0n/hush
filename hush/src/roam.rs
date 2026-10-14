@@ -83,7 +83,13 @@ impl Transport {
                 Arc::clone(trouble),
             )?)),
             #[cfg(target_os = "macos")]
-            Self::Network => Ok(Arc::new(hush_core::nwsock::NwSocket::connect(addr)?)),
+            Self::Network => {
+                let trouble = Arc::clone(trouble);
+                Ok(Arc::new(hush_core::nwsock::NwSocket::connect(
+                    addr,
+                    move || trouble.notify_one(),
+                )?))
+            }
         }
     }
 }
@@ -185,7 +191,7 @@ async fn watch_path(
     endpoint: Endpoint,
     conn: WeakConnectionHandle,
     transport: Transport,
-    trouble: Arc<Notify>,
+    mut trouble: Arc<Notify>,
 ) {
     let mut tick = tokio::time::interval(WATCH_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -224,7 +230,7 @@ async fn watch_path(
             if !watch.may_hop_now(now) {
                 continue;
             }
-            "socket cannot send"
+            "socket lost its path"
         } else if event == Event::NetworkChanged {
             let Ok(source) = preferred_source(remote) else {
                 // No route to the server right now; a later change brings one.
@@ -246,16 +252,22 @@ async fn watch_path(
             continue;
         };
         watch.hopped(now, silence);
+        // Each socket reports to its own `Notify`: quinn keeps the previous
+        // socket for late packets, and its complaints no longer matter.
+        let next_trouble = Arc::new(Notify::new());
         match transport
-            .open(remote, &trouble)
+            .open(remote, &next_trouble)
             .and_then(|socket| endpoint.rebind_abstract(socket))
         {
-            Ok(()) => tracing::debug!(
-                %remote,
-                local = ?endpoint.local_addr().ok(),
-                reason,
-                "moved to a new socket"
-            ),
+            Ok(()) => {
+                trouble = next_trouble;
+                tracing::debug!(
+                    %remote,
+                    local = ?endpoint.local_addr().ok(),
+                    reason,
+                    "moved to a new socket"
+                );
+            }
             Err(err) => tracing::debug!(%remote, %err, reason, "could not open a new socket"),
         }
     }

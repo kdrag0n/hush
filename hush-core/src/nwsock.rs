@@ -31,6 +31,7 @@ struct Handle {
 type FlowCb = extern "C" fn(*mut c_void, u64, *const libc::sockaddr, *const libc::sockaddr);
 type RecvCb = extern "C" fn(*mut c_void, u64, *const u8, usize);
 type CloseCb = extern "C" fn(*mut c_void, u64);
+type PathCb = extern "C" fn(*mut c_void, u64);
 
 unsafe extern "C" {
     fn nwudp_create(
@@ -48,6 +49,7 @@ unsafe extern "C" {
     fn nwudp_connect(h: *mut Handle, host: *const libc::c_char, port: u16) -> u64;
     fn nwudp_send(h: *mut Handle, flow: u64, data: *const u8, len: usize, seg: usize) -> i32;
     fn nwudp_close_flow(h: *mut Handle, flow: u64);
+    fn nwudp_set_path_handler(h: *mut Handle, on_path: PathCb);
     fn nwudp_protect_flow(h: *mut Handle, flow: u64) -> i32;
 }
 
@@ -69,6 +71,8 @@ struct Inner {
     waker: Mutex<Option<Waker>>,
     local: Mutex<SocketAddr>,
     ipv6: bool,
+    /// A client's handler for its flow losing its path; see `connect`.
+    on_path_trouble: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 // SAFETY: the handle is only used through its thread-safe C API.
@@ -166,6 +170,14 @@ extern "C" fn on_recv(ctx: *mut c_void, flow: u64, data: *const u8, len: usize) 
     }
 }
 
+extern "C" fn on_path(ctx: *mut c_void, _flow: u64) {
+    // SAFETY: as in on_flow.
+    let inner = unsafe { &*(ctx as *const Inner) };
+    if let Some(handler) = &inner.on_path_trouble {
+        handler();
+    }
+}
+
 extern "C" fn on_close(ctx: *mut c_void, flow: u64) {
     // SAFETY: as in on_flow.
     let inner = unsafe { &*(ctx as *const Inner) };
@@ -194,7 +206,11 @@ impl std::fmt::Debug for Inner {
 }
 
 impl NwSocket {
-    fn new(ipv6: bool, local: SocketAddr) -> Self {
+    fn new(
+        ipv6: bool,
+        local: SocketAddr,
+        on_path_trouble: Option<Box<dyn Fn() + Send + Sync>>,
+    ) -> Self {
         let inner = Arc::new(Inner {
             handle: std::ptr::null_mut(),
             flows: Mutex::new(HashMap::new()),
@@ -204,6 +220,7 @@ impl NwSocket {
             waker: Mutex::new(None),
             local: Mutex::new(local),
             ipv6,
+            on_path_trouble,
         });
         // The shim keeps a raw pointer to Inner; leak one reference so it
         // stays valid for the process lifetime (experimental transport).
@@ -220,7 +237,7 @@ impl NwSocket {
 
     /// Listen on `addr`; an unspecified address means every address.
     pub fn listen(addr: SocketAddr, max_unprotected_flows: usize) -> io::Result<Self> {
-        let socket = Self::new(addr.is_ipv6(), addr);
+        let socket = Self::new(addr.is_ipv6(), addr, None);
         let host = (!addr.ip().is_unspecified())
             .then(|| CString::new(addr.ip().to_string()))
             .transpose()
@@ -241,8 +258,13 @@ impl NwSocket {
         Ok(socket)
     }
 
-    /// A single flow to `addr`.
-    pub fn connect(addr: SocketAddr) -> io::Result<Self> {
+    /// A single flow to `addr`. A flow stays on the path it started on, so
+    /// `on_path_trouble` is called when it cannot send anymore, fails, or a
+    /// better path appears; the owner then moves to a new socket.
+    pub fn connect(
+        addr: SocketAddr,
+        on_path_trouble: impl Fn() + Send + Sync + 'static,
+    ) -> io::Result<Self> {
         let mut socket = Self::new(
             addr.is_ipv6(),
             SocketAddr::new(
@@ -253,7 +275,10 @@ impl NwSocket {
                 },
                 0,
             ),
+            Some(Box::new(on_path_trouble)),
         );
+        // SAFETY: valid handle, set before the flow exists.
+        unsafe { nwudp_set_path_handler(socket.inner.handle, on_path) };
         let host = CString::new(addr.ip().to_string()).map_err(io::Error::other)?;
         // SAFETY: valid handle and C string.
         let flow = unsafe { nwudp_connect(socket.inner.handle, host.as_ptr(), addr.port()) };

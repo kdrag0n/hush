@@ -14,6 +14,7 @@ typedef void (*nwudp_recv_cb)(void *ctx, uint64_t flow, const void *data, size_t
 typedef void (*nwudp_flow_cb)(void *ctx, uint64_t flow, const struct sockaddr *remote,
                               const struct sockaddr *local);
 typedef void (*nwudp_close_cb)(void *ctx, uint64_t flow);
+typedef void (*nwudp_path_cb)(void *ctx, uint64_t flow);
 
 #define NWUDP_MAX_UNPROTECTED_FLOWS 128
 #define NWUDP_UNPROTECTED_IDLE_NS (3ULL * 1000 * 1000 * 1000)
@@ -34,6 +35,9 @@ typedef struct nwudp {
     nwudp_flow_cb on_flow;
     nwudp_recv_cb on_recv;
     nwudp_close_cb on_close;
+    // Set for a client: told when its flow's path stops working or a better
+    // one appears, so the owner can move to a new flow.
+    nwudp_path_cb on_path;
     dispatch_queue_t queue;
     nw_listener_t listener;
     pthread_mutex_t lock;
@@ -193,6 +197,7 @@ static void start_flow(nwudp_t *h, flow_t *f) {
             flow_ready(h, id);
         } else if (state == nw_connection_state_failed ||
                    state == nw_connection_state_cancelled) {
+            if (state == nw_connection_state_failed && h->on_path) h->on_path(h->ctx, id);
             close_flow(h, id);
         }
     });
@@ -314,8 +319,23 @@ uint64_t nwudp_connect(nwudp_t *h, const char *host, uint16_t port) {
     nw_release(p);
     nw_release(ep);
     flow_t *f = add_flow(h, conn);
+    if (!f) {
+        nw_release(conn);
+        return 0;
+    }
+    if (h->on_path) {
+        // A flow stays on the interface and source address it started with,
+        // so a network change leaves it unable to send (it turns unviable)
+        // or on a worse path than a new flow would get.
+        uint64_t id = f->id;
+        nw_connection_set_viability_changed_handler(conn, ^(bool viable) {
+            if (!viable) h->on_path(h->ctx, id);
+        });
+        nw_connection_set_better_path_available_handler(conn, ^(bool better) {
+            if (better) h->on_path(h->ctx, id);
+        });
+    }
     nw_release(conn);
-    if (!f) return 0;
     // The reaper is for flows unauthenticated peers open on a listener; a
     // client's own flow lives as long as its owner keeps it.
     pthread_mutex_lock(&h->lock);
@@ -355,13 +375,21 @@ int nwudp_send(nwudp_t *h, uint64_t id, const void *data, size_t len, size_t seg
             dispatch_data_t d = copy_datagram(h, q, n);
             if (!d) break;
             nw_connection_send(conn, d, NW_CONNECTION_DEFAULT_MESSAGE_CONTEXT, true,
-                               ^(nw_error_t err) { (void)err; });
+                               ^(nw_error_t err) {
+                                   if (err && h->on_path) h->on_path(h->ctx, id);
+                               });
             dispatch_release(d);
             q += n; left -= n;
         }
     });
     nw_release(conn);
     return 0;
+}
+
+// Make `h` a client whose flows report path trouble to `on_path`; call before
+// nwudp_connect.
+void nwudp_set_path_handler(nwudp_t *h, nwudp_path_cb on_path) {
+    h->on_path = on_path;
 }
 
 void nwudp_close_flow(nwudp_t *h, uint64_t id) {
