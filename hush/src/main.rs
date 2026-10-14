@@ -4,6 +4,7 @@ mod cp;
 mod logging;
 mod net;
 mod os;
+mod roam;
 mod session;
 
 use anyhow::{Result, bail};

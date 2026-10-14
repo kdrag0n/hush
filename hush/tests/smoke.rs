@@ -1,10 +1,14 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs,
-    net::{TcpListener, UdpSocket},
+    net::{SocketAddr, TcpListener, UdpSocket},
     os::unix::process::ExitStatusExt,
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::OnceLock,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -17,6 +21,7 @@ struct TestEnv {
     data: PathBuf,
     authorized_keys: PathBuf,
     server: Option<Child>,
+    server_env: Vec<(&'static str, &'static str)>,
     port: u16,
 }
 
@@ -48,6 +53,7 @@ impl TestEnv {
             data,
             authorized_keys,
             server: None,
+            server_env: Vec::new(),
             port: free_udp_port(),
         }
     }
@@ -61,6 +67,7 @@ impl TestEnv {
         fs::create_dir_all(&server_home).unwrap();
         let child = Command::new(server_bin())
             .env_remove("SSH_AUTH_SOCK")
+            .envs(self.server_env.iter().copied())
             .env("HOME", &server_home)
             .arg("--data-dir")
             .arg(&self.data)
@@ -111,13 +118,17 @@ impl TestEnv {
     }
 
     fn hush(&self) -> Command {
+        self.hush_to_port(self.port)
+    }
+
+    fn hush_to_port(&self, port: u16) -> Command {
         let mut cmd = Command::new(hush_bin());
         cmd.env("HOME", &self.home)
             .env_remove("SSH_AUTH_SOCK")
             .arg("--data-dir")
             .arg(self.home.join(".hush"))
             .arg("-p")
-            .arg(self.port.to_string());
+            .arg(port.to_string());
         cmd
     }
 
@@ -1613,4 +1624,195 @@ fn ecdsa_agent_key_works() {
 
     assert!(out.status.success(), "{out:?}");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "p384-agent-ok");
+}
+
+/// A UDP relay in front of the server that behaves like a NAT: each client
+/// address gets its own upstream socket, so the server sees a new port for
+/// every client port. `break_mappings` silently drops all traffic of the
+/// client addresses seen so far in both directions, like a NAT whose mappings
+/// broke while the client keeps them from expiring.
+struct NatRelay {
+    port: u16,
+    clients: Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>>,
+    broken: Arc<Mutex<HashSet<SocketAddr>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl NatRelay {
+    fn start(server_port: u16) -> Self {
+        let front = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        front
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let relay = Self {
+            port: front.local_addr().unwrap().port(),
+            clients: Arc::default(),
+            broken: Arc::default(),
+            stop: Arc::default(),
+        };
+        let (clients, broken, stop) = (
+            Arc::clone(&relay.clients),
+            Arc::clone(&relay.broken),
+            Arc::clone(&relay.stop),
+        );
+        thread::spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            while !stop.load(Ordering::Relaxed) {
+                let Ok((len, client)) = front.recv_from(&mut buf) else {
+                    continue;
+                };
+                if broken.lock().unwrap().contains(&client) {
+                    continue;
+                }
+                let upstream =
+                    Arc::clone(clients.lock().unwrap().entry(client).or_insert_with(|| {
+                        relay_upstream(server_port, client, &front, &broken, &stop)
+                    }));
+                let _ = upstream.send(&buf[..len]);
+            }
+        });
+        relay
+    }
+
+    fn break_mappings(&self) {
+        let clients = self.clients.lock().unwrap();
+        self.broken.lock().unwrap().extend(clients.keys());
+    }
+
+    fn client_ports(&self) -> usize {
+        self.clients.lock().unwrap().len()
+    }
+}
+
+impl Drop for NatRelay {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The relay's socket for one client, and a thread returning the server's
+/// replies to that client.
+fn relay_upstream(
+    server_port: u16,
+    client: SocketAddr,
+    front: &Arc<UdpSocket>,
+    broken: &Arc<Mutex<HashSet<SocketAddr>>>,
+    stop: &Arc<AtomicBool>,
+) -> Arc<UdpSocket> {
+    let upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+    upstream.connect(("127.0.0.1", server_port)).unwrap();
+    upstream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let (socket, front, broken, stop) = (
+        Arc::clone(&upstream),
+        Arc::clone(front),
+        Arc::clone(broken),
+        Arc::clone(stop),
+    );
+    thread::spawn(move || {
+        let mut buf = vec![0u8; 65536];
+        while !stop.load(Ordering::Relaxed) {
+            let Ok(len) = socket.recv(&mut buf) else {
+                continue;
+            };
+            if !broken.lock().unwrap().contains(&client) {
+                let _ = front.send_to(&buf[..len], client);
+            }
+        }
+    });
+    upstream
+}
+
+/// Lines of a child's stdout, as they arrive.
+fn stdout_lines(child: &mut Child) -> std::sync::mpsc::Receiver<String> {
+    use std::io::BufRead;
+
+    let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for line in stdout.lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// A session whose NAT mapping breaks mid-way: the client must move to a
+/// new port, the server must follow it, and the server's output after an
+/// idle pause (longer than the Network framework server's reaper allows an
+/// unprotected flow) must still arrive.
+fn session_survives_broken_nat_mapping(
+    client_env: &[(&str, &str)],
+    server_env: &[(&'static str, &'static str)],
+) {
+    use std::io::Write;
+
+    let mut env = TestEnv::new();
+    env.server_env.extend_from_slice(server_env);
+    env.start_server();
+    let relay = NatRelay::start(env.port);
+    let mut client = env
+        .hush_to_port(relay.port)
+        .envs(client_env.iter().copied())
+        .arg("-T")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("read a; echo got-$a; read b; echo got-$b; sleep 5; echo late")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let lines = stdout_lines(&mut client);
+    let mut stdin = client.stdin.take().unwrap();
+    let expect = |want: &str, timeout: Duration| {
+        let got = lines.recv_timeout(timeout);
+        assert_eq!(got.as_deref(), Ok(want), "waiting for {want:?}");
+    };
+
+    writeln!(stdin, "one").unwrap();
+    expect("got-one", Duration::from_secs(10));
+    assert_eq!(relay.client_ports(), 1);
+
+    relay.break_mappings();
+    writeln!(stdin, "two").unwrap();
+    expect("got-two", Duration::from_secs(15));
+    assert!(
+        relay.client_ports() >= 2,
+        "client never moved to a new port"
+    );
+    expect("late", Duration::from_secs(15));
+
+    drop(stdin);
+    let status = wait_for_child_exit(&mut client, Duration::from_secs(10));
+    assert!(status.is_some_and(|s| s.success()), "{status:?}");
+}
+
+#[test]
+fn session_survives_broken_nat_mapping_default_backends() {
+    session_survives_broken_nat_mapping(&[], &[]);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn session_survives_broken_nat_mapping_bsd_server() {
+    session_survives_broken_nat_mapping(&[], &[("HUSH_BSD_UDP", "1")]);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn session_survives_broken_nat_mapping_network_framework_client() {
+    session_survives_broken_nat_mapping(&[("HUSH_NW", "1")], &[]);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn session_survives_broken_nat_mapping_network_framework_client_bsd_server() {
+    session_survives_broken_nat_mapping(&[("HUSH_NW", "1")], &[("HUSH_BSD_UDP", "1")]);
 }

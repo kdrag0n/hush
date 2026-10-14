@@ -1,19 +1,9 @@
+use crate::roam::{self, Transport};
 use anyhow::{Context, Result, anyhow, bail};
-use hush_core::fastsock::{QuicSocket, is_dead_socket_error};
-use quinn::{
-    AsyncUdpSocket, ClientConfig, Connection, Endpoint, EndpointConfig, TokioRuntime, UdpPoller,
-    udp::{RecvMeta, Transmit},
-};
-use socket2::{Domain, Protocol, Socket, Type};
-use std::{
-    collections::VecDeque,
-    io::{self, IoSliceMut},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    pin::Pin,
-    sync::Arc,
-    task::{Context as TaskContext, Poll},
-};
+use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig, TokioRuntime};
+use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
 use tokio::{
+    sync::Notify,
     task::JoinSet,
     time::{Duration, Instant},
 };
@@ -42,103 +32,24 @@ pub(crate) async fn connect_any(
     }
 }
 
-/// A UDP socket of `addr`'s family, bound to an ephemeral port and connected
-/// to `addr`.
-fn connected_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
-    let (domain, local): (Domain, SocketAddr) = match addr {
-        SocketAddr::V4(_) => (Domain::IPV4, (Ipv4Addr::UNSPECIFIED, 0).into()),
-        SocketAddr::V6(_) => (Domain::IPV6, (Ipv6Addr::UNSPECIFIED, 0).into()),
-    };
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    hush_core::os::set_recv_buffer(&socket);
-    socket.bind(&local.into())?;
-    socket.connect(&addr.into())?;
-    Ok(socket.into())
-}
-
-fn connected_endpoint(addr: SocketAddr, client_config: ClientConfig) -> Result<Endpoint> {
-    #[cfg(target_os = "macos")]
-    if std::env::var_os("HUSH_NW").is_some() {
-        let socket = hush_core::nwsock::NwSocket::connect(addr)
-            .with_context(|| format!("open Network.framework flow to {addr}"))?;
-        let mut endpoint = Endpoint::new_with_abstract_socket(
-            EndpointConfig::default(),
-            None,
-            Arc::new(socket),
-            Arc::new(TokioRuntime),
-        )?;
-        endpoint.set_default_client_config(client_config);
-        return Ok(endpoint);
-    }
-    let socket = connected_socket(addr).with_context(|| format!("open UDP socket to {addr}"))?;
+/// A client endpoint whose socket goes to `addr`.
+fn connected_endpoint(
+    addr: SocketAddr,
+    client_config: ClientConfig,
+    transport: Transport,
+    trouble: &Arc<Notify>,
+) -> Result<Endpoint> {
+    let socket = transport
+        .open(addr, trouble)
+        .with_context(|| format!("open {transport:?} socket to {addr}"))?;
     let mut endpoint = Endpoint::new_with_abstract_socket(
         EndpointConfig::default(),
         None,
-        Arc::new(ClientSocket::new(socket)?),
+        socket,
         Arc::new(TokioRuntime),
     )?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
-}
-
-/// A client's connected UDP socket.
-#[derive(Debug)]
-struct ClientSocket {
-    socket: QuicSocket,
-}
-
-impl ClientSocket {
-    fn new(socket: std::net::UdpSocket) -> io::Result<Self> {
-        Ok(Self {
-            socket: QuicSocket::new(socket)?,
-        })
-    }
-}
-
-impl AsyncUdpSocket for ClientSocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(quinn::UdpPollHelper::new(move || {
-            let socket = self.clone();
-            async move { socket.socket.writable().await }
-        }))
-    }
-
-    fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        match self.socket.try_send(transmit) {
-            // A send error stops the connection's driver for good, and this
-            // socket cannot send again: drop the datagram like any other loss.
-            Err(e) if is_dead_socket_error(&e) => {
-                tracing::debug!(%e, "client socket cannot send");
-                Ok(())
-            }
-            other => other,
-        }
-    }
-
-    fn poll_recv(
-        &self,
-        cx: &mut TaskContext,
-        bufs: &mut [IoSliceMut<'_>],
-        meta: &mut [RecvMeta],
-    ) -> Poll<io::Result<usize>> {
-        self.socket.poll_recv(cx, bufs, meta)
-    }
-
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.socket.local_addr()
-    }
-
-    fn may_fragment(&self) -> bool {
-        self.socket.may_fragment()
-    }
-
-    fn max_transmit_segments(&self) -> usize {
-        self.socket.max_transmit_segments()
-    }
-
-    fn max_receive_segments(&self) -> usize {
-        self.socket.max_receive_segments()
-    }
 }
 
 async fn connect_any_inner(
@@ -222,12 +133,16 @@ fn spawn_connect_attempt(
     let server_name = server_name.to_owned();
     let label = label.to_owned();
     attempts.spawn(async move {
-        let endpoint = connected_endpoint(addr, client_config)?;
+        let transport = Transport::from_env();
+        let trouble = Arc::new(Notify::new());
+        let endpoint = connected_endpoint(addr, client_config, transport, &trouble)?;
         let conn = endpoint
             .connect(addr, &server_name)
             .with_context(|| format!("start QUIC connect to {addr} for {label}"))?
             .await
             .with_context(|| format!("connect to {addr} for {label}"))?;
+        // A losing attempt's connection is dropped, which ends its watcher.
+        roam::keep_path(endpoint.clone(), &conn, transport, trouble);
         Ok((endpoint, conn))
     });
 }

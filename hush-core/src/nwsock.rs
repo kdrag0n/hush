@@ -182,6 +182,9 @@ extern "C" fn on_close(ctx: *mut c_void, flow: u64) {
 #[derive(Debug)]
 pub struct NwSocket {
     inner: Arc<Inner>,
+    /// A client's one flow, closed with the socket: a client that moves to a
+    /// new socket drops the old one.
+    client_flow: Option<u64>,
 }
 
 impl std::fmt::Debug for Inner {
@@ -209,7 +212,10 @@ impl NwSocket {
         let handle = unsafe { nwudp_create(ctx, on_flow, on_recv, on_close) };
         // SAFETY: Inner is behind an Arc we own; handle set once here.
         unsafe { (*(Arc::as_ptr(&inner) as *mut Inner)).handle = handle };
-        Self { inner }
+        Self {
+            inner,
+            client_flow: None,
+        }
     }
 
     /// Listen on `addr`; an unspecified address means every address.
@@ -237,7 +243,7 @@ impl NwSocket {
 
     /// A single flow to `addr`.
     pub fn connect(addr: SocketAddr) -> io::Result<Self> {
-        let socket = Self::new(
+        let mut socket = Self::new(
             addr.is_ipv6(),
             SocketAddr::new(
                 if addr.is_ipv6() {
@@ -251,8 +257,14 @@ impl NwSocket {
         let host = CString::new(addr.ip().to_string()).map_err(io::Error::other)?;
         // SAFETY: valid handle and C string.
         let flow = unsafe { nwudp_connect(socket.inner.handle, host.as_ptr(), addr.port()) };
+        if flow == 0 {
+            return Err(io::Error::other(
+                "could not create a Network.framework flow",
+            ));
+        }
         socket.inner.flows.lock().unwrap().insert(addr, flow);
         socket.inner.peers.lock().unwrap().insert(flow, addr);
+        socket.client_flow = Some(flow);
         Ok(socket)
     }
 
@@ -279,6 +291,16 @@ impl NwSocket {
         NwFlowGuard {
             inner: Arc::clone(&self.inner),
             peer,
+        }
+    }
+}
+
+impl Drop for NwSocket {
+    fn drop(&mut self) {
+        if let Some(flow) = self.client_flow {
+            // SAFETY: the handle stays valid for the process lifetime (see
+            // `new`); closing an already closed flow is harmless in the shim.
+            unsafe { nwudp_close_flow(self.inner.handle, flow) };
         }
     }
 }
