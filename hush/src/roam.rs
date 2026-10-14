@@ -7,8 +7,10 @@
 //! a new socket itself. Like mosh, the client hops to a fresh socket, with a
 //! new source port and the source address the system picks now, whenever
 //! what it sent goes unanswered, and right away when its socket reports that
-//! it cannot send.
+//! it cannot send or a network change gives the server a different source
+//! address.
 
+use crate::netmon::NetworkMonitor;
 use hush_core::fastsock::{QuicSocket, is_dead_socket_error};
 use quinn::{
     AsyncUdpSocket, Connection, ConnectionStats, Endpoint, UdpPoller, WeakConnectionHandle,
@@ -17,7 +19,7 @@ use quinn::{
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     io::{self, IoSliceMut},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -36,7 +38,7 @@ const SILENCE_RTTS: u32 = 8;
 /// While hopping does not help (the network is down, or the server is gone),
 /// hops back off up to this interval.
 const MAX_HOP_BACKOFF: Duration = Duration::from_secs(30);
-/// Hops requested by the socket itself are at least this far apart.
+/// Hops requested by the socket or the network are at least this far apart.
 const MIN_HOP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The kind of socket a client endpoint uses.
@@ -60,6 +62,16 @@ impl Transport {
 
     /// A new socket to `addr`, from a fresh port. `trouble` is notified when
     /// the socket finds it cannot send anymore.
+    /// Whether the socket stays on the source address it started from, so
+    /// network changes have to be watched for it.
+    fn pins_source_address(self) -> bool {
+        match self {
+            Self::Bsd => true,
+            #[cfg(target_os = "macos")]
+            Self::Network => false,
+        }
+    }
+
     pub(crate) fn open(
         self,
         addr: SocketAddr,
@@ -177,25 +189,52 @@ async fn watch_path(
 ) {
     let mut tick = tokio::time::interval(WATCH_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut monitor = transport
+        .pins_source_address()
+        .then(|| {
+            NetworkMonitor::new()
+                .inspect_err(|err| tracing::debug!(%err, "cannot watch for network changes"))
+                .ok()
+        })
+        .flatten();
     let mut watch = PathWatch::default();
     loop {
-        let socket_trouble = tokio::select! {
-            _ = tick.tick() => false,
-            _ = trouble.notified() => true,
+        let event = tokio::select! {
+            _ = tick.tick() => Event::Tick,
+            _ = trouble.notified() => Event::SocketTrouble,
+            changed = next_change(&mut monitor) => {
+                if let Err(err) = changed {
+                    tracing::debug!(%err, "stopped watching for network changes");
+                    monitor = None;
+                }
+                Event::NetworkChanged
+            }
         };
         if !conn.is_alive() {
             return;
         }
-        let (Some(stats), Some(rtt)) = (conn.stats(), conn.rtt()) else {
+        let (Some(stats), Some(rtt), Some(remote)) =
+            (conn.stats(), conn.rtt(), conn.remote_address())
+        else {
             return;
         };
         let now = Instant::now();
         let silence = (rtt * SILENCE_RTTS).clamp(MIN_SILENCE, MAX_HOP_BACKOFF);
-        let reason = if socket_trouble {
+        let reason = if event == Event::SocketTrouble {
             if !watch.may_hop_now(now) {
                 continue;
             }
             "socket cannot send"
+        } else if event == Event::NetworkChanged {
+            let Ok(source) = preferred_source(remote) else {
+                // No route to the server right now; a later change brings one.
+                continue;
+            };
+            let current = endpoint.local_addr().ok().map(|local| local.ip());
+            if current == Some(source) || !watch.may_hop_now(now) {
+                continue;
+            }
+            "network changed"
         } else if watch.observe(
             now,
             stats.frame_rx.acks,
@@ -205,9 +244,6 @@ async fn watch_path(
             "sent packets went unanswered"
         } else {
             continue;
-        };
-        let Some(remote) = conn.remote_address() else {
-            return;
         };
         watch.hopped(now, silence);
         match transport
@@ -223,6 +259,34 @@ async fn watch_path(
             Err(err) => tracing::debug!(%remote, %err, reason, "could not open a new socket"),
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Event {
+    Tick,
+    SocketTrouble,
+    NetworkChanged,
+}
+
+/// The next network change, or never without a monitor.
+async fn next_change(monitor: &mut Option<NetworkMonitor>) -> io::Result<()> {
+    match monitor {
+        Some(monitor) => monitor.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The source address the system would send from to `remote` now.
+fn preferred_source(remote: SocketAddr) -> io::Result<IpAddr> {
+    let unspecified: IpAddr = match remote {
+        SocketAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
+        SocketAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
+    };
+    // Connecting a datagram socket only picks a route and source address;
+    // nothing is sent.
+    let probe = UdpSocket::bind((unspecified, 0))?;
+    probe.connect(remote)?;
+    Ok(probe.local_addr()?.ip())
 }
 
 /// Frames sent that the peer must acknowledge: every kind but ACK itself

@@ -3,6 +3,7 @@ mod complete;
 mod cp;
 mod logging;
 mod net;
+mod netmon;
 mod os;
 mod roam;
 mod session;
