@@ -1,10 +1,17 @@
 use anyhow::{Context, Result, anyhow, bail};
-use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig, TokioRuntime};
+use hush_core::fastsock::{QuicSocket, is_dead_socket_error};
+use quinn::{
+    AsyncUdpSocket, ClientConfig, Connection, Endpoint, EndpointConfig, TokioRuntime, UdpPoller,
+    udp::{RecvMeta, Transmit},
+};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::VecDeque,
+    io::{self, IoSliceMut},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
     sync::Arc,
+    task::{Context as TaskContext, Poll},
 };
 use tokio::{
     task::JoinSet,
@@ -64,14 +71,74 @@ fn connected_endpoint(addr: SocketAddr, client_config: ClientConfig) -> Result<E
         return Ok(endpoint);
     }
     let socket = connected_socket(addr).with_context(|| format!("open UDP socket to {addr}"))?;
-    let mut endpoint = Endpoint::new(
+    let mut endpoint = Endpoint::new_with_abstract_socket(
         EndpointConfig::default(),
         None,
-        socket,
+        Arc::new(ClientSocket::new(socket)?),
         Arc::new(TokioRuntime),
     )?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
+}
+
+/// A client's connected UDP socket.
+#[derive(Debug)]
+struct ClientSocket {
+    socket: QuicSocket,
+}
+
+impl ClientSocket {
+    fn new(socket: std::net::UdpSocket) -> io::Result<Self> {
+        Ok(Self {
+            socket: QuicSocket::new(socket)?,
+        })
+    }
+}
+
+impl AsyncUdpSocket for ClientSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        Box::pin(quinn::UdpPollHelper::new(move || {
+            let socket = self.clone();
+            async move { socket.socket.writable().await }
+        }))
+    }
+
+    fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+        match self.socket.try_send(transmit) {
+            // A send error stops the connection's driver for good, and this
+            // socket cannot send again: drop the datagram like any other loss.
+            Err(e) if is_dead_socket_error(&e) => {
+                tracing::debug!(%e, "client socket cannot send");
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut TaskContext,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        self.socket.poll_recv(cx, bufs, meta)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.socket.may_fragment()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.socket.max_transmit_segments()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.socket.max_receive_segments()
+    }
 }
 
 async fn connect_any_inner(

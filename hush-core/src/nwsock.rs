@@ -299,11 +299,13 @@ impl AsyncUdpSocket for NwSocket {
             .unwrap()
             .get(&transmit.destination)
             .copied();
+        // Failing a send stops the connection's driver for good, so a datagram
+        // that cannot go out is dropped like any other loss. A flow is gone
+        // once Network.framework fails it or the reaper closes it; the peer's
+        // next datagram opens a new one.
         let Some(flow) = flow else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                format!("no flow to {}", transmit.destination),
-            ));
+            tracing::debug!(peer = %transmit.destination, "no flow to peer; dropping datagram");
+            return Ok(());
         };
         let seg = transmit
             .segment_size
@@ -320,7 +322,7 @@ impl AsyncUdpSocket for NwSocket {
             )
         };
         if rc != 0 {
-            return Err(io::Error::other("nw send failed"));
+            tracing::debug!(peer = %transmit.destination, "flow closed; dropping datagram");
         }
         Ok(())
     }

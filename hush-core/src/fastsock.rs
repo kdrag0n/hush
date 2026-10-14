@@ -32,6 +32,16 @@ use std::{
 };
 use tokio::io::Interest;
 
+/// Whether a send error means this socket will never send again: the kernel
+/// has shut it down (EPIPE), or the address it is bound or connected from is
+/// gone (EADDRNOTAVAIL). Another socket can still reach the peer.
+pub fn is_dead_socket_error(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EPIPE) | Some(libc::EADDRNOTAVAIL)
+    )
+}
+
 /// One UDP socket driven by tokio with quinn's platform-specific datapath.
 #[derive(Debug)]
 pub struct QuicSocket {
@@ -46,13 +56,18 @@ impl QuicSocket {
             io: tokio::net::UdpSocket::from_std(socket)?,
         })
     }
+
+    /// Wait until the socket may accept a send.
+    pub async fn writable(&self) -> io::Result<()> {
+        self.io.writable().await
+    }
 }
 
 impl AsyncUdpSocket for QuicSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
         Box::pin(quinn::UdpPollHelper::new(move || {
             let socket = self.clone();
-            async move { socket.io.writable().await }
+            async move { socket.writable().await }
         }))
     }
 
@@ -250,10 +265,11 @@ impl AsyncUdpSocket for MultiSocket {
                     segment_size: transmit.segment_size,
                     src_ip: None,
                 }) {
-                    Err(e) if e.raw_os_error() == Some(libc::EPIPE) => {
-                        // The kernel has shut this socket down. Back to the
+                    Err(e) if is_dead_socket_error(&e) => {
+                        // The kernel has shut this socket down, or the local
+                        // address it is bound to is gone. Back to the
                         // listener for this peer.
-                        tracing::debug!(peer = %private.peer, "private socket refused sends; closing it");
+                        tracing::debug!(peer = %private.peer, %e, "private socket refused sends; closing it");
                         private.failed.store(true, Ordering::Relaxed);
                         *private.socket.lock().unwrap() = None;
                     }
@@ -264,6 +280,13 @@ impl AsyncUdpSocket for MultiSocket {
         match self.main.try_send(transmit) {
             Err(e) if e.raw_os_error() == Some(libc::EPIPE) => {
                 tracing::warn!(%e, "listener send failed");
+                Ok(())
+            }
+            // The local address quinn learned for this peer is gone. Drop the
+            // datagram like any other loss: an error here would stop the
+            // connection's driver for good.
+            Err(e) if e.raw_os_error() == Some(libc::EADDRNOTAVAIL) => {
+                tracing::debug!(%e, src = ?transmit.src_ip, "listener send failed");
                 Ok(())
             }
             other => other,

@@ -13,6 +13,9 @@ pristine upstream source, so `git log -- vendor/<crate>` shows the patches.
   unconnected one, which is what limits QUIC throughput there.
 - ENOBUFS is returned to the caller instead of being logged and dropped, and
   is exported as `quinn_udp::ENOBUFS` so quinn can retry.
+- EPIPE and EADDRNOTAVAIL are returned too, so the socket's owner can switch
+  to another socket: the kernel has shut the socket down, or the address it
+  sends from is gone (a connected socket keeps failing after an IP change).
 - Receive ignores ICMP-derived errors (`ECONNREFUSED`, `EHOSTUNREACH`, ...)
   that connected sockets report, instead of failing the endpoint.
 
