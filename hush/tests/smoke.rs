@@ -1849,3 +1849,54 @@ fn dual_stack_bsd_server_serves_ipv4_clients() {
     assert!(status.success(), "{status:?}");
     assert_eq!(lines.recv().as_deref(), Ok("served"));
 }
+
+/// Output without a trailing newline, such as a shell prompt, must reach the
+/// terminal right away rather than wait in a line buffer for the next line.
+fn partial_line_arrives_promptly(tty_flag: &str) {
+    use std::io::Read;
+
+    let mut env = TestEnv::new();
+    env.start_server();
+    let mut client = env
+        .hush()
+        .arg(tty_flag)
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("printf prompt; sleep 5")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdout = client.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+            if got.ends_with(b"prompt") {
+                let _ = tx.send(());
+            }
+        }
+    });
+    let arrived = rx.recv_timeout(Duration::from_secs(3)).is_ok();
+    let _ = client.kill();
+    let _ = client.wait();
+    assert!(arrived, "partial line was held back");
+}
+
+#[test]
+fn partial_line_arrives_promptly_without_pty() {
+    partial_line_arrives_promptly("-T");
+}
+
+#[test]
+fn partial_line_arrives_promptly_with_pty() {
+    partial_line_arrives_promptly("-t");
+}

@@ -438,6 +438,9 @@ async fn quic_to_terminal(mut recv: quinn::RecvStream) -> Result<()> {
             os::set_remote_alt_screen(alt_screen.alt);
         }
         stdout.write_all(&buf[..n]).await?;
+        // Tokio's stdout writes through std's line buffer: without a flush,
+        // output after the last newline (a shell prompt) waits for the next.
+        stdout.flush().await?;
     }
 }
 
@@ -543,6 +546,8 @@ where
             return Ok(());
         }
         writer.write_all(&buf[..n]).await?;
+        // Stdout writes through std's line buffer; see `quic_to_terminal`.
+        writer.flush().await?;
     }
 }
 
