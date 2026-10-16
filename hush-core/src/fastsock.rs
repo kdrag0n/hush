@@ -273,6 +273,13 @@ impl AsyncUdpSocket for MultiSocket {
                         private.failed.store(true, Ordering::Relaxed);
                         *private.socket.lock().unwrap() = None;
                     }
+                    // quinn waits for the listener to become writable, never
+                    // for this socket, so a WouldBlock returned from here has
+                    // it retry at once, forever: a new socket is not writable
+                    // until tokio's reactor has polled it, and that reactor
+                    // may be waiting on the very worker that is retrying. Use
+                    // the listener for this datagram instead.
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     other => return other,
                 }
             }
@@ -359,5 +366,55 @@ impl Drop for PrivateSocketGuard {
     fn drop(&mut self) {
         tracing::debug!(peer = %self.private.peer, "private socket closed");
         self.sockets.close_private(&self.private);
+    }
+}
+
+// macOS refuses private sockets on loopback, so only Linux exercises them.
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A private socket opens inside the first send that needs it, before
+    /// tokio has seen it become writable. quinn waits on the listener's
+    /// writability, so a WouldBlock from the private socket would have it
+    /// retry in a loop that never yields.
+    #[tokio::test]
+    async fn first_send_to_adopted_peer_does_not_block() {
+        let listener = crate::os::bind_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        let sockets = MultiSocket::new(listener).unwrap();
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let _guard = sockets.adopt("127.0.0.1".parse().unwrap(), peer_addr);
+        // What quinn's poller does before every send.
+        sockets.main.writable().await.unwrap();
+
+        sockets
+            .try_send(&Transmit {
+                destination: peer_addr,
+                ecn: None,
+                contents: b"hello",
+                segment_size: None,
+                src_ip: None,
+            })
+            .unwrap();
+        let private = Arc::clone(&sockets.privates.read().unwrap()[0]);
+        assert!(
+            !private.failed.load(Ordering::Relaxed),
+            "private socket failed"
+        );
+        assert!(private.socket().is_some(), "private socket not opened");
+
+        let mut buf = [0u8; 16];
+        loop {
+            // The private socket's empty probe datagram may come first.
+            let (len, from) = peer.recv_from(&mut buf).unwrap();
+            assert_eq!(from.port(), sockets.local_addr().unwrap().port());
+            if len > 0 {
+                assert_eq!(&buf[..len], b"hello");
+                break;
+            }
+        }
     }
 }
