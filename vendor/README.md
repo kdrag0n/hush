@@ -10,7 +10,10 @@ pristine upstream source, so `git log -- vendor/<crate>` shows the patches.
 - Connected sockets: sends omit the destination when the socket is connected
   (`UdpSocketState::connected`, `set_connected`). On macOS a connected
   datagram socket costs a fraction of the kernel time per packet of an
-  unconnected one, which is what limits QUIC throughput there.
+  unconnected one, which is what limits QUIC throughput there. Every send
+  path omits it: Linux refuses (EAFNOSUPPORT) an IPv4-mapped destination on a
+  connected IPv4 socket, which is how a dual-stack server's private socket
+  sees an IPv4 peer.
 - ENOBUFS is returned to the caller instead of being logged and dropped, and
   is exported as `quinn_udp::ENOBUFS` so quinn can retry.
 - EPIPE and EADDRNOTAVAIL are returned too, so the socket's owner can switch

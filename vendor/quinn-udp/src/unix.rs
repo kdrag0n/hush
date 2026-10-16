@@ -325,12 +325,7 @@ impl UdpSocketState {
 }
 
 #[cfg(not(any(apple, target_os = "openbsd", target_os = "netbsd")))]
-fn send(
-    #[allow(unused_variables)] // only used on Linux
-    state: &UdpSocketState,
-    io: SockRef<'_>,
-    transmit: &Transmit<'_>,
-) -> io::Result<()> {
+fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
     #[allow(unused_mut)] // only mutable on FreeBSD
     let mut encode_src_ip = true;
     #[cfg(target_os = "freebsd")]
@@ -356,6 +351,12 @@ fn send(
         encode_src_ip,
         state.sendmsg_einval(),
     );
+    // A connected socket refuses a destination of another family (EAFNOSUPPORT
+    // for an IPv4-mapped peer on an IPv4 socket), so name none.
+    if state.connected() {
+        msg_hdr.msg_name = std::ptr::null_mut();
+        msg_hdr.msg_namelen = 0;
+    }
 
     loop {
         let n = unsafe { libc::sendmsg(io.as_raw_fd(), &msg_hdr, 0) };
@@ -477,6 +478,10 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
         cfg!(apple) || cfg!(target_os = "openbsd") || cfg!(target_os = "netbsd"),
         state.sendmsg_einval(),
     );
+    if state.connected() {
+        hdr.msg_name = std::ptr::null_mut();
+        hdr.msg_namelen = 0;
+    }
     loop {
         let n = unsafe { libc::sendmsg(io.as_raw_fd(), &hdr, 0) };
 

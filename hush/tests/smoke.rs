@@ -22,6 +22,7 @@ struct TestEnv {
     authorized_keys: PathBuf,
     server: Option<Child>,
     server_env: Vec<(&'static str, &'static str)>,
+    listen_host: &'static str,
     port: u16,
 }
 
@@ -54,6 +55,7 @@ impl TestEnv {
             authorized_keys,
             server: None,
             server_env: Vec::new(),
+            listen_host: "127.0.0.1",
             port: free_udp_port(),
         }
     }
@@ -76,7 +78,7 @@ impl TestEnv {
             .arg("--allow-user")
             .arg(hush_core::auth::current_username())
             .arg("-l")
-            .arg(format!("127.0.0.1:{}", self.port))
+            .arg(format!("{}:{}", self.listen_host, self.port))
             .args(extra_args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1815,4 +1817,35 @@ fn session_survives_broken_nat_mapping_network_framework_client() {
 #[cfg(target_os = "macos")]
 fn session_survives_broken_nat_mapping_network_framework_client_bsd_server() {
     session_survives_broken_nat_mapping(&[("HUSH_NW", "1")], &[("HUSH_BSD_UDP", "1")]);
+}
+
+/// A dual-stack listener sees IPv4 peers as IPv4-mapped IPv6 addresses, but
+/// gives each connection a plain IPv4 private socket, which must not be
+/// handed the mapped destination.
+#[test]
+fn dual_stack_bsd_server_serves_ipv4_clients() {
+    let mut env = TestEnv::new();
+    env.listen_host = "[::]";
+    env.server_env.push(("HUSH_BSD_UDP", "1"));
+    env.start_server();
+    let mut client = env
+        .hush()
+        .arg("-T")
+        .arg(env.target())
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("printf served")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let lines = stdout_lines(&mut client);
+    let status = wait_for_child_exit(&mut client, Duration::from_secs(15)).unwrap_or_else(|| {
+        let _ = client.kill();
+        let _ = client.wait();
+        panic!("session over a dual-stack listener did not finish");
+    });
+    assert!(status.success(), "{status:?}");
+    assert_eq!(lines.recv().as_deref(), Ok("served"));
 }
